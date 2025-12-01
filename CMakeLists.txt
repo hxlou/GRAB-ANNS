@@ -61,3 +61,12 @@ target_link_libraries(test_cagra_build PRIVATE light_cagra)
 
 add_executable(test_bitonic tests/test_bitonic.cu)
 target_link_libraries(test_bitonic PRIVATE light_cagra)
+
+add_executable(test_hashmap tests/test_hashmap.cu)
+target_link_libraries(test_hashmap PRIVATE light_cagra)
+
+add_executable(test_cagra tests/test_cagra.cpp)
+target_link_libraries(test_cagra PRIVATE light_cagra)
+
+add_executable(test_sort_impl tests/test_sort_impl.cu)
+target_link_libraries(test_sort_impl PRIVATE light_cagra)
