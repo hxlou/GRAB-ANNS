@@ -7,7 +7,7 @@
 ```bash
 conda create -n lightCagra
 conda activate lightCagra
-conda install conda-forge::faiss        # 包含所有必须环境
+conda install conda-forge::faiss-gpu        # 包含所有必须环境
 ```
 
 构建方法
