@@ -5,7 +5,7 @@
 #include "compute_distance.cuh"
 #include "search.cuh"
 #include "smem_cal.cuh"
-
+#include "insert.cuh"
 
 #include <iostream>
 #include <vector>
@@ -83,7 +83,10 @@ void generate_knn_graph(const float* d_dataset,
     int nbits = 8;
 
     faiss::gpu::GpuIndexIVFPQConfig config;
-    config.device = 0; 
+
+    int current_device = 0;
+    cudaGetDevice(&current_device);
+    config.device = current_device; 
     
     faiss::gpu::GpuIndexIVFPQ index(&res, dim, nlist, M, nbits, faiss::METRIC_L2, config);
 
@@ -653,7 +656,7 @@ void build(const float* d_dataset,
            BuildParams params,
            uint32_t** d_constructed_graph)  // [Output] 输出构建好的图指针
 {
-    std::cout << ">> [cagra::build] Starting CAGRA construction..." << std::endl;
+    // std::cout << ">> [cagra::build] Starting CAGRA construction..." << std::endl;
     uint32_t degree = params.graph_degree;
 
     // 1. 申请最终图的显存
@@ -692,7 +695,7 @@ void build(const float* d_dataset,
     // 输出指针
     *d_constructed_graph = d_graph;
 
-    std::cout << ">> [cagra::build] Done. Graph stored on GPU." << std::endl;
+    // std::cout << ">> [cagra::build] Done. Graph stored on GPU." << std::endl;
 }
 
 // 2. Search (执行搜索)
@@ -707,8 +710,8 @@ void search(const float* d_dataset,
             int64_t* d_out_indices, 
             float* d_out_dists)
 {
-    std::cout << ">> [cagra::search] Starting search for " 
-              << num_queries << " queries, top-" << k << "..." << std::endl;
+    // std::cout << ">> [cagra::search] Starting search for " 
+    //           << num_queries << " queries, top-" << k << "..." << std::endl;
     
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
@@ -734,13 +737,13 @@ void search(const float* d_dataset,
     // D. 随机种子
     std::random_device rd;
     uint64_t rand_xor_mask = rd(); 
-    uint32_t num_seeds = params.itopk_size / 2;
+    uint32_t num_seeds = params.itopk_size / 4;
 
     // E. 启动 Kernel
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    std::cout << ">> [cagra::search] Launching search kernel..." << std::endl;
+    // std::cout << ">> [cagra::search] Launching search kernel..." << std::endl;
     cagra::device::search_kernel<<<grid, block, smem_size>>>(
         d_out_indices_u32,
         d_out_dists,
@@ -765,7 +768,7 @@ void search(const float* d_dataset,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
-    std::cout << ">> [cagra::search] Search kernel finished." << std::endl;
+    // std::cout << ">> [cagra::search] Search kernel finished." << std::endl;
 
     // F. 类型转换
     size_t total_elements = num_queries * topk;
@@ -781,6 +784,131 @@ void search(const float* d_dataset,
 
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_out_indices_u32));
+}
+
+// =============================================================================
+// Helper: CPU 侧拓扑更新 (随机替换策略)
+// =============================================================================
+void update_topology_random_cpu(uint32_t* h_graph,
+                                const int64_t* h_search_indices,
+                                size_t num_existing,
+                                size_t num_new,
+                                uint32_t graph_degree,
+                                uint32_t search_k)
+{
+    // 保护区大小：前一半不动，后一半可以随机替换
+    const uint32_t num_protected = graph_degree / 2;
+    const uint32_t num_unprotected = graph_degree - num_protected;
+
+    // OpenMP 并行处理每个新插入的节点
+    #pragma omp parallel for
+    for (size_t i = 0; i < num_new; ++i) {
+        // 新节点的逻辑 ID 是接着旧节点后面的
+        size_t new_node_id = num_existing + i;
+        
+        // 伪随机数生成
+        uint64_t rng_state = new_node_id * 0x9e3779b97f4a7c15; 
+
+        // --- Part A: 填充新节点的出边 (我指向谁) ---
+        uint32_t* new_node_neighbors = h_graph + new_node_id * graph_degree;
+        
+        // 初始化
+        for(uint32_t k=0; k<graph_degree; ++k) new_node_neighbors[k] = 0xFFFFFFFF;
+
+        // 直接从搜索结果中取 Top-Degree
+        for (uint32_t k = 0; k < graph_degree; ++k) {
+            int64_t idx = h_search_indices[i * search_k + k];
+            // 确保指向的是有效的旧节点
+            if (idx >= 0 && idx < (int64_t)num_existing) {
+                new_node_neighbors[k] = (uint32_t)idx;
+            }
+        }
+
+        // --- Part B: 更新反向边 (随机替换谁指向我) ---
+        for (int m = 0; m < search_k; ++m) {
+            int64_t neighbor_idx_64 = h_search_indices[i * search_k + m];
+            if (neighbor_idx_64 < 0 || neighbor_idx_64 >= (int64_t)num_existing) continue;
+            
+            uint32_t old_id = (uint32_t)neighbor_idx_64;
+            uint32_t* old_neighbors = h_graph + old_id * graph_degree;
+
+            // 1. 查重
+            bool exists = false;
+            for (uint32_t x = 0; x < graph_degree; ++x) {
+                if (old_neighbors[x] == (uint32_t)new_node_id) {
+                    exists = true; 
+                    break;
+                }
+            }
+
+            if (!exists) {
+                // 2. 随机替换逻辑 (仅在 Unprotected 区域)
+                rng_state = rng_state * 6364136223846793005ULL + 1;
+                uint32_t random_offset = (rng_state >> 32) % num_unprotected;
+                uint32_t replace_idx = num_protected + random_offset;
+
+                old_neighbors[replace_idx] = (uint32_t)new_node_id;
+            }
+        }
+    }
+}
+
+void insert(const float* d_dataset,     // 旧数据
+            size_t num_existing,
+            size_t num_new,
+            const float* d_new_data,    // 新数据 (分离指针)
+            uint32_t* d_graph,          // 图数据 (显存，空间需足够)
+            uint32_t* h_graph,          // 图数据 (主机，空间需足够)
+            uint32_t graph_degree,
+            SearchParams search_params)
+{
+    if (num_new == 0) return;
+    // std::cout << ">> [cagra::insert] Inserting " << num_new << " nodes..." << std::endl;
+
+    // 1. 为增量数据分配显存 (Search Results)
+    uint32_t search_k = graph_degree * 2; 
+    
+    int64_t* d_search_indices;
+    float* d_search_dists;
+    CUDA_CHECK(cudaMalloc(&d_search_indices, num_new * search_k * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_search_dists, num_new * search_k * sizeof(float)));
+
+    // 2. 执行搜索 (Find Neighbors)
+    // 这里的逻辑是：把 d_new_data 作为 query，在 d_dataset (旧库) 中搜索
+    find_near_nodes(d_dataset, 
+                    num_existing, 
+                    num_new, 
+                    d_new_data, // 直接传入新数据指针
+                    d_graph, 
+                    graph_degree, 
+                    search_k, 
+                    search_params, 
+                    d_search_indices, 
+                    d_search_dists);
+
+    // 3. 同步数据到 CPU
+    // 3.1 拷回搜索结果
+    std::vector<int64_t> h_indices(num_new * search_k);
+    CUDA_CHECK(cudaMemcpy(h_indices.data(), d_search_indices, num_new * search_k * sizeof(int64_t), cudaMemcpyDeviceToHost));
+
+    // 4. 处理节点来更新反向边 (CPU Random Update)
+    // 这个函数会填充 h_graph 后半部分的新节点出边，并修改前半部分的旧节点入边
+    update_topology_random_cpu(h_graph,
+                               h_indices.data(),
+                               num_existing,
+                               num_new,
+                               graph_degree,
+                               search_k);
+
+    // 5. 将更新后的图写回 GPU
+    // 必须全量写回，因为旧节点的邻居列表也被修改了
+    CUDA_CHECK(cudaMemcpy(d_graph, h_graph, (num_existing + num_new) * graph_degree * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    // 清理资源
+    CUDA_CHECK(cudaFree(d_search_indices));
+    CUDA_CHECK(cudaFree(d_search_dists));
+    
+    // std::cout << ">> [cagra::insert] Finished." << std::endl;
 }
 
 } // namespace cagra

@@ -224,8 +224,22 @@ __global__ void search_kernel(
     // 4. 搜索主循环
     // -------------------------------------------------------------
     uint32_t iter = 0;
+    uint32_t hash_reset_iter = 20; // 每隔这么多轮重置 Hashmap
     for (; iter < max_iterations; ++iter) {
         
+        // 更新哈希表，清空并加入topk中的数据到哈希表中
+        if (iter > 0 && (iter % hash_reset_iter == 0)) {
+            // 1. 清空
+            cagra::hashmap::init(visited_hash, hash_bitlen);
+            __syncthreads();
+            
+            // 2. 恢复 (把 itopk 里的节点重新加回去)
+            // 为什么只恢复 itopk？因为只有这些节点是“当前最优”，
+            // 我们不希望重新计算它们的距离，也不希望重新扩展它们（如果已标记为 Parent）。
+            cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
+            __syncthreads();
+        }
+
         // --- Step A: 排序 (仅 Warp 0 工作) ---
         // 我们根据 queue_capacity 决定每个线程负责多少个元素 (N)
         // Warp 0 有 32 个线程。 Capacity = 32 * N
@@ -386,7 +400,7 @@ __global__ void search_kernel(
     }
 
 
-    if (tid == 0) printf("[iter] iter nums is %d\n", iter);
+    // if (tid == 0) printf("[iter] iter nums is %d\n", iter);
     if (tid == 0 && num_executed_iterations) {
         num_executed_iterations[query_id] = iter;
     }

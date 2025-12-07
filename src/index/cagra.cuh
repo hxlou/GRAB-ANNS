@@ -130,4 +130,13 @@ void search(const float* d_dataset,
             int64_t* d_out_indices, 
             float* d_out_dists);
 
+void insert(const float* d_dataset,     // 旧数据
+            size_t num_existing,
+            size_t num_new,
+            const float* d_new_data,    // 新数据 (分离指针)
+            uint32_t* d_graph,          // 图数据 (显存，空间需足够)
+            uint32_t* h_graph,          // 图数据 (主机，空间需足够)
+            uint32_t graph_degree,
+            SearchParams search_params);
+
 } // namespace cagra

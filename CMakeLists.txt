@@ -7,6 +7,9 @@ endif()
 
 project(LightCagra LANGUAGES CXX CUDA)
 
+# 设置 CUDA 运行时库为共享库
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+
 # ==========================================
 # 1. 编译选项设置
 # ==========================================
@@ -14,59 +17,90 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # ==========================================
-# 2. 寻找依赖 (FAISS & CUDA)
+# 2. 依赖查找 (Conda, OpenMP, CUDA, FAISS)
 # ==========================================
-# 告诉 CMake 去 CONDA 环境里找包
+
+# 2.1 Conda 环境配置
 if(DEFINED ENV{CONDA_PREFIX})
-    list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
-    include_directories("$ENV{CONDA_PREFIX}/include")
-    link_directories("$ENV{CONDA_PREFIX}/lib")
+    set(CONDA_ROOT "$ENV{CONDA_PREFIX}")
+    message(STATUS ">> Using Conda Env: ${CONDA_ROOT}")
+    
+    # 将 Conda 路径设为最高优先级
+    list(PREPEND CMAKE_PREFIX_PATH "${CONDA_ROOT}")
+    include_directories("${CONDA_ROOT}/include")
+    link_directories("${CONDA_ROOT}/lib")
+else()
+    message(WARNING "Not in a Conda environment. Relying on system paths.")
 endif()
 
-# 查找 CUDA 工具包 (用于 cublas, cudart)
-find_package(CUDAToolkit REQUIRED)
+# 2.2 查找 OpenMP
+find_package(OpenMP REQUIRED)
 
-# 查找 FAISS
-# Conda 环境下通常没有标准的 Findfaiss.cmake，我们直接查找库文件
-find_library(FAISS_LIB faiss REQUIRED)
+# 2.3 查找 CUDA Toolkit (核心)
+# 这提供了 CUDA::cudart (Runtime) 和 CUDA::cuda_driver (Driver API for VMM)
+find_package(CUDAToolkit REQUIRED)
+include_directories(${CUDAToolkit_INCLUDE_DIRS})
+
+# 2.4 查找 FAISS
+# 优先在 Conda lib 下查找
+find_library(FAISS_LIB faiss REQUIRED HINTS "${CONDA_ROOT}/lib")
 
 # ==========================================
 # 3. 定义核心库 (light_cagra)
 # ==========================================
-add_library(light_cagra
+add_library(light_cagra SHARED
     src/index/cagra.cu
+    src/cagraIndex.cu  # 确保你的文件是 .cu 后缀
 )
 
-# 包含头文件路径
 target_include_directories(light_cagra PUBLIC 
-    src
+    src 
     src/index
 )
 
 # 链接依赖
 target_link_libraries(light_cagra PUBLIC
-    ${FAISS_LIB}      # 链接 FAISS
-    CUDA::cudart      # FAISS 依赖
-    CUDA::cublas      # FAISS 依赖
+    ${FAISS_LIB}
+    CUDA::cudart       # CUDA Runtime API (cudaMalloc, etc.)
+    CUDA::cublas       # FAISS 依赖
+    CUDA::cuda_driver  # 【重要】CUDA Driver API (cuInit, cuMemCreate for VMM)
+    OpenMP::OpenMP_CXX
 )
 
 # ==========================================
-# 4. 定义测试可执行文件
+# 4. 定义测试辅助函数
 # ==========================================
-add_executable(test_knn_build tests/test_knn_build.cpp)
-target_link_libraries(test_knn_build PRIVATE light_cagra)
+function(add_cagra_test test_name source_file)
+    # 根据源文件后缀决定是 C++ 还是 CUDA 链接
+    add_executable(${test_name} ${source_file})
+    
+    target_link_libraries(${test_name} PRIVATE 
+        light_cagra 
+        CUDA::cudart
+        OpenMP::OpenMP_CXX
+    )
+endfunction()
 
-add_executable(test_cagra_build tests/test_cagra_build.cpp)
-target_link_libraries(test_cagra_build PRIVATE light_cagra)
+# ==========================================
+# 5. 添加测试目标
+# ==========================================
 
-add_executable(test_bitonic tests/test_bitonic.cu)
-target_link_libraries(test_bitonic PRIVATE light_cagra)
+# 基础组件测试
+add_cagra_test(test_knn_build    tests/test_knn_build.cu)
+add_cagra_test(test_bitonic      tests/test_bitonic.cu)
+add_cagra_test(test_hashmap      tests/test_hashmap.cu)
+add_cagra_test(test_cagra        tests/test_cagra.cu)
+# 索引功能测试
 
-add_executable(test_hashmap tests/test_hashmap.cu)
-target_link_libraries(test_hashmap PRIVATE light_cagra)
+add_cagra_test(test_cagra_index  tests/test_cagra_index.cu)
+add_cagra_test(test_cagra_insert tests/test_cagra_insert.cu)
 
-add_executable(test_cagra tests/test_cagra.cpp)
-target_link_libraries(test_cagra PRIVATE light_cagra)
-
-add_executable(test_sort_impl tests/test_sort_impl.cu)
-target_link_libraries(test_sort_impl PRIVATE light_cagra)
+# FAISS HNSW 对比测试 (如果有的话)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_faiss_hnsw_insert.cpp")
+    add_executable(test_faiss_hnsw tests/test_faiss_hnsw_insert.cpp)
+    target_link_libraries(test_faiss_hnsw PRIVATE 
+        light_cagra 
+        OpenMP::OpenMP_CXX
+        CUDA::cudart
+    )
+endif()

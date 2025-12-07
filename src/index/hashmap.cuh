@@ -85,5 +85,31 @@ __device__ __forceinline__ bool insert(uint32_t* table, const uint32_t bitlen, c
     return false; 
 }
 
+/**
+ * @brief 重置后恢复 Hash 表 (Restore)
+ * 
+ * 将当前的 TopK 结果重新插入 Hash 表，防止走回头路。
+ * 
+ * @param table         Hash 表
+ * @param bitlen        Hash 表大小对数
+ * @param result_indices 当前的结果队列
+ * @param itopk_size    需要恢复的节点数量
+ */
+__device__ inline void restore(uint32_t* table, uint32_t bitlen, const uint32_t* result_indices, uint32_t itopk_size) {
+    // 线程并行恢复
+    for (uint32_t i = threadIdx.x; i < itopk_size; i += blockDim.x) {
+        uint32_t idx_with_flag = result_indices[i];
+        
+        // 去掉 MSB 标记 (Visited Flag)
+        // 因为 Hashmap 里存的是原始 ID
+        uint32_t node_id = idx_with_flag & 0x7FFFFFFF;
+        
+        // 只插入有效节点
+        if (node_id != 0xFFFFFFFF) {
+            insert(table, bitlen, node_id);
+        }
+    }
+}
+
 } // namespace hashmap
 } // namespace cagra
