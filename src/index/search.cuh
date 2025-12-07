@@ -225,6 +225,7 @@ __global__ void search_kernel(
     // -------------------------------------------------------------
     uint32_t iter = 0;
     uint32_t hash_reset_iter = 20; // 每隔这么多轮重置 Hashmap
+
     for (; iter < max_iterations; ++iter) {
         
         // 更新哈希表，清空并加入topk中的数据到哈希表中
@@ -257,6 +258,19 @@ __global__ void search_kernel(
                 load_sort_store<8>(result_dists, result_indices, 256);
             } else if (queue_capacity == 512) {
                 load_sort_store<16>(result_dists, result_indices, 512);
+            } else if (queue_capacity == 1024) {
+                load_sort_store<32>(result_dists, result_indices, 1024);
+            } else if (queue_capacity == 2048) {
+                load_sort_store<64>(result_dists, result_indices, 2048);
+            } else if (queue_capacity == 4096) {
+                load_sort_store<128>(result_dists, result_indices, 4096);
+            } else if (queue_capacity == 8192) {
+                load_sort_store<256>(result_dists, result_indices, 8192);
+            } else {
+                // 不支持的容量大小
+                if (tid == 0) {
+                    printf(">> [search_kernel] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+                }
             }
             // 如果更大，可以继续加 case
         }
@@ -387,6 +401,10 @@ __global__ void search_kernel(
         else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
         else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
         else if (queue_capacity == 512) load_sort_store<16>(result_dists, result_indices, 512);
+        else if (queue_capacity == 1024) load_sort_store<32>(result_dists, result_indices, 1024);
+        else if (queue_capacity == 2048) load_sort_store<64>(result_dists, result_indices, 2048);
+        else if (queue_capacity == 4096) load_sort_store<128>(result_dists, result_indices, 4096);
+        else if (queue_capacity == 8192) load_sort_store<256>(result_dists, result_indices, 8192);
     }
     __syncthreads();
 

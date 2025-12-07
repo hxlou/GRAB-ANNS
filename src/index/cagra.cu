@@ -725,6 +725,8 @@ void search(const float* d_dataset,
     size_t smem_size = cagra::detail::calculate_and_check_smem(
         itopk_size, params.search_width, graph_degree
     );
+    printf(">> [cagra::search] Using %zu KB shared memory per block.\n", smem_size / 1024);
+    
 
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
@@ -768,7 +770,7 @@ void search(const float* d_dataset,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
-    // std::cout << ">> [cagra::search] Search kernel finished." << std::endl;
+    
 
     // F. 类型转换
     size_t total_elements = num_queries * topk;
