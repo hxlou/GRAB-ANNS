@@ -76,6 +76,10 @@ bool parseMeta(const std::string& path, int& dim, int& total) {
 // 主测试流程
 // =============================================================================
 int main() {
+
+    int cuda_device = 1;
+    CHECK_CUDA(cudaSetDevice(cuda_device));
+
     // ---------------------------------------------------------
     // 1. 配置
     // ---------------------------------------------------------
@@ -83,7 +87,7 @@ int main() {
     std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";
 
     // 测试参数
-    int num_queries = 1;
+    int num_queries = 32;
     int k = 20; // Top-K
 
     // CAGRA 参数
@@ -157,7 +161,7 @@ int main() {
     {
         faiss::gpu::StandardGpuResources res;
         faiss::gpu::GpuIndexFlatConfig config;
-        config.device = 0;
+        config.device = 1;
         faiss::gpu::GpuIndexFlatL2 flat_index(&res, dim, config); // 必须用 L2
         flat_index.add(vector_total, d_dataset); 
         flat_index.search(num_queries, d_queries, k, d_gt_dists, d_gt_indices);
