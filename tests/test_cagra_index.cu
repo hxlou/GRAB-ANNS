@@ -246,6 +246,7 @@ void run_test_insert(const float* full_data, int dim, size_t n_old, size_t n_new
     // 计算总召回率 (覆盖所有批次)
     double recall = calculate_recall(TOTAL_QUERIES, K, gt_indices.data(), all_out_indices.data());
     double avg_qps = (TOTAL_QUERIES * 1000.0) / total_search_time_ms;
+    double avg_ips = (n_new * 1000.0) / t_insert;
     double avg_latency = total_search_time_ms / NUM_BATCHES; // 平均每个Batch的耗时
 
     std::cout << "------------------------------------------------" << std::endl;
@@ -253,6 +254,7 @@ void run_test_insert(const float* full_data, int dim, size_t n_old, size_t n_new
     std::cout << "   Total Time:    " << total_search_time_ms << " ms" << std::endl;
     std::cout << "   Avg Latency:   " << avg_latency << " ms / batch(" << BATCH_SIZE << ")" << std::endl;
     std::cout << "   QPS:           " << std::fixed << std::setprecision(2) << avg_qps << std::endl;
+    std::cout << "   IPS:           " << std::fixed << std::setprecision(2) << avg_ips << std::endl;
     std::cout << "   Avg Recall:    " << std::fixed << std::setprecision(2) << recall << "%" << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 }
@@ -278,8 +280,8 @@ int main() {
     const float* data = (const float*)mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
 
     // Run Tests
-    size_t n_build = 500000;
-    size_t n_insert = 200000;
+    size_t n_build = 50000;
+    size_t n_insert = 500000;
 
     run_test_build(data, dim, n_build, index_path);
     run_test_insert(data, dim, n_build, n_insert, index_path);

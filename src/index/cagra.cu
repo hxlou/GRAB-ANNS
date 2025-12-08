@@ -77,7 +77,7 @@ void generate_knn_graph(const float* d_dataset,
     res.setTempMemory(1024 * 1024 * 512); 
 
     // 2. 配置参数
-    int nlist = static_cast<int>(4 * std::sqrt(static_cast<double>(num_dataset)));
+    int nlist = static_cast<int>(2 * std::sqrt(static_cast<double>(num_dataset)));
     nlist = std::max(1, std::min((int)num_dataset, nlist));
     int M = 32; 
     int nbits = 8;
@@ -725,7 +725,7 @@ void search(const float* d_dataset,
     size_t smem_size = cagra::detail::calculate_and_check_smem(
         itopk_size, params.search_width, graph_degree
     );
-    printf(">> [cagra::search] Using %zu KB shared memory per block.\n", smem_size / 1024);
+    // printf(">> [cagra::search] Using %zu KB shared memory per block.\n", smem_size / 1024);
     
 
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
@@ -788,72 +788,6 @@ void search(const float* d_dataset,
     CUDA_CHECK(cudaFree(d_out_indices_u32));
 }
 
-// =============================================================================
-// Helper: CPU 侧拓扑更新 (随机替换策略)
-// =============================================================================
-void update_topology_random_cpu(uint32_t* h_graph,
-                                const int64_t* h_search_indices,
-                                size_t num_existing,
-                                size_t num_new,
-                                uint32_t graph_degree,
-                                uint32_t search_k)
-{
-    // 保护区大小：前一半不动，后一半可以随机替换
-    const uint32_t num_protected = graph_degree / 2;
-    const uint32_t num_unprotected = graph_degree - num_protected;
-
-    // OpenMP 并行处理每个新插入的节点
-    #pragma omp parallel for
-    for (size_t i = 0; i < num_new; ++i) {
-        // 新节点的逻辑 ID 是接着旧节点后面的
-        size_t new_node_id = num_existing + i;
-        
-        // 伪随机数生成
-        uint64_t rng_state = new_node_id * 0x9e3779b97f4a7c15; 
-
-        // --- Part A: 填充新节点的出边 (我指向谁) ---
-        uint32_t* new_node_neighbors = h_graph + new_node_id * graph_degree;
-        
-        // 初始化
-        for(uint32_t k=0; k<graph_degree; ++k) new_node_neighbors[k] = 0xFFFFFFFF;
-
-        // 直接从搜索结果中取 Top-Degree
-        for (uint32_t k = 0; k < graph_degree; ++k) {
-            int64_t idx = h_search_indices[i * search_k + k];
-            // 确保指向的是有效的旧节点
-            if (idx >= 0 && idx < (int64_t)num_existing) {
-                new_node_neighbors[k] = (uint32_t)idx;
-            }
-        }
-
-        // --- Part B: 更新反向边 (随机替换谁指向我) ---
-        for (int m = 0; m < search_k; ++m) {
-            int64_t neighbor_idx_64 = h_search_indices[i * search_k + m];
-            if (neighbor_idx_64 < 0 || neighbor_idx_64 >= (int64_t)num_existing) continue;
-            
-            uint32_t old_id = (uint32_t)neighbor_idx_64;
-            uint32_t* old_neighbors = h_graph + old_id * graph_degree;
-
-            // 1. 查重
-            bool exists = false;
-            for (uint32_t x = 0; x < graph_degree; ++x) {
-                if (old_neighbors[x] == (uint32_t)new_node_id) {
-                    exists = true; 
-                    break;
-                }
-            }
-
-            if (!exists) {
-                // 2. 随机替换逻辑 (仅在 Unprotected 区域)
-                rng_state = rng_state * 6364136223846793005ULL + 1;
-                uint32_t random_offset = (rng_state >> 32) % num_unprotected;
-                uint32_t replace_idx = num_protected + random_offset;
-
-                old_neighbors[replace_idx] = (uint32_t)new_node_id;
-            }
-        }
-    }
-}
 
 void insert(const float* d_dataset,     // 旧数据
             size_t num_existing,
@@ -877,6 +811,7 @@ void insert(const float* d_dataset,     // 旧数据
 
     // 2. 执行搜索 (Find Neighbors)
     // 这里的逻辑是：把 d_new_data 作为 query，在 d_dataset (旧库) 中搜索
+    // auto t1 = std::chrono::high_resolution_clock::now();
     find_near_nodes(d_dataset, 
                     num_existing, 
                     num_new, 
@@ -888,23 +823,31 @@ void insert(const float* d_dataset,     // 旧数据
                     d_search_indices, 
                     d_search_dists);
 
-    // 3. 同步数据到 CPU
-    // 3.1 拷回搜索结果
-    std::vector<int64_t> h_indices(num_new * search_k);
-    CUDA_CHECK(cudaMemcpy(h_indices.data(), d_search_indices, num_new * search_k * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    // auto t2 =  std::chrono::high_resolution_clock::now();
+
+    // // 3. 同步数据到 CPU
+    // // 3.1 拷回搜索结果
+    // std::vector<int64_t> h_indices(num_new * search_k);
+    // CUDA_CHECK(cudaMemcpy(h_indices.data(), d_search_indices, num_new * search_k * sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     // 4. 处理节点来更新反向边 (CPU Random Update)
     // 这个函数会填充 h_graph 后半部分的新节点出边，并修改前半部分的旧节点入边
-    update_topology_random_cpu(h_graph,
-                               h_indices.data(),
+    update_topology_random_gpu(d_graph,
+                               d_search_indices,
                                num_existing,
                                num_new,
                                graph_degree,
                                search_k);
 
-    // 5. 将更新后的图写回 GPU
-    // 必须全量写回，因为旧节点的邻居列表也被修改了
-    CUDA_CHECK(cudaMemcpy(d_graph, h_graph, (num_existing + num_new) * graph_degree * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    // // 5. 将更新后的图写回 GPU
+    // // 必须全量写回，因为旧节点的邻居列表也被修改了
+    // CUDA_CHECK(cudaMemcpy(d_graph, h_graph, (num_existing + num_new) * graph_degree * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    // auto t3 =  std::chrono::high_resolution_clock::now();
+
+    // auto duration_search = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    // auto duration_update = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    // std::cout << ">> [cagra::insert] Search Time: " << duration_search << " ms, Update Time: " << duration_update << " ms." << std::endl;
 
     // 清理资源
     CUDA_CHECK(cudaFree(d_search_indices));

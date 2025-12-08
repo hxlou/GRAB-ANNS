@@ -6,21 +6,21 @@
 #include <iomanip>
 #include <random>
 #include <algorithm>
+#include <set>
 
-// 系统库
+// System headers
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
-// FAISS 头文件 (HNSW 是 CPU 索引)
+// FAISS headers
 #include <faiss/IndexHNSW.h>
 #include <faiss/IndexFlat.h>
-#include <faiss/index_io.h>
 #include <faiss/utils/utils.h>
 
 // -----------------------------------------------------------------------------
-// 计时器
+// Timer Helper
 // -----------------------------------------------------------------------------
 class Timer {
 public:
@@ -35,7 +35,7 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// 数据加载辅助 (复用之前的逻辑)
+// Data Parsing Helper
 // -----------------------------------------------------------------------------
 bool parseMeta(const std::string& path, int& dim, int& total) {
     std::ifstream file(path);
@@ -59,115 +59,151 @@ bool parseMeta(const std::string& path, int& dim, int& total) {
 }
 
 // -----------------------------------------------------------------------------
-// 主程序
+// Main Benchmark
 // -----------------------------------------------------------------------------
 int main() {
-    // 1. 路径配置 (请确保文件存在)
+    // 1. Configuration
     std::string meta_path = "../data/hotpotqa_fullwiki_train.meta.json";
     std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";
 
-    // 2. 实验参数
-    const size_t BASE_SIZE = 50000;   // 初始构建大小
-    const size_t INSERT_SIZE = 50000; // 插入大小
+    const size_t BASE_SIZE = 50000;
+    const size_t INSERT_SIZE = 50000;
     const size_t TOTAL_SIZE = BASE_SIZE + INSERT_SIZE;
     
-    // HNSW 参数
-    const int M = 32;          // 每个节点的边数 (同 CAGRA 的 graph_degree)
-    const int efConstruction = 128; // 构建时的搜索深度 (越大越准但越慢)
+    // HNSW Params
+    const int M = 32;
+    const int efConstruction = 128;
+    const int efSearch = 64;
+
+    // Search Params
+    const int SEARCH_BATCH_SIZE = 32;
+    const int SEARCH_ITERATIONS = 10;
+    const int TOTAL_QUERIES = SEARCH_BATCH_SIZE * SEARCH_ITERATIONS;
+    const int K = 10; // Top-K
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "FAISS HNSW (CPU) Benchmark" << std::endl;
-    std::cout << "Base: " << BASE_SIZE << ", Insert: " << INSERT_SIZE << std::endl;
-    std::cout << "HNSW Config: M=" << M << ", efConstruction=" << efConstruction << std::endl;
+    std::cout << "Base Size: " << BASE_SIZE << ", Insert Size: " << INSERT_SIZE << std::endl;
+    std::cout << "Search: " << SEARCH_ITERATIONS << " iters x " << SEARCH_BATCH_SIZE << " queries" << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 3. 加载数据
+    // 2. Load Data
     int dim = -1, file_total = -1;
     if (!parseMeta(meta_path, dim, file_total)) {
-        std::cerr << "Error parsing meta file." << std::endl;
+        std::cerr << "Error parsing meta file: " << meta_path << std::endl;
         return 1;
     }
-    
+
     if (file_total < TOTAL_SIZE) {
-        std::cerr << "Error: File only has " << file_total << " vectors, need " << TOTAL_SIZE << std::endl;
+        std::cerr << "Error: Not enough data. File has " << file_total 
+                  << ", need " << TOTAL_SIZE << std::endl;
         return 1;
     }
 
     int fd = open(bin_path.c_str(), O_RDONLY);
+    if (fd == -1) { std::cerr << "Error opening bin file." << std::endl; return 1; }
+    
     size_t file_bytes = (size_t)file_total * dim * sizeof(float);
-    // 使用 mmap 读取，避免拷贝
     const float* host_data = (const float*)mmap(nullptr, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (host_data == MAP_FAILED) { std::cerr << "mmap failed." << std::endl; return 1; }
+    if (host_data == MAP_FAILED) { std::cerr << "mmap failed." << std::endl; close(fd); return 1; }
 
-    std::cout << ">> Data loaded (Mapped). Dim: " << dim << std::endl;
+    std::cout << ">> Data loaded via mmap. Dim: " << dim << std::endl;
 
-    // 4. 初始化 FAISS HNSW 索引
-    // IndexHNSWFlat: HNSW 图结构 + 原始向量存储 (Flat)
+    // 3. Initialize HNSW Index
     faiss::IndexHNSWFlat index(dim, M, faiss::METRIC_L2);
     index.hnsw.efConstruction = efConstruction;
-    
-    // 也可以设置多线程构建
-    // omp_set_num_threads(16); 
+    index.hnsw.efSearch = efSearch;
 
-    // 5. 构建 Base 索引 (5w)
-    std::cout << ">> [Step 1] Building Base Index (" << BASE_SIZE << ")..." << std::endl;
+    // 4. Build Base Index (500k)
+    std::cout << ">> [Step 1] Building Base Index (" << BASE_SIZE << " vectors)..." << std::endl;
     Timer timer;
-    
-    // faiss::Index 的 add 方法会将数据拷贝到内部存储
     index.add(BASE_SIZE, host_data);
-    
-    double build_time = timer.elapsed_ms();
-    std::cout << "   Base Build Time: " << build_time << " ms" << std::endl;
+    std::cout << "   Base Build Time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-    // 6. 执行插入 (5w) 并统计耗时
+    // 5. Insert Benchmark (200k)
     std::cout << ">> [Step 2] Inserting " << INSERT_SIZE << " vectors..." << std::endl;
-    
     const float* insert_data_ptr = host_data + BASE_SIZE * dim;
     
     timer.reset();
     index.add(INSERT_SIZE, insert_data_ptr);
-    double insert_time = timer.elapsed_ms();
-
-    // 7. 统计结果
-    std::cout << "---------------------------------------------------" << std::endl;
-    std::cout << "Insertion Performance Report (CPU HNSW):" << std::endl;
-    std::cout << "  Count:       " << INSERT_SIZE << std::endl;
-    std::cout << "  Total Time:  " << insert_time << " ms" << std::endl;
-    std::cout << "  Throughput:  " << (INSERT_SIZE * 1000.0 / insert_time) << " vec/sec" << std::endl;
-    std::cout << "  Avg Latency: " << (insert_time / INSERT_SIZE) << " ms/vec" << std::endl;
-    std::cout << "---------------------------------------------------" << std::endl;
-
-    // 8. 简单验证 (Search Sanity Check)
-    std::cout << ">> [Verification] Running simple search..." << std::endl;
-    int k = 10;
-    int num_queries = 100;
-    std::vector<float> queries(num_queries * dim);
-    std::vector<faiss::idx_t> I(num_queries * k);
-    std::vector<float> D(num_queries * k);
-
-    // 随机取 100 个做查询
-    // (取自刚才插入的后半部分数据，确保能搜到新插入的内容)
-    for(int i=0; i<num_queries; ++i) {
-        size_t idx = BASE_SIZE + i; 
-        std::copy(host_data + idx * dim, host_data + (idx + 1) * dim, queries.data() + i * dim);
-    }
-
-    index.hnsw.efSearch = 64; // 搜索时的参数
+    double insert_time_ms = timer.elapsed_ms();
     
-    timer.reset();
-    index.search(num_queries, queries.data(), k, D.data(), I.data());
-    double search_time = timer.elapsed_ms();
+    double ips = (INSERT_SIZE * 1000.0) / insert_time_ms;
+    std::cout << "   Insert Time: " << insert_time_ms << " ms" << std::endl;
+    std::cout << "   IPS: " << std::fixed << std::setprecision(2) << ips << " vectors/sec" << std::endl;
 
-    // 检查 Recall@1 (Self-search 应该是自己)
-    int recall = 0;
-    for(int i=0; i<num_queries; ++i) {
-        if (I[i*k] == (BASE_SIZE + i)) recall++;
+    // 6. Search Benchmark & Ground Truth Verification
+    std::cout << ">> [Step 3] Preparing Search & Ground Truth..." << std::endl;
+
+    // Create a Ground Truth Index (Brute Force) containing ALL data (700k)
+    // Note: For very large datasets, this might be slow, but for 700k it's manageable on CPU
+    faiss::IndexFlatL2 gt_index(dim);
+    gt_index.add(TOTAL_SIZE, host_data); 
+
+    // Generate random query indices
+    std::vector<int> query_indices(TOTAL_QUERIES);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, TOTAL_SIZE - 1);
+    for(int i=0; i<TOTAL_QUERIES; ++i) query_indices[i] = dis(gen);
+
+    // Prepare query buffer
+    std::vector<float> query_vectors(TOTAL_QUERIES * dim);
+    for(int i=0; i<TOTAL_QUERIES; ++i) {
+        const float* src = host_data + (size_t)query_indices[i] * dim;
+        std::copy(src, src + dim, query_vectors.begin() + i * dim);
     }
 
-    std::cout << "   Search Time: " << search_time << " ms" << std::endl;
-    std::cout << "   Recall@1: " << recall << "/" << num_queries << " (" << recall << "%)" << std::endl;
+    // Run Benchmark
+    std::cout << "   Running " << SEARCH_ITERATIONS << " iterations (Batch=" << SEARCH_BATCH_SIZE << ")..." << std::endl;
+    
+    double total_search_time_ms = 0;
+    long total_recall_hits = 0;
 
-    // 清理
+    for (int it = 0; it < SEARCH_ITERATIONS; ++it) {
+        printf("search iteration %d / %d\r", it + 1, SEARCH_ITERATIONS);
+        // Pointers for current batch
+        const float* batch_queries = query_vectors.data() + it * SEARCH_BATCH_SIZE * dim;
+        
+        // Output buffers for HNSW
+        std::vector<faiss::idx_t> I_hnsw(SEARCH_BATCH_SIZE * K);
+        std::vector<float> D_hnsw(SEARCH_BATCH_SIZE * K);
+
+        // A. Measure HNSW Search Time
+        auto t1 = std::chrono::high_resolution_clock::now();
+        index.search(SEARCH_BATCH_SIZE, batch_queries, K, D_hnsw.data(), I_hnsw.data());
+        auto t2 = std::chrono::high_resolution_clock::now();
+        total_search_time_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+        // B. Calculate Ground Truth (Brute Force)
+        std::vector<faiss::idx_t> I_gt(SEARCH_BATCH_SIZE * K);
+        std::vector<float> D_gt(SEARCH_BATCH_SIZE * K);
+        gt_index.search(SEARCH_BATCH_SIZE, batch_queries, K, D_gt.data(), I_gt.data());
+
+        // C. Calculate Recall@K
+        for (int q = 0; q < SEARCH_BATCH_SIZE; ++q) {
+            std::set<faiss::idx_t> gt_set;
+            for (int k = 0; k < K; ++k) gt_set.insert(I_gt[q * K + k]);
+
+            for (int k = 0; k < K; ++k) {
+                if (gt_set.count(I_hnsw[q * K + k])) {
+                    total_recall_hits++;
+                }
+            }
+        }
+    }
+
+    double avg_recall = (double)total_recall_hits / (TOTAL_QUERIES * K);
+    double qps = (TOTAL_QUERIES * 1000.0) / total_search_time_ms;
+
+    std::cout << "---------------------------------------------------" << std::endl;
+    std::cout << "Final Results:" << std::endl;
+    std::cout << "  IPS (Insertion): " << ips << " vec/sec" << std::endl;
+    std::cout << "  QPS (Search):    " << qps << " queries/sec" << std::endl;
+    std::cout << "  Recall@" << K << ":      " << (avg_recall * 100.0) << " %" << std::endl;
+    std::cout << "---------------------------------------------------" << std::endl;
+
+    // Cleanup
     munmap((void*)host_data, file_bytes);
     close(fd);
 

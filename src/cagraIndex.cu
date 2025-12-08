@@ -22,12 +22,12 @@ CagraIndex::CagraIndex(uint32_t dim, uint32_t graph_degree, size_t vmm_max_bytes
     // 2. 查询参数初始化 (用于 query 接口)
     search_params_.itopk_size = 256;
     search_params_.search_width = 6; // 标准查询平衡参数
-    search_params_.max_iterations = 50;
+    search_params_.max_iterations = 30;
     search_params_.hash_bitlen = 12;
 
     // 3. 插入参数初始化 (用于 insert 内部搜索，需要更激进以保证连通性)
     insert_params_.itopk_size = 128;
-    insert_params_.search_width = 4; // 插入时宽搜，找得更准
+    insert_params_.search_width = 6; // 插入时宽搜，找得更准
     insert_params_.max_iterations = 50;
     insert_params_.hash_bitlen = 12;
 }
@@ -127,7 +127,7 @@ void CagraIndex::insert(size_t new_vectors, const float* insert_vectors) {
 
     // 4. 执行增量插入逻辑
     // 这里的插入，我们每次插入一个batch的大小
-    int batch = 32;
+    int batch = 64;
     for (size_t offset = 0; offset < new_vectors; offset += batch) {
         if (offset % 2048 == 0) {
             std::cout << "    - Inserting vector " << offset << " / " << new_vectors << std::endl;
@@ -194,6 +194,10 @@ void CagraIndex::query(const float* host_queries,
 void CagraIndex::save(const std::string& filepath) {
     std::ofstream out(filepath, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot open file for save");
+
+    // 因为更新不会同步数据到Host端，save前要把图数据同步到Host
+    size_t graph_bytes = current_size_ * graph_degree_ * sizeof(uint32_t);
+    CUDA_CHECK(cudaMemcpy(h_graph_.data(), d_graph_vmm_->data(), graph_bytes, cudaMemcpyDeviceToHost));
 
     out.write((char*)&dim_, sizeof(dim_));
     out.write((char*)&graph_degree_, sizeof(graph_degree_));
