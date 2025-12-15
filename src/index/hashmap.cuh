@@ -6,6 +6,11 @@
 namespace cagra {
 namespace hashmap {
 
+/**
+ * 这个地方不能使用位图，因为位图需要包含范围 0 ～ max_index 的所有值，并不能很好的应对稀疏情况
+ * 对于100w的数据，位图需要 100w / 8 = 125KB 的内存，情况变得更差
+ */
+
 // 定义无效 Key 值 (类似于 NULL)
 constexpr uint32_t INVALID_KEY = 0xFFFFFFFF;
 

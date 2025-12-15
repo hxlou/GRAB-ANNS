@@ -163,44 +163,44 @@ inline void find_near_nodes(const float* d_dataset,
             curr_dists_ptr
         );
 
-        // // 2. 精确距离计算 (GPU Calc)
-        // // 这里的配置是：1 个 Warp 处理 1 对 (Query, Candidate)
-        // int total_pairs = current_batch * search_k;
-        // int threads_calc = total_pairs * 32; 
-        // int block_calc = 256; 
-        // int grid_calc = (threads_calc + block_calc - 1) / block_calc;
+        // 2. 精确距离计算 (GPU Calc)
+        // 这里的配置是：1 个 Warp 处理 1 对 (Query, Candidate)
+        int total_pairs = current_batch * search_k;
+        int threads_calc = total_pairs * 32; 
+        int block_calc = 256; 
+        int grid_calc = (threads_calc + block_calc - 1) / block_calc;
 
-        // detail::insert_refine_kernel_warp<<<grid_calc, block_calc>>>(
-        //     curr_queries_ptr,
-        //     d_dataset,
-        //     curr_indices_ptr,
-        //     curr_dists_ptr,
-        //     num_existing,
-        //     cagra::config::DIM, // 1024
-        //     search_k,
-        //     total_pairs
-        // );
-        // CUDA_CHECK(cudaGetLastError());
+        detail::insert_refine_kernel_warp<<<grid_calc, block_calc>>>(
+            curr_queries_ptr,
+            d_dataset,
+            curr_indices_ptr,
+            curr_dists_ptr,
+            num_existing,
+            cagra::config::DIM, // 1024
+            search_k,
+            total_pairs
+        );
+        CUDA_CHECK(cudaGetLastError());
 
-        // // 3. 排序 (GPU Sort)
-        // // 这里的配置是：1 个 Warp 处理 1 个 Query
-        // int threads_sort = current_batch * 32;
-        // int block_sort = 256;
-        // int grid_sort = (threads_sort + block_sort - 1) / block_sort;
+        // 3. 排序 (GPU Sort)
+        // 这里的配置是：1 个 Warp 处理 1 个 Query
+        int threads_sort = current_batch * 32;
+        int block_sort = 256;
+        int grid_sort = (threads_sort + block_sort - 1) / block_sort;
 
-        // // 根据 search_k 动态分发到对应的模板 Kernel
-        // // N 必须满足 32 * N >= search_k，且为 2 的幂次
-        // if (search_k <= 64) {
-        //     detail::insert_sort_kernel<2><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
-        // } else if (search_k <= 128) {
-        //     detail::insert_sort_kernel<4><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
-        // } else if (search_k <= 256) {
-        //     detail::insert_sort_kernel<8><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
-        // } else {
-        //     // Fallback for larger k, e.g., 512
-        //     detail::insert_sort_kernel<16><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
-        // }
-        // CUDA_CHECK(cudaGetLastError());
+        // 根据 search_k 动态分发到对应的模板 Kernel
+        // N 必须满足 32 * N >= search_k，且为 2 的幂次
+        if (search_k <= 64) {
+            detail::insert_sort_kernel<2><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
+        } else if (search_k <= 128) {
+            detail::insert_sort_kernel<4><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
+        } else if (search_k <= 256) {
+            detail::insert_sort_kernel<8><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
+        } else {
+            // Fallback for larger k, e.g., 512
+            detail::insert_sort_kernel<16><<<grid_sort, block_sort>>>(curr_indices_ptr, curr_dists_ptr, current_batch, search_k);
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
     
     // 等待所有 Batch 完成
@@ -208,7 +208,7 @@ inline void find_near_nodes(const float* d_dataset,
 }
 
 // =============================================================================
-// Helper: CPU 侧拓扑更新 (随机替换策略)
+// Helper: CPU 侧拓扑更新 (随机替换策略) 弃用
 // =============================================================================
 void update_topology_random_cpu(uint32_t* h_graph,
                                 const int64_t* h_search_indices,
@@ -425,7 +425,7 @@ __global__ void apply_topology_updates_kernel(uint32_t* d_graph,
 // =============================================================================
 // Host 接口实现
 // =============================================================================
-void update_topology_random_gpu(uint32_t* d_graph,
+void update_topology_gpu_v1(uint32_t* d_graph,
                                 const int64_t* d_search_indices,
                                 size_t num_existing,
                                 size_t num_new,

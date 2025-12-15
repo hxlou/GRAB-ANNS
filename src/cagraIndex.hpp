@@ -17,7 +17,7 @@ public:
      * @param vmm_max_bytes VMM 允许的最大显存占用
      */
     CagraIndex(uint32_t dim, 
-               uint32_t graph_degree = 32, 
+               uint32_t graph_degree = 32,
                size_t vmm_max_bytes = 20ULL * 1024 * 1024 * 1024);
 
     ~CagraIndex();
@@ -53,9 +53,11 @@ public:
      */
     void query(const float* host_queries, 
                size_t num_queries, 
-               int k, 
+               int k,
                int64_t* host_indices, 
-               float* host_dists);
+               float* host_dists,
+               uint32_t* seeds = nullptr,
+               size_t num_seeds_per_query = 0);
 
     void setBuildParams(uint32_t inter_degree, uint32_t graph_degree) {
         build_params_.intermediate_degree = inter_degree;
@@ -72,10 +74,14 @@ public:
         search_params_.hash_bitlen = hash_bitlen;
     };
 
+    void* get_data() {
+        return h_data_.data();
+    };
+
     void save(const std::string& filepath);
     void load(const std::string& filepath);
 
-    size_t size() const { return current_size_; }
+    size_t size() const { return h_data_.size() / dim_; }
 
 private:
     uint32_t dim_;

@@ -128,7 +128,10 @@ void search(const float* d_dataset,
             int64_t k,
             SearchParams params,
             int64_t* d_out_indices, 
-            float* d_out_dists);
+            float* d_out_dists,
+            const uint32_t* d_seeds = nullptr,
+            const uint32_t num_seeds = 0
+        );
 
 void insert(const float* d_dataset,     // 旧数据
             size_t num_existing,

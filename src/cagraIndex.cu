@@ -22,8 +22,10 @@ CagraIndex::CagraIndex(uint32_t dim, uint32_t graph_degree, size_t vmm_max_bytes
     // 2. 查询参数初始化 (用于 query 接口)
     search_params_.itopk_size = 256;
     search_params_.search_width = 6; // 标准查询平衡参数
-    search_params_.max_iterations = 30;
-    search_params_.hash_bitlen = 12;
+    search_params_.max_iterations = 50;
+    search_params_.hash_bitlen = 13;            // 目前最大为13，哈希表大小为 32KB      hash_size = (1ull << hash_bitlen) * sizeof(uint32_t);
+                                                // 13 对应最大可以储存 8192 个元素
+                                                // 3090ti 的 shared memory默认大小48KB，最大可以手动设置100KB，因此这个参数最大设置为14，对应哈希表64KB
 
     // 3. 插入参数初始化 (用于 insert 内部搜索，需要更激进以保证连通性)
     insert_params_.itopk_size = 128;
@@ -55,7 +57,7 @@ void CagraIndex::add(size_t num_vectors, const float* add_vectors) {
 void CagraIndex::build() {
     if (current_size_ == 0) return;
     
-    std::cout << ">> [CagraIndex::build] Starting build for " << current_size_ << " vectors..." << std::endl;
+    // std::cout << ">> [CagraIndex::build] Starting build for " << current_size_ << " vectors..." << std::endl;
 
     // 1. 调整 Device VMM 大小以匹配 Host 数据
     size_t data_bytes = current_size_ * dim_ * sizeof(float);
@@ -95,7 +97,7 @@ void CagraIndex::build() {
     CUDA_CHECK(cudaFree(d_raw_knn));
     CUDA_CHECK(cudaFree(d_constructed_graph));
 
-    std::cout << ">> [CagraIndex::build] Finished." << std::endl;
+    // std::cout << ">> [CagraIndex::build] Finished." << std::endl;
 }
 
 // =========================================================
@@ -103,6 +105,16 @@ void CagraIndex::build() {
 // =========================================================
 void CagraIndex::insert(size_t new_vectors, const float* insert_vectors) {
     if (new_vectors == 0) return;
+
+    std::cout << ">> [CagraIndex::insert] Preparing to insert " << new_vectors << " vectors." << std::endl;
+    // 如果是一个全新的图，直接调用 build
+    if (current_size_ == 0) {
+        // std::cout << ">> [CagraIndex::insert] Index is empty, performing build instead." << std::endl;
+        add(new_vectors, insert_vectors);
+        build();
+        return;
+    }
+    std::cout << ">> [CagraIndex::insert] Inserting into existing index of size " << current_size_ << "." << std::endl;
 
     size_t old_size = current_size_;
     size_t new_size = old_size + new_vectors;
@@ -151,10 +163,12 @@ void CagraIndex::insert(size_t new_vectors, const float* insert_vectors) {
 // 4. query
 // =========================================================
 void CagraIndex::query(const float* host_queries, 
-                       size_t num_queries, 
-                       int k, 
-                       int64_t* host_indices, 
-                       float* host_dists) 
+               size_t num_queries, 
+               int k,
+               int64_t* host_indices, 
+               float* host_dists,
+               uint32_t* seeds,
+               size_t num_seeds_per_query)
 {
     if (current_size_ == 0) return;
 
@@ -169,6 +183,12 @@ void CagraIndex::query(const float* host_queries,
     CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists, num_queries * k * sizeof(float)));
 
+    uint32_t* d_seed_ptr = nullptr;
+    if (seeds != nullptr && num_seeds_per_query > 0) {
+        CUDA_CHECK(cudaMalloc(&d_seed_ptr, num_queries * num_seeds_per_query * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpy(d_seed_ptr, seeds, num_queries * num_seeds_per_query * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
+
     cagra::search((float*)d_data_vmm_->data(), 
                   current_size_, 
                   (uint32_t*)d_graph_vmm_->data(), 
@@ -178,7 +198,9 @@ void CagraIndex::query(const float* host_queries,
                   k, 
                   search_params_, // 使用成员变量
                   d_indices, 
-                  d_dists);
+                  d_dists,
+                  d_seed_ptr,
+                  num_seeds_per_query);
 
     CUDA_CHECK(cudaMemcpy(host_indices, d_indices, num_queries * k * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(host_dists, d_dists, num_queries * k * sizeof(float), cudaMemcpyDeviceToHost));

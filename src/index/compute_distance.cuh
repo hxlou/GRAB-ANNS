@@ -85,6 +85,63 @@ __device__ inline void compute_distance_to_random_nodes(
     __syncthreads();
 }
 
+__device__ inline void compute_distance_to_init_nodes(
+    uint32_t* result_indices,       // [Output]
+    float* result_distances,        // [Output]
+    const float* query_buffer,      // Shared Mem Query
+    const float* dataset_ptr,       // Global Dataset
+    size_t num_dataset,             // N
+    uint32_t dim,                   // 1024
+    uint32_t result_buffer_size,    // 队列容量
+    uint32_t target_num_seeds,      // 目标需要生成的种子总数 (即 num_seeds)
+    const uint32_t* seed_ptr,       // [Input] 外部提供的种子列表 (可以是 nullptr)
+    uint32_t num_provided_seeds,    // [Input] 外部提供的种子数量
+    uint64_t rand_xor_mask,         // 随机掩码
+    uint32_t* visited_hash,         // Hashmap
+    uint32_t hash_bitlen
+) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane_id = tid % 32;
+    const uint32_t warp_id = tid / 32;
+    const uint32_t num_warps = blockDim.x / 32;
+
+    // 1. 并行初始化结果队列
+    for (uint32_t i = tid; i < result_buffer_size; i += blockDim.x) {
+        result_indices[i] = 0xFFFFFFFF;
+        result_distances[i] = 3.40282e38f; // FLT_MAX
+    }
+    __syncthreads();
+
+    // 2. 每个 Warp 负责填充一部分种子
+    // 循环直到填满 target_num_seeds 个位置
+    for (uint32_t i = warp_id; i < target_num_seeds; i += num_warps) {
+        
+        uint32_t node_id = 0xFFFFFFFF;
+
+        if (seed_ptr != nullptr && i < num_provided_seeds) {
+            node_id = seed_ptr[i];
+        }
+
+        if (node_id >= num_dataset) {
+            node_id = (rand_xor_mask * (i + 1)) % num_dataset;
+        }
+
+        // 3. 计算距离 (Warp 级并行)
+        const float* node_ptr = dataset_ptr + (size_t)node_id * dim;
+        float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+
+        // 4. 写入队列 & 哈希表 (仅 Lane 0 执行)
+        if (lane_id == 0) {
+            // 写入结果队列
+            result_indices[i] = node_id;
+            result_distances[i] = dist;
+            
+            cagra::hashmap::insert(visited_hash, hash_bitlen, node_id);
+        }
+    }
+    __syncthreads();
+}
+
 // ============================================================================
 // 阶段 2: 扩展 (计算子节点距离)
 // ============================================================================

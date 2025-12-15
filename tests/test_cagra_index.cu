@@ -22,6 +22,8 @@
 // FAISS (仅用于生成真值 GT)
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/GpuIndexFlat.h>
+#include <faiss/IndexFlat.h> // 引入 CPU FAISS 头文件
+
 
 // -----------------------------------------------------------------------------
 // 辅助工具
@@ -75,8 +77,6 @@ double calculate_recall(size_t num_queries, int k, const int64_t* gt_indices, co
     }
     return 100.0 * correct / (num_queries * k);
 }
-
-#include <faiss/IndexFlat.h> // 引入 CPU FAISS 头文件
 
 // 生成 GT (使用 CPU FAISS，确保绝对正确)
 void generate_ground_truth(const float* dataset, size_t n, int dim, const float* queries, size_t nq, int k, int64_t* gt_indices) {
@@ -138,10 +138,13 @@ void run_test_build(const float* full_data, int dim, size_t n_build, const std::
     std::vector<int64_t> out_indices(N_QUERY * K);
     std::vector<float> out_dists(N_QUERY * K);
 
-    timer.reset();
+    // timer.reset();
+    auto t1 = std::chrono::high_resolution_clock::now();
     // <--- 极简接口：不需要 SearchParams
     index.query(queries.data(), N_QUERY, K, out_indices.data(), out_dists.data());
-    double t_search = timer.elapsed_ms();
+    // double t_search = timer.elapsed_ms();
+    auto t2 =  std::chrono::high_resolution_clock::now();
+    double t_search = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
     // 7. 统计
     double recall = calculate_recall(N_QUERY, K, gt_indices.data(), out_indices.data());
@@ -259,6 +262,90 @@ void run_test_insert(const float* full_data, int dim, size_t n_old, size_t n_new
     std::cout << "------------------------------------------------" << std::endl;
 }
 
+// =============================================================================
+// TEST 3: Baseline (Full Build) - Control Group
+// =============================================================================
+void run_test_full_baseline(const float* full_data, int dim, size_t n_total) {
+    std::cout << "\n[TEST 3] Baseline: Full Build (" << n_total << ") -> Query" << std::endl;
+    
+    // --- 配置测试参数 (与 TEST 2 保持一致) ---
+    const int K = 10;
+    const int BATCH_SIZE = 32;
+    const int NUM_BATCHES = 100;
+    const size_t TOTAL_QUERIES = BATCH_SIZE * NUM_BATCHES;
+
+    Timer timer;
+
+    // 1. 初始化 & Add All
+    cagra::CagraIndex index(dim); 
+    std::cout << ">> Adding " << n_total << " vectors..." << std::endl;
+    index.add(n_total, full_data);
+
+    // 2. Build (一次性全量优化)
+    std::cout << ">> Building full index..." << std::endl;
+    timer.reset();
+    index.build(); 
+    double t_build = timer.elapsed_ms();
+    std::cout << "   Full Build Time: " << t_build << " ms" << std::endl;
+
+    // -----------------------------------------------------------
+    // 3. Query 准备 (逻辑完全同 TEST 2，确保公平)
+    // -----------------------------------------------------------
+    if (TOTAL_QUERIES > n_total) { std::cerr << "Not enough data" << std::endl; return; }
+
+    std::cout << ">> Preparing " << TOTAL_QUERIES << " unique queries..." << std::endl;
+    std::vector<float> all_queries(TOTAL_QUERIES * dim);
+    std::vector<size_t> all_indices(n_total);
+    std::iota(all_indices.begin(), all_indices.end(), 0);
+    
+    // 使用相同的种子 1145，确保抽样的 Query 向量和 TEST 2 完全一致！
+    // 这样对比 Recall 才有意义。
+    std::mt19937 rng(1145); 
+    std::shuffle(all_indices.begin(), all_indices.end(), rng);
+
+    for (size_t i = 0; i < TOTAL_QUERIES; ++i) {
+        size_t data_idx = all_indices[i];
+        std::copy(full_data + data_idx * dim, 
+                  full_data + (data_idx + 1) * dim, 
+                  all_queries.data() + i * dim);
+    }
+
+    // 4. GT (同 TEST 2)
+    std::cout << ">> Generating Ground Truth..." << std::endl;
+    std::vector<int64_t> gt_indices(TOTAL_QUERIES * K);
+    generate_ground_truth(full_data, n_total, dim, all_queries.data(), TOTAL_QUERIES, K, gt_indices.data());
+
+    // -----------------------------------------------------------
+    // 5. Query 执行
+    // -----------------------------------------------------------
+    std::cout << ">> Querying..." << std::endl;
+    std::vector<int64_t> all_out_indices(TOTAL_QUERIES * K);
+    std::vector<float> all_out_dists(TOTAL_QUERIES * K);
+
+    double total_search_time_ms = 0.0;
+
+    for (int b = 0; b < NUM_BATCHES; ++b) {
+        float* batch_queries = all_queries.data() + b * BATCH_SIZE * dim;
+        int64_t* batch_out_indices = all_out_indices.data() + b * BATCH_SIZE * K;
+        float* batch_out_dists = all_out_dists.data() + b * BATCH_SIZE * K;
+
+        timer.reset();
+        index.query(batch_queries, BATCH_SIZE, K, batch_out_indices, batch_out_dists);
+        total_search_time_ms += timer.elapsed_ms();
+    }
+
+    // 6. 统计
+    double recall = calculate_recall(TOTAL_QUERIES, K, gt_indices.data(), all_out_indices.data());
+    double avg_qps = (TOTAL_QUERIES * 1000.0) / total_search_time_ms;
+
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "   [Baseline Result]" << std::endl;
+    std::cout << "   Total Time:    " << total_search_time_ms << " ms" << std::endl;
+    std::cout << "   QPS:           " << std::fixed << std::setprecision(2) << avg_qps << std::endl;
+    std::cout << "   Avg Recall:    " << std::fixed << std::setprecision(2) << recall << "%" << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+}
+
 int main() {
     int cuda_device = 1;
     CHECK_CUDA(cudaSetDevice(cuda_device));
@@ -270,9 +357,6 @@ int main() {
 
     int dim = -1, total = -1;
     if (!parseMeta(meta_path, dim, total)) { std::cerr << "Meta parse failed" << std::endl; return 1; }
-    
-    // 确保数据足够
-    if (total < 100000) { std::cerr << "Need 100k data" << std::endl; return 1; }
 
     // mmap
     int fd = open(bin_path.c_str(), O_RDONLY);
@@ -281,10 +365,14 @@ int main() {
 
     // Run Tests
     size_t n_build = 50000;
-    size_t n_insert = 500000;
+    size_t n_insert = 750000;
+    size_t n_total = n_build + n_insert;
+
 
     run_test_build(data, dim, n_build, index_path);
     run_test_insert(data, dim, n_build, n_insert, index_path);
+
+    run_test_full_baseline(data, dim, n_total);
 
     // Cleanup
     remove(index_path.c_str());

@@ -92,7 +92,7 @@ int main() {
 
     // CAGRA 参数
     const uint32_t KNN_K = 128;      // 初始图度数 (越大构建越慢，但质量越好)
-    const uint32_t GRAPH_K = 32;     // 最终图度数 (通常 32 或 64)
+    const uint32_t GRAPH_K = 64;     // 最终图度数 (通常 32 或 64)
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "CAGRA Real Data Test (HotpotQA)" << std::endl;
@@ -108,7 +108,7 @@ int main() {
     }
     
     // 如果数据量太大，为了测试速度可以截断，例如只测前 5万
-    vector_total = std::min(vector_total, 500000); 
+    vector_total = std::min(vector_total, 50000); 
 
     std::cout << "Dataset Info: " << vector_total << " vectors, " << dim << " dims." << std::endl;
 
@@ -261,7 +261,7 @@ int main() {
     // 【关键】放宽搜索参数以提升召回
     cagra::SearchParams search_params;
     search_params.itopk_size = 128;     // 内部池大小
-    search_params.search_width = 4;     // 宽搜：每次扩展 4 个
+    search_params.search_width = 8;     // 宽搜：每次扩展 4 个
     search_params.max_iterations = 50;  // 多跳：最多 50 步
 
     // Warmup
@@ -272,6 +272,16 @@ int main() {
     cagra::search(d_dataset, vector_total, d_cagra_graph, GRAPH_K, 
                   d_queries, num_queries, k, search_params, d_out_indices, d_out_dists);
     double search_time = timer.elapsed_ms();
+
+    // 输出第一个query的结果和对应的gt，调试用
+    for (int i = 0; i < k; ++i) {
+        int64_t out_idx;
+        float out_dist;
+        CHECK_CUDA(cudaMemcpy(&out_idx, d_out_indices + i, sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&out_dist, d_out_dists + i, sizeof(float), cudaMemcpyDeviceToHost));
+        std::cout << "Query 0 Result " << i << ": ID=" << out_idx << ", Dist=" << out_dist 
+                  << ", GT_ID=" << h_gt_indices[i] << std::endl;
+    }
 
     // ---------------------------------------------------------
     // 8. 统计 Search Recall

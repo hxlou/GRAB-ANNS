@@ -11,6 +11,13 @@
 namespace cagra {
 namespace device {
 
+__device__ unsigned long long get_global_time() {
+    unsigned long long global_timer;
+    // 使用内联汇编读取特殊寄存器 %globaltimer
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_timer));
+    return global_timer;
+}
+
 /**
  * @brief 选择下一轮的父节点 (Pickup Next Parents)
  * 
@@ -146,6 +153,7 @@ __global__ void search_kernel(
     const float* dataset_ptr,           // [N, dim] 数据集
     const uint32_t* knn_graph,          // [N, degree] CAGRA 图
     const uint32_t* seed_ptr,           // Seed (可选)
+    const uint32_t num_seeds_per_query,           // 单个 query 的 Seeds 数量
     uint32_t* num_executed_iterations,  // 调试用
     
     // --- 运行时参数 ---
@@ -162,6 +170,7 @@ __global__ void search_kernel(
     uint32_t hash_bitlen,       
     uint32_t queue_capacity     // 必须是 32 的倍数 (通常也是 2 的幂次)
 ) {
+
     // -------------------------------------------------------------
     // 1. Shared Memory 动态布局初始化
     // -------------------------------------------------------------
@@ -209,15 +218,37 @@ __global__ void search_kernel(
     cagra::hashmap::init(visited_hash, hash_bitlen);
     
     __syncthreads(); 
-
     // -------------------------------------------------------------
     // 3. 初始种子阶段
     // -------------------------------------------------------------
-    cagra::device::compute_distance_to_random_nodes(
-        result_indices, result_dists, query_buffer, dataset_ptr,
-        num_dataset, dim, queue_capacity, num_seeds, rand_xor_mask,
-        visited_hash, hash_bitlen
-    );
+    uint32_t seed_offset = query_id * num_seeds_per_query;
+    uint32_t* local_seed_ptr = nullptr;
+    if (seed_ptr != nullptr) {
+        local_seed_ptr = (uint32_t*)(seed_ptr + seed_offset);
+        // 调用混合初始化函数
+        cagra::device::compute_distance_to_init_nodes(
+            result_indices,
+            result_dists,
+            query_buffer,
+            dataset_ptr,
+            num_dataset,
+            dim,
+            queue_capacity,
+            num_seeds,          // 目标总种子数 (例如 32)
+            local_seed_ptr,     // 当前 Query 的外部种子起始位置
+            num_seeds_per_query, // 外部提供了多少个
+            rand_xor_mask,
+            visited_hash,
+            hash_bitlen
+        );
+    } else {
+        // 如果没有提供 seed ，直接随机初始化即可
+        cagra::device::compute_distance_to_random_nodes(
+            result_indices, result_dists, query_buffer, dataset_ptr,
+            num_dataset, dim, queue_capacity, num_seeds, rand_xor_mask,
+            visited_hash, hash_bitlen
+        );
+    }
     __syncthreads();
 
     // -------------------------------------------------------------
@@ -225,7 +256,6 @@ __global__ void search_kernel(
     // -------------------------------------------------------------
     uint32_t iter = 0;
     uint32_t hash_reset_iter = 20; // 每隔这么多轮重置 Hashmap
-
     for (; iter < max_iterations; ++iter) {
         
         // 更新哈希表，清空并加入topk中的数据到哈希表中
@@ -241,11 +271,7 @@ __global__ void search_kernel(
             __syncthreads();
         }
 
-        // --- Step A: 排序 (仅 Warp 0 工作) ---
-        // 我们根据 queue_capacity 决定每个线程负责多少个元素 (N)
-        // Warp 0 有 32 个线程。 Capacity = 32 * N
-        // 所以 N = Capacity / 32
-        
+        // --- Step A: 排序 (仅 Warp 0 工作) ---        
         if (tid < 32) {
             // Shadow variable issue: 之前代码这里定义了 local queue_capacity 导致错误
             // 这里我们使用传入的 queue_capacity 参数，并用 switch/if 处理模板参数 N
@@ -274,33 +300,7 @@ __global__ void search_kernel(
             }
             // 如果更大，可以继续加 case
         }
-        __syncthreads(); // 必须同步，等待 Warp 0 排序完成
-
-        // // ======================= [DEBUG: CHECK SORT] =======================
-        // // 仅让 Query 0 的 Thread 0 打印前 16 个结果
-        // if (query_id == 0 && tid == 0) {
-        //     printf("Iter %2u Sorted Top-16:\n", iter);
-        //     bool is_sorted = true;
-        //     for (int i = 0; i < 16; ++i) {
-        //         float d = result_dists[i];
-        //         uint32_t raw_idx = result_indices[i];
-                
-        //         // 解析 ID 和 访问状态
-        //         uint32_t idx = raw_idx & 0x7FFFFFFF;     // 去掉最高位
-        //         bool visited = (raw_idx & 0x80000000);   // 检查最高位
-
-        //         printf("  [%d] Dist: %.4f | Idx: %u | %s\n", 
-        //                i, d, idx, visited ? "Visited" : "New");
-
-        //         // 简单的单调性检查
-        //         if (i > 0 && result_dists[i] < result_dists[i-1]) {
-        //             is_sorted = false;
-        //         }
-        //     }
-        //     if (!is_sorted) printf("  [ERROR] ARRAY IS NOT SORTED!\n");
-        //     else printf("  [OK] Array is strictly ascending.\n");
-        // }
-        // // ===================================================================
+        __syncthreads();
 
         // --- Step B: 选父节点 ---
         if (tid < 32) {
@@ -309,25 +309,8 @@ __global__ void search_kernel(
                 itopk_size, search_width
             );
         }
-
-        // // ======================= [DEBUG START] =======================
-        // // 仅让第 0 个 Query 的第 0 号线程打印，防止刷屏
-        // if (query_id == 0 && tid == 0) {
-        //     printf("Iter %2u | Term: %u | Parents: [ ", iter, *terminate_flag);
-            
-        //     for (uint32_t i = 0; i < search_width; ++i) {
-        //         uint32_t pid = parent_list[i];
-        //         if (pid == 0xFFFFFFFF) {
-        //             printf("NULL "); // 没有选满，或者是空的
-        //         } else {
-        //             printf("%u ", pid);
-        //         }
-        //     }
-        //     printf("]\n");
-        // }
-        // // ======================= [DEBUG END] =========================
-
         __syncthreads();
+
 
         // --- Step C: 检查终止 ---
         if (*terminate_flag == 1) break;
@@ -340,56 +323,6 @@ __global__ void search_kernel(
             visited_hash, hash_bitlen, parent_list, search_width
         );
         __syncthreads();
-
-        // // ======================= [DEBUG & VERIFY] =======================
-        // if (query_id == 0 && tid == 0) {
-        //     uint32_t start_idx = itopk_size;
-        //     uint32_t count = 0;
-            
-        //     printf("Iter %2u | Best: %.4f | New: [ ", iter, result_dists[0]);
-
-        //     // 1. 寻找第一个有效的候选节点进行验证
-        //     uint32_t verify_idx = 0xFFFFFFFF;
-        //     float verify_dist_gpu = 0.0f;
-
-        //     for (uint32_t i = 0; i < search_width * graph_degree; ++i) {
-        //         float d = result_dists[start_idx + i];
-        //         uint32_t idx = result_indices[start_idx + i];
-
-        //         if (d < 3.0e38f) {
-        //             if (count < 4) printf("%.2f(%u) ", d, idx); // 打印前4个
-                    
-        //             // 抓住第一个有效节点用于验证
-        //             if (verify_idx == 0xFFFFFFFF) {
-        //                 verify_idx = idx;
-        //                 verify_dist_gpu = d;
-        //             }
-        //             count++;
-        //         }
-        //     }
-        //     printf("] Valid: %u\n", count);
-
-        //     // 2. 朴素方法验证 (Naive Calculation)
-        //     if (verify_idx != 0xFFFFFFFF) {
-        //         float naive_dist = 0.0f;
-        //         // 直接从 Global Memory 读取，不依赖 Shared Memory 或 Warp Shuffle
-        //         const float* q_ptr = queries_ptr + (size_t)query_id * dim;
-        //         const float* d_ptr = dataset_ptr + (size_t)verify_idx * dim;
-
-        //         for (int d = 0; d < dim; ++d) {
-        //             float diff = q_ptr[d] - d_ptr[d];
-        //             naive_dist += diff * diff;
-        //         }
-
-        //         float diff = fabsf(verify_dist_gpu - naive_dist);
-        //         printf("   >>> [Verify Node %u] GPU: %.4f | Naive: %.4f | Diff: %.6f", 
-        //                verify_idx, verify_dist_gpu, naive_dist, diff);
-                
-        //         if (diff > 1e-3) printf(" [ERROR: MISMATCH!]\n");
-        //         else printf(" [OK]\n");
-        //     }
-        // }
-        // // =================================================================
     }
 
     // -------------------------------------------------------------

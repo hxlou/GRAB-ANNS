@@ -27,7 +27,8 @@ inline uint32_t next_power_of_2(uint32_t n) {
  */
 inline size_t calculate_and_check_smem(uint32_t itopk_size, 
                                        uint32_t search_width, 
-                                       uint32_t graph_degree) 
+                                       uint32_t graph_degree,
+                                       uint32_t hash_bitlen)
 {
     using namespace config;
     size_t smem = 0;
@@ -38,7 +39,7 @@ inline size_t calculate_and_check_smem(uint32_t itopk_size,
     smem += (query_size + 15) & ~15;
 
     // 2. Visited Hashmap [4096 * 4 bytes] = 16KB
-    size_t hash_size = (1u << DEFAULT_HASH_BITLEN) * sizeof(uint32_t);
+    size_t hash_size = (1u << hash_bitlen) * sizeof(uint32_t);
     smem += (hash_size + 15) & ~15;
 
     // 3. 结果队列 & 候选队列 (关键修改点)

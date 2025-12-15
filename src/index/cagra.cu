@@ -288,7 +288,7 @@ void optimize_prune(const uint32_t* h_knn_graph,
                     uint32_t input_degree,
                     uint32_t output_degree)
 {
-    std::cout << ">> [Optimize Step 1] Pruning Graph (Batched)..." << std::endl;
+    // std::cout << ">> [Optimize Step 1] Pruning Graph (Batched)..." << std::endl;
     
     // 检查 Shared Memory 限制 (Kernel 中定义的 MAX_DEGREE 为 512)
     if (input_degree > MAX_DEGREE) {
@@ -308,7 +308,7 @@ void optimize_prune(const uint32_t* h_knn_graph,
     // ==========================================
     // 2. 拷贝输入图到 GPU & 初始化输出
     // ==========================================
-    std::cout << "   Copying input graph to GPU..." << std::endl;
+    // std::cout << "   Copying input graph to GPU..." << std::endl;
     CUDA_CHECK(cudaMemcpy(d_input_graph, h_knn_graph, 
                           num_dataset * input_degree * sizeof(uint32_t), 
                           cudaMemcpyHostToDevice));
@@ -345,12 +345,12 @@ void optimize_prune(const uint32_t* h_knn_graph,
     }
     // 等待所有 Kernel 执行完毕
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::cout << "   Kernel execution finished." << std::endl;
+    // std::cout << "   Kernel execution finished." << std::endl;
 
     // ==========================================
     // 4. 将绕路计数 (Detour Count) 拷回 CPU
     // ==========================================
-    std::cout << "   Copying detour counts back to CPU..." << std::endl;
+    // std::cout << "   Copying detour counts back to CPU..." << std::endl;
     std::vector<uint8_t> h_detour_count(num_dataset * input_degree);
     
     CUDA_CHECK(cudaMemcpy(h_detour_count.data(), d_detour_count, 
@@ -360,7 +360,7 @@ void optimize_prune(const uint32_t* h_knn_graph,
     // ==========================================
     // 5. CPU 端的筛选逻辑 (Rank-based Pruning)
     // ==========================================
-    std::cout << "   Ranking and pruning on CPU..." << std::endl;
+    // std::cout << "   Ranking and pruning on CPU..." << std::endl;
     
     // 使用 OpenMP 并行加速循环
     #pragma omp parallel for
@@ -396,7 +396,7 @@ void optimize_prune(const uint32_t* h_knn_graph,
     CUDA_CHECK(cudaFree(d_input_graph));
     CUDA_CHECK(cudaFree(d_detour_count));
     
-    std::cout << ">> Pruning Finished." << std::endl;
+    // std::cout << ">> Pruning Finished." << std::endl;
 }
 
 /**
@@ -457,7 +457,7 @@ void optimize_create_reverse_graph(const uint32_t* h_input_graph,
                                    size_t num_dataset,
                                    uint32_t degree)
 {
-    std::cout << ">> [Optimize Step 2] Creating Reverse Graph..." << std::endl;
+    // std::cout << ">> [Optimize Step 2] Creating Reverse Graph..." << std::endl;
 
     // ==========================================
     // 1. 准备 GPU 资源
@@ -526,7 +526,7 @@ void optimize_create_reverse_graph(const uint32_t* h_input_graph,
     // ==========================================
     // 4. 结果拷回 CPU
     // ==========================================
-    std::cout << "   Copying results back to CPU..." << std::endl;
+    // std::cout << "   Copying results back to CPU..." << std::endl;
     
     CUDA_CHECK(cudaMemcpy(h_rev_graph, d_rev_graph, 
                           num_dataset * degree * sizeof(uint32_t), 
@@ -543,7 +543,7 @@ void optimize_create_reverse_graph(const uint32_t* h_input_graph,
     CUDA_CHECK(cudaFree(d_rev_counts));
     CUDA_CHECK(cudaFree(d_dest_nodes));
 
-    std::cout << ">> Reverse Graph Created." << std::endl;
+    // std::cout << ">> Reverse Graph Created." << std::endl;
 }
 
 // 辅助函数：在数组中查找元素的位置
@@ -698,6 +698,136 @@ void build(const float* d_dataset,
     // std::cout << ">> [cagra::build] Done. Graph stored on GPU." << std::endl;
 }
 
+// Keep the original signature
+// void search(const float* d_dataset,
+//             size_t num_dataset,
+//             const uint32_t* d_graph,    // [Input] 构建好的图
+//             uint32_t graph_degree,      // 图度数
+//             const float* d_queries,
+//             int64_t num_queries,
+//             int64_t k,
+//             SearchParams params,
+//             int64_t* d_out_indices,
+//             float* d_out_dists)
+// {
+
+//     if (d_graph == nullptr) {
+//         throw std::runtime_error("Graph is null!");
+//     }
+
+//     uint32_t topk = static_cast<uint32_t>(k);
+//     uint32_t itopk_size = std::max(topk, params.itopk_size);
+//     if (itopk_size < 64) itopk_size = 64;
+
+//     // B. 计算 Shared Memory
+//     size_t smem_size = cagra::detail::calculate_and_check_smem(
+//         itopk_size, params.search_width, graph_degree, params.hash_bitlen
+//     );
+//     std::cout << ">> [cagra::search] Using " << (smem_size / 1024) << " KB Shared Memory per Block." << std::endl;
+
+//     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
+//     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE,
+//                                        cagra::detail::next_power_of_2(raw_needed));
+
+//     // C. 临时内存 (uint32)
+//     uint32_t* d_out_indices_u32 = nullptr;
+//     CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+//     // D. 随机种子
+//     std::random_device rd;
+//     uint64_t rand_xor_mask = rd();
+//     uint32_t num_seeds = params.itopk_size / 4;
+
+//     // E. 启动 Kernel
+//     dim3 grid(num_queries);
+//     dim3 block(cagra::config::BLOCK_SIZE);
+
+//     // Create CUDA events for per-kernel timing
+//     cudaEvent_t ev_search_start = nullptr, ev_search_end = nullptr;
+//     cudaEvent_t ev_convert_start = nullptr, ev_convert_end = nullptr;
+//     CUDA_CHECK(cudaEventCreate(&ev_search_start));
+//     CUDA_CHECK(cudaEventCreate(&ev_search_end));
+//     CUDA_CHECK(cudaEventCreate(&ev_convert_start));
+//     CUDA_CHECK(cudaEventCreate(&ev_convert_end));
+
+//     // Record start for search kernel
+//     CUDA_CHECK(cudaEventRecord(ev_search_start, 0));
+
+//     // Launch search kernel (as before)
+//     cagra::device::search_kernel<<<grid, block, smem_size>>>(
+//         d_out_indices_u32,
+//         d_out_dists,
+//         d_queries,
+//         d_dataset,
+//         d_graph,
+//         nullptr,
+//         nullptr,
+
+//         // Params
+//         (uint32_t)num_queries,
+//         num_dataset,
+//         cagra::config::DIM, // 1024
+//         graph_degree,
+//         topk,
+//         itopk_size,
+//         params.search_width,
+//         params.max_iterations,
+//         num_seeds,
+//         rand_xor_mask,
+//         params.hash_bitlen,
+//         queue_capacity
+//     );
+//     CUDA_CHECK(cudaGetLastError());
+
+//     // Record end for search kernel
+//     CUDA_CHECK(cudaEventRecord(ev_search_end, 0));
+
+//     // Record start for conversion kernel
+//     CUDA_CHECK(cudaEventRecord(ev_convert_start, 0));
+
+//     // F. 类型转换
+//     size_t total_elements = static_cast<size_t>(num_queries) * static_cast<size_t>(topk);
+//     size_t convert_block = 256;
+//     size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
+
+//     cast_u32_to_i64_kernel<<<convert_grid, convert_block>>>(
+//         d_out_indices_u32,
+//         d_out_indices,
+//         total_elements
+//     );
+//     CUDA_CHECK(cudaGetLastError());
+
+//     // Record end for conversion kernel
+//     CUDA_CHECK(cudaEventRecord(ev_convert_end, 0));
+
+//     // Wait for the conversion end event (this will wait for both kernels to finish because they are enqueued in-order on the default stream)
+//     CUDA_CHECK(cudaEventSynchronize(ev_convert_end));
+
+//     // Clean up temporary buffer
+//     CUDA_CHECK(cudaFree(d_out_indices_u32));
+
+//     // Query elapsed times (milliseconds)
+//     float ms_search = 0.0f, ms_convert = 0.0f, ms_total_device = 0.0f;
+//     CUDA_CHECK(cudaEventElapsedTime(&ms_search, ev_search_start, ev_search_end));
+//     CUDA_CHECK(cudaEventElapsedTime(&ms_convert, ev_convert_start, ev_convert_end));
+//     // Optionally measure from search_start to convert_end as total device time
+//     CUDA_CHECK(cudaEventElapsedTime(&ms_total_device, ev_search_start, ev_convert_end));
+
+//     // Destroy events
+//     CUDA_CHECK(cudaEventDestroy(ev_search_start));
+//     CUDA_CHECK(cudaEventDestroy(ev_search_end));
+//     CUDA_CHECK(cudaEventDestroy(ev_convert_start));
+//     CUDA_CHECK(cudaEventDestroy(ev_convert_end));
+
+//     std::cout << ">> [cagra::search] Host timings (ms): Start=" << duration_start
+//               << ", HostWaitForDevice=" << duration_host_between_launch_and_event_sync
+//               << ", PostFree=" << duration_free_and_post << std::endl;
+
+//     std::cout << ">> [cagra::search] GPU kernel times (ms): search=" << ms_search
+//               << ", convert=" << ms_convert
+//               << ", total_device_window=" << ms_total_device << std::endl;
+// }
+
 // 2. Search (执行搜索)
 void search(const float* d_dataset,
             size_t num_dataset,
@@ -708,11 +838,10 @@ void search(const float* d_dataset,
             int64_t k,
             SearchParams params,
             int64_t* d_out_indices, 
-            float* d_out_dists)
-{
-    // std::cout << ">> [cagra::search] Starting search for " 
-    //           << num_queries << " queries, top-" << k << "..." << std::endl;
-    
+            float* d_out_dists,
+            const uint32_t* d_seeds,
+            const uint32_t num_seeds_per_query
+){
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
     }
@@ -723,10 +852,8 @@ void search(const float* d_dataset,
 
     // B. 计算 Shared Memory
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, graph_degree
+        itopk_size, params.search_width, graph_degree, params.hash_bitlen
     );
-    // printf(">> [cagra::search] Using %zu KB shared memory per block.\n", smem_size / 1024);
-    
 
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
@@ -745,14 +872,15 @@ void search(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    // std::cout << ">> [cagra::search] Launching search kernel..." << std::endl;
+    // 一个block负责一个query
     cagra::device::search_kernel<<<grid, block, smem_size>>>(
         d_out_indices_u32,
         d_out_dists,
         d_queries,
         d_dataset,
         d_graph,
-        nullptr, 
+        d_seeds,
+        num_seeds_per_query, 
         nullptr, 
         
         // Params
@@ -771,7 +899,6 @@ void search(const float* d_dataset,
     );
     CUDA_CHECK(cudaGetLastError());
     
-
     // F. 类型转换
     size_t total_elements = num_queries * topk;
     size_t convert_block = 256;
@@ -832,12 +959,23 @@ void insert(const float* d_dataset,     // 旧数据
 
     // 4. 处理节点来更新反向边 (CPU Random Update)
     // 这个函数会填充 h_graph 后半部分的新节点出边，并修改前半部分的旧节点入边
-    update_topology_random_gpu(d_graph,
+    // update_topology_gpu_v2(d_graph,
+    //                            d_dataset,
+    //                            d_search_indices,
+    //                            d_search_dists,
+    //                            num_existing,
+    //                            num_new,
+    //                            graph_degree,
+    //                            search_k);
+
+    update_topology_gpu_v1(d_graph,
                                d_search_indices,
                                num_existing,
                                num_new,
                                graph_degree,
-                               search_k);
+                               search_k);                           
+
+
 
     // // 5. 将更新后的图写回 GPU
     // // 必须全量写回，因为旧节点的邻居列表也被修改了
@@ -855,5 +993,12 @@ void insert(const float* d_dataset,     // 旧数据
     
     // std::cout << ">> [cagra::insert] Finished." << std::endl;
 }
+
+
+/**
+ * 
+ */
+
+
 
 } // namespace cagra
