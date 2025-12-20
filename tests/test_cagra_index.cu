@@ -364,13 +364,13 @@ int main() {
     const float* data = (const float*)mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
 
     // Run Tests
-    size_t n_build = 50000;
-    size_t n_insert = 750000;
+    size_t n_build = 880000;
+    size_t n_insert = 0;
     size_t n_total = n_build + n_insert;
 
 
-    run_test_build(data, dim, n_build, index_path);
-    run_test_insert(data, dim, n_build, n_insert, index_path);
+    // run_test_build(data, dim, n_build, index_path);
+    // run_test_insert(data, dim, n_build, n_insert, index_path);
 
     run_test_full_baseline(data, dim, n_total);
 

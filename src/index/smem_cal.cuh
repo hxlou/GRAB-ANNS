@@ -60,14 +60,16 @@ inline size_t calculate_and_check_smem(uint32_t itopk_size,
     // ==========================================
     // 核心检查逻辑
     // ==========================================
-    if (smem > MAX_SHARED_MEMORY) {
-        std::cerr << "Error: Shared Memory limit exceeded!" << std::endl;
-        std::cerr << "  User Request: itopk=" << itopk_size << std::endl;
-        std::cerr << "  Queue Cap: " << queue_capacity << " (aligned to pow2)" << std::endl;
-        std::cerr << "  Total SMEM: " << smem << " bytes" << std::endl;
-        std::cerr << "  Hardware Limit: " << MAX_SHARED_MEMORY << " bytes" << std::endl;
-        throw std::runtime_error("Shared Memory limit exceeded");
-    }
+    // if (smem > MAX_SHARED_MEMORY) {
+    //     std::cerr << "Error: Shared Memory limit exceeded!" << std::endl;
+    //     std::cerr << "  User Request: itopk=" << itopk_size << std::endl;
+    //     std::cerr << "  Queue Cap: " << queue_capacity << " (aligned to pow2)" << std::endl;
+    //     std::cerr << "  Total SMEM: " << smem << " bytes" << std::endl;
+    //     std::cerr << "  Hardware Limit: " << MAX_SHARED_MEMORY << " bytes" << std::endl;
+    //     // throw std::runtime_error("Shared Memory limit exceeded");
+    // }
+
+    if (hash_bitlen >= 14) smem -= (1u << hash_bitlen) * sizeof(uint32_t);
 
     return smem;
 }

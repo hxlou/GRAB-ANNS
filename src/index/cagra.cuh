@@ -118,6 +118,8 @@ void build(const float* d_dataset,
            BuildParams params,
            uint32_t** d_constructed_graph);
 
+__global__ void cast_u32_to_i64_kernel(const uint32_t* src, int64_t* dst, size_t total_count);
+
 // 2. Search (执行搜索)
 void search(const float* d_dataset,
             size_t num_dataset,

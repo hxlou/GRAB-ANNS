@@ -17,7 +17,7 @@ public:
      * @param vmm_max_bytes VMM 允许的最大显存占用
      */
     CagraIndex(uint32_t dim, 
-               uint32_t graph_degree = 32,
+               uint32_t graph_degree = 64,
                size_t vmm_max_bytes = 20ULL * 1024 * 1024 * 1024);
 
     ~CagraIndex();

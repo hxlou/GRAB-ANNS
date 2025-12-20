@@ -50,8 +50,15 @@ find_library(FAISS_LIB faiss REQUIRED HINTS "${CONDA_ROOT}/lib")
 # ==========================================
 add_library(light_cagra SHARED
     src/index/cagra.cu
+    src/index/cagra_opt.cu
+    src/index/insert.cu
+    src/index/search.cu
+    
+    
     src/cagraIndex.cu  # 确保你的文件是 .cu 后缀
     src/timeStampIndex.cu
+    src/cagraIndexOpt.cu
+    
 )
 
 target_include_directories(light_cagra PUBLIC 
@@ -98,6 +105,10 @@ add_cagra_test(test_cagra_insert tests/test_cagra_insert.cu)
 
 add_cagra_test(test_timestamp_index tests/test_timestamp_index.cu)
 add_cagra_test(test_timestamp_index_random tests/test_timestamp_index_random.cu)
+
+add_cagra_test(test_cagra_opt tests/test_cagra_opt.cu)
+add_cagra_test(test_cagra_opt_search_bucket tests/test_cagra_opt_search_bucket.cu)
+
 
 # FAISS HNSW 对比测试 (如果有的话)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_faiss_hnsw_insert.cpp")

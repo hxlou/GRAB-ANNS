@@ -243,5 +243,119 @@ __device__ inline void compute_distance_to_child_nodes(
     __syncthreads();
 }
 
+// ============================================================================
+// 阶段 2 (变体): 局部扩展 (Local-Only Expansion)
+// 适用于桶内搜索，强制只访问前 active_degree 个邻居 (Local Edges)
+// ============================================================================
+__device__ inline void compute_distance_to_child_nodes_strided(
+    uint32_t* candidate_indices,    
+    float* candidate_distances,     
+    const float* query_buffer,      
+    const float* dataset_ptr,       
+    const uint32_t* knn_graph,      
+    uint32_t graph_stride,          // 物理宽度 (32)
+    uint32_t active_degree,         // 逻辑宽度 (28)
+    uint32_t dim,                   
+    uint32_t* visited_hash,         
+    uint32_t hash_bitlen,
+    const uint32_t* parent_list,    
+    uint32_t search_width           
+) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane_id = tid % 32;
+    const uint32_t warp_id = tid / 32;
+    const uint32_t num_warps = blockDim.x / 32; // 8
+
+    // 任务总量：search_width 个父节点 * graph_degree 个邻居
+    // 我们将其展平，分配给各个 Warp
+    // 每个 Warp 负责处理一个 (parent, neighbor) 对
+    
+    // 注意：这里的内存写入位置是 candidate_indices[k]
+    // k 范围是 [0, search_width * graph_degree - 1]
+    
+    // 外层循环：遍历所有父节点
+    // 为了简化逻辑，我们让每个 Warp 负责处理 "一个父节点的一组邻居"
+    // 或者更细粒度：所有 Warp 共同瓜分 "所有父节点的所有邻居"
+    
+    // 采用更细粒度的策略：
+    uint32_t graph_degree = graph_stride; // 物理宽度
+    uint32_t total_tasks = search_width * graph_degree;
+
+    for (uint32_t task_id = warp_id; task_id < total_tasks; task_id += num_warps) {
+        
+        // 1. 解码任务：当前处理第几个父节点的第几个邻居？
+        uint32_t parent_idx = task_id / graph_degree;
+        uint32_t neighbor_offset = task_id % graph_degree;
+
+        // 仅处理前 active_degree 个邻居
+        if (neighbor_offset >= active_degree) {
+            // 写入无效值
+            if (lane_id == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+            continue;
+        }
+
+        // 2. 获取父节点 ID
+        uint32_t parent_id = parent_list[parent_idx];
+        
+        // 检查父节点是否有效
+        if (parent_id != 0xFFFFFFFF) {
+            
+            // 3. 查图：获取邻居 ID
+            // knn_graph 是 [N, degree] 的行主序
+            // 邻居位置 = parent_id * degree + offset
+            uint32_t neighbor_id = knn_graph[(size_t)parent_id * graph_degree + neighbor_offset];
+
+            // 4. 检查邻居是否有效 (填充值)
+            if (neighbor_id != 0xFFFFFFFF) {
+                
+                // 5. 查重：Hashmap
+                // 只有 Lane 0 负责查重 (原子操作)，结果广播给全 Warp
+                // insert 返回 true 表示插入成功(未访问过)，false 表示已存在
+                int not_visited = 0;
+                if (lane_id == 0) {
+                    not_visited = cagra::hashmap::insert(visited_hash, hash_bitlen, neighbor_id);
+                }
+                // 广播查重结果
+                not_visited = __shfl_sync(0xFFFFFFFF, not_visited, 0);
+
+                if (not_visited) {
+                    // 6. 没访问过 -> 计算距离
+                    const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
+                    float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+
+                    // 7. 写入结果
+                    if (lane_id == 0) {
+                        candidate_indices[task_id] = neighbor_id;
+                        candidate_distances[task_id] = dist;
+                    }
+                } else {
+                    // 已访问过 -> 写入无效值
+                    if (lane_id == 0) {
+                        candidate_indices[task_id] = 0xFFFFFFFF;
+                        candidate_distances[task_id] = 3.40282e38f;
+                    }
+                }
+            } else {
+                // 无效邻居 -> 写入无效值
+                if (lane_id == 0) {
+                    candidate_indices[task_id] = 0xFFFFFFFF;
+                    candidate_distances[task_id] = 3.40282e38f;
+                }
+            }
+        } else {
+            // 无效父节点 -> 写入无效值
+            if (lane_id == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+        }
+    }
+    // 所有 Warp 完成计算后同步
+    __syncthreads();
+}
+
 } // namespace device
 } // namespace cagra

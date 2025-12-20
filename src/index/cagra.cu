@@ -895,6 +895,7 @@ void search(const float* d_dataset,
         num_seeds,
         rand_xor_mask,
         params.hash_bitlen,
+        nullptr,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
