@@ -55,7 +55,7 @@ __device__ __forceinline__ void pickup_next_parents(uint32_t* terminate_flag,
 
     uint32_t num_new_parents = 0; // 已收集到的父节点数量
 
-// 2. 遍历 TopK 队列
+    // 2. 遍历 TopK 队列
     for (uint32_t j = threadIdx.x; j < internal_topk_size; j += 32) {
         
         uint32_t node_id = internal_topk_indices[j]; 
@@ -261,7 +261,7 @@ __global__ void search_kernel(
     // 4. 搜索主循环
     // -------------------------------------------------------------
     uint32_t iter = 0;
-    uint32_t hash_reset_iter = 50; // 每隔这么多轮重置 Hashmap
+    uint32_t hash_reset_iter = 30; // 每隔这么多轮重置 Hashmap
     for (; iter < max_iterations; ++iter) {
         // 更新哈希表，清空并加入topk中的数据到哈希表中
         if (iter > 0 && (iter % hash_reset_iter == 0)) {
@@ -452,7 +452,263 @@ __global__ void search_kernel_bucket(
 
     // 4. 主循环
     uint32_t iter = 0;
-    uint32_t hash_reset_iter = 50;
+    uint32_t hash_reset_iter = 30;
+
+    for (; iter < max_iterations; ++iter) {
+        if (iter > 0 && (iter % hash_reset_iter == 0)) {
+            cagra::hashmap::init(visited_hash, hash_bitlen);
+            __syncthreads();
+            cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
+            __syncthreads();
+        }
+
+        // A. Sort (完全复用)
+        if (tid < 32) {
+            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
+            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else {
+                // 不支持的容量大小
+                if (tid == 0) {
+                    printf(">> [search_kernel_bucket] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+                }
+            }
+        }
+        __syncthreads();
+
+        // // 输出itopk中的内容，调试用
+        // if (tid == 0 && query_id == 0) {
+        //     printf("Now is After Iteration %u for Query %u:\n", iter, query_id);
+        //     printf("itopk index are as follows: ");
+        //     for (uint32_t i = 0; i < itopk_size; ++i) {
+        //         uint32_t idx = result_indices[i];
+        //         printf("0x%x ", idx);
+        //     }
+        //     printf("\n");
+
+        //     printf("itopk dists are as follows: ");
+        //     for (uint32_t i = 0; i < itopk_size; ++i) {
+        //         float dist = result_dists[i];
+        //         printf("%f ", dist);
+        //     }
+        //     printf("\n");
+        // }
+
+
+        // B. Pickup Parents (完全复用)
+        if (tid < 32) {
+            cagra::device::pickup_next_parents(
+                (uint32_t*)terminate_flag, parent_list, result_indices,
+                itopk_size, search_width
+            );
+        }
+        __syncthreads();
+
+        // C. Check
+        if (*terminate_flag == 1) break;
+
+        // D. Expand (使用 STRIDED 版本)
+        // 【核心差异】使用 compute_distance_to_child_nodes_strided
+        cagra::device::compute_distance_to_child_nodes_strided(
+            result_indices + itopk_size,
+            result_dists + itopk_size,
+            query_buffer, 
+            dataset_ptr, 
+            knn_graph, 
+            graph_stride,   // 物理宽度 32
+            active_degree,  // 逻辑宽度 28 (Local Only)
+            dim,
+            visited_hash, 
+            hash_bitlen, 
+            parent_list, 
+            search_width,
+            result_indices,
+            queue_capacity
+        );
+        __syncthreads();
+
+
+    }
+
+    if (tid < 32) {
+        if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
+        else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+        else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+        else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+        else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
+        else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
+        else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+        else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+        else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+        else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+        else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+        else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+        else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+        else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+        else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+        else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+        else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+        else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+        else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+        else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+        else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+        else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+        else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+        else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+        else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+        else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+        else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+        else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+        else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+        else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+        else {
+            // 不支持的容量大小
+            if (tid == 0) {
+                printf(">> [search_kernel_bucket] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+            }
+        }
+    }
+    __syncthreads();
+
+    uint32_t output_offset = query_id * topk;
+    for (uint32_t i = tid; i < topk; i += blockDim.x) {
+        uint32_t idx = result_indices[i] & 0x7FFFFFFF;
+        float dist = result_dists[i];
+        if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
+        if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
+    }
+
+    // if (tid == 0) printf("[Bucket Search] Query %u finished in %u iterations.\n", query_id, iter);
+
+    if (tid == 0 && num_executed_iterations) {
+        num_executed_iterations[query_id] = iter;
+    }
+}
+
+
+__global__ void search_kernel_range(
+    uint32_t* result_indices_ptr,       
+    float* result_distances_ptr,        
+    const float* queries_ptr,           
+    const float* dataset_ptr,           
+    const uint32_t* knn_graph,          
+    const uint32_t* seed_ptr,      
+    uint64_t* d_ts,     
+    uint32_t num_provided_seeds,        
+    uint32_t* num_executed_iterations,  
+    
+    // --- 核心参数 ---
+    uint32_t num_queries,
+    size_t num_dataset,
+    uint32_t dim,               
+    uint32_t graph_stride,      // 图的物理宽度 (32)
+    uint32_t active_degree,     // 实际使用的逻辑宽度 (28 - Local Edge)
+    uint64_t start_bucket,      // [start_bucket, end_bucket)
+    uint64_t end_bucket,
+    
+    uint32_t topk,              
+    uint32_t itopk_size,        
+    uint32_t search_width,      
+    uint32_t max_iterations,    
+    uint32_t num_seeds,         
+    uint64_t rand_xor_mask,     
+    uint32_t hash_bitlen,
+    uint32_t* pre_hashmap,   
+    uint32_t queue_capacity     
+) {
+    // 1. Shared Memory Init (完全复用，代码一样)
+    extern __shared__ uint8_t smem[]; 
+    size_t offset = 0;
+
+    float* query_buffer = (float*)(smem + offset);
+    offset += (dim * sizeof(float) + 15) & ~15;
+
+    uint32_t* visited_hash = nullptr;
+    if (hash_bitlen < 14) {
+        visited_hash = (uint32_t*)(smem + offset);
+        offset += ((1u << hash_bitlen) * sizeof(uint32_t) + 15) & ~15;     
+    } else {
+        visited_hash = pre_hashmap + (blockIdx.x * (1u << hash_bitlen));
+    }
+
+    uint32_t* result_indices = (uint32_t*)(smem + offset);
+    offset += (queue_capacity * sizeof(uint32_t) + 15) & ~15;
+
+    float* result_dists = (float*)(smem + offset);
+    offset += (queue_capacity * sizeof(float) + 15) & ~15;
+
+    uint32_t* parent_list = (uint32_t*)(smem + offset);
+    offset += (search_width * sizeof(uint32_t) + 15) & ~15;
+
+    volatile uint32_t* terminate_flag = (uint32_t*)(smem + offset);
+
+    // 2. Thread Init
+    const uint32_t query_id = blockIdx.x;
+    if (query_id >= num_queries) return;
+    const uint32_t tid = threadIdx.x;
+
+    const float* global_query = queries_ptr + (size_t)query_id * dim;
+    for (uint32_t i = tid; i < dim; i += blockDim.x) {
+        query_buffer[i] = global_query[i];
+    }
+    
+    if (tid == 0) *terminate_flag = 0;
+    cagra::hashmap::init(visited_hash, hash_bitlen);
+    __syncthreads(); 
+
+    // 3. 初始种子阶段
+    // 【注意】这里我们假设外部一定提供了足够的桶内种子，或者 num_seeds 设为 0
+    // 如果没有种子，我们不能全图随机，必须在桶内随机。
+    // 但为了简化，我们复用 init_nodes，并假设上层逻辑保证了种子质量。
+    // 如果上层没传种子，这里的兜底随机逻辑是全图的，可能会“跳出桶”。
+    // *修正策略*：如果你希望 Kernel 内部支持桶内随机，你需要传 bucket_start 和 bucket_size 进来。
+    // 但既然你说了“Host 端直接生成”，那我们就信任 seed_ptr。
+    
+    const uint32_t* local_seed_ptr = nullptr;
+    if (seed_ptr != nullptr) {
+        local_seed_ptr = seed_ptr + (size_t)query_id * num_provided_seeds;
+    }
+
+    cagra::device::compute_distance_to_init_nodes(
+        result_indices, result_dists, query_buffer, dataset_ptr,
+        num_dataset, dim, queue_capacity, 
+        num_seeds,          
+        local_seed_ptr,     
+        num_provided_seeds, 
+        rand_xor_mask, visited_hash, hash_bitlen
+    );
+    __syncthreads();
+
+    // 4. 主循环
+    uint32_t iter = 0;
+    uint32_t hash_reset_iter = 30;
 
     for (; iter < max_iterations; ++iter) {
         if (iter > 0 && (iter % hash_reset_iter == 0)) {
@@ -485,7 +741,7 @@ __global__ void search_kernel_bucket(
 
         // D. Expand (使用 STRIDED 版本)
         // 【核心差异】使用 compute_distance_to_child_nodes_strided
-        cagra::device::compute_distance_to_child_nodes_strided(
+        cagra::device::compute_distance_to_child_nodes_range(
             result_indices + itopk_size,
             result_dists + itopk_size,
             query_buffer, 
@@ -497,7 +753,10 @@ __global__ void search_kernel_bucket(
             visited_hash, 
             hash_bitlen, 
             parent_list, 
-            search_width
+            search_width,
+            start_bucket,
+            end_bucket,
+            d_ts
         );
         __syncthreads();
     }

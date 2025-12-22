@@ -10,6 +10,34 @@ project(LightCagra LANGUAGES CXX CUDA)
 # 设置 CUDA 运行时库为共享库
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
+# 定义 CUDA 设备 ID（可以通过命令行覆盖）
+set(CUDA_DEVICE_ID "0" CACHE STRING "CUDA device ID to use")
+add_compile_definitions(CUDA_DEVICE_ID=${CUDA_DEVICE_ID})
+
+# # 1. 首先设置构建类型
+# set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+
+# # 2. 设置 CUDA 调试选项（覆盖默认值）
+# set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0 -lineinfo" CACHE STRING "CUDA debug flags" FORCE)
+# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -g -G -O0 -lineinfo")
+
+# # 3. 设置 C++ 调试选项
+# set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "CXX debug flags" FORCE)
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
+
+# # 4. 移除任何优化标志
+# string(REPLACE "-O2" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+# string(REPLACE "-O3" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+# string(REPLACE "-O2" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+# string(REPLACE "-O3" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+
+# # 5. 打印确认信息
+# message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+# message(STATUS "CUDA Flags: ${CMAKE_CUDA_FLAGS}")
+# message(STATUS "CUDA Debug Flags: ${CMAKE_CUDA_FLAGS_DEBUG}")
+# message(STATUS "CXX Flags: ${CMAKE_CXX_FLAGS}")
+# message(STATUS "CXX Debug Flags: ${CMAKE_CXX_FLAGS_DEBUG}")
+
 # ==========================================
 # 1. 编译选项设置
 # ==========================================
@@ -108,7 +136,8 @@ add_cagra_test(test_timestamp_index_random tests/test_timestamp_index_random.cu)
 
 add_cagra_test(test_cagra_opt tests/test_cagra_opt.cu)
 add_cagra_test(test_cagra_opt_search_bucket tests/test_cagra_opt_search_bucket.cu)
-
+add_cagra_test(test_cagra_opt_search_range tests/test_cagra_opt_search_range.cu)
+add_cagra_test(test_cagra_opt_insert tests/test_cagra_opt_insert.cu)
 
 # FAISS HNSW 对比测试 (如果有的话)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_faiss_hnsw_insert.cpp")

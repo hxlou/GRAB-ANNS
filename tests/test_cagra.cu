@@ -75,10 +75,11 @@ bool parseMeta(const std::string& path, int& dim, int& total) {
 // =============================================================================
 // 主测试流程
 // =============================================================================
-int main() {
 
-    int cuda_device = 1;
-    CHECK_CUDA(cudaSetDevice(cuda_device));
+#include "common.cuh"
+
+int main() {
+    CHECK_CUDA(cudaSetDevice(CUDA_DEVICE_ID));
 
     // ---------------------------------------------------------
     // 1. 配置

@@ -19,7 +19,7 @@ public:
      * @param vmm_max_bytes VMM 预留的最大显存空间 (默认 20GB)
      */
     CagraIndexOpt(uint32_t dim, 
-                  uint32_t graph_degree = 64,
+                  uint32_t graph_degree = 32,
                   size_t vmm_max_bytes = 20ULL * 1024 * 1024 * 1024);
 
     ~CagraIndexOpt();
@@ -82,6 +82,15 @@ public:
                         float* host_dists,
                         uint32_t local_degree);
 
+    void query_range(const float* host_queries, 
+                        size_t num_queries, 
+                        int k, 
+                        uint64_t start_bucket,  // 指定范围 [start, end)
+                        uint64_t end_bucket,
+                        int64_t* host_indices, 
+                        float* host_dists,
+                        uint32_t local_degree);
+
     // --- 参数设置 ---
     void setBuildParams(uint32_t inter_degree, uint32_t graph_degree) {
         build_params_.intermediate_degree = inter_degree;
@@ -101,6 +110,10 @@ public:
     // --- 数据访问 ---
     const float* get_data() const { return h_data_.data(); }
     const uint32_t* get_graph() const { return h_graph_.data(); }
+    std::vector<uint32_t> get_ids_by_timestamp(uint64_t ts) const {
+        if (ts_to_ids_.count(ts)) return ts_to_ids_.at(ts);
+        return {};
+    }
     size_t size() const { return current_size_; }
 
     // 获取特定时间范围内的随机种子 (用于辅助搜索)

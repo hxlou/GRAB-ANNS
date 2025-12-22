@@ -555,87 +555,98 @@ inline uint32_t find_pos_in_array(const uint32_t* arr, uint32_t size, uint32_t t
     return size;
 }
 
+// 辅助函数：检查值是否存在于数组的前 len 个元素中
+inline bool is_duplicate(const uint32_t* arr, uint32_t len, uint32_t val) {
+    for (uint32_t i = 0; i < len; ++i) {
+        if (arr[i] == val) return true;
+    }
+    return false;
+}
+
 /**
- * @brief 第三步优化：合并图 (注入反向边)
+ * @brief 第三步优化：交错合并图 (Interleaved Merge)
  * 
- * 逻辑：
- * 1. 保护前 degree/2 个邻居。
- * 2. 遍历反向图，将反向邻居插入到 degree/2 的位置。
- * 3. 数组右移，丢弃末尾元素。
+ * 策略：
+ * 不再设定保护区，而是尝试按照 [原图, 反向, 原图, 反向...] 的顺序填充新列表。
+ * 如果某一方耗尽，则由另一方继续填充，直到填满 degree 为止。
  */
-void optimize_merge_graphs(uint32_t* h_graph,           // [In/Out] 主图 (剪枝后的图)
+void optimize_merge_graphs(uint32_t* h_graph,           // [In/Out] 主图
                            const uint32_t* h_rev_graph, // [In] 反向图
                            const uint32_t* h_rev_counts,// [In] 反向计数
                            size_t num_dataset,
                            uint32_t degree)
 {
-    // 保护区大小：前一半
-    const uint32_t num_protected = degree / 2;
-
-    // OpenMP 并行处理每个节点
     #pragma omp parallel for
     for (size_t j = 0; j < num_dataset; ++j) {
-        // 当前节点 j 的邻居列表指针
-        uint32_t* graph_ptr = h_graph + j * degree;
+        // 1. 获取当前节点的源数据指针
+        const uint32_t* src_orig_ptr = h_graph + j * degree;
+        const uint32_t* src_rev_ptr  = h_rev_graph + j * degree;
         
-        // 获取有多少节点指向 j
+        // 获取反向边的实际数量
         uint32_t rev_count = h_rev_counts[j];
-        // 限制处理数量，不能超过度数 (虽然一般 rev_graph 也没存那么多)
         if (rev_count > degree) rev_count = degree;
 
-        const uint32_t* rev_ptr = h_rev_graph + j * degree;
+        // 2. 准备临时缓冲区来构建新的邻居列表
+        // 使用 vector 可以避免 VLA (变长数组) 问题，虽然有微小开销，但在 CPU 端可接受
+        // 如果追求极致性能，可以使用栈上固定大小数组 (如 uint32_t buffer[128])
+        std::vector<uint32_t> new_neighbors;
+        new_neighbors.reserve(degree);
 
-        // 遍历每一个指向 j 的节点 i
-        // 倒序遍历还是正序遍历在随机图上影响不大，这里采用正序
-        for (uint32_t k = 0; k < rev_count; ++k) {
-            uint32_t i = rev_ptr[k];
+        // 3. 定义两个游标，分别指向原图和反向图的当前读取位置
+        uint32_t cursor_orig = 0;
+        uint32_t cursor_rev = 0;
 
-            // 过滤无效节点
-            if (i >= num_dataset) continue;
-            // 理论上 i 不应该等于 j (无自环)，稍微防一下
-            if (i == (uint32_t)j) continue;
+        // 4. 循环填充，直到填满 degree 或者两个源都耗尽
+        while (new_neighbors.size() < degree) {
+            bool added_any = false; // 标记这一轮是否添加了节点
 
-            // 1. 检查 i 是否已经在 j 的邻居列表中
-            uint32_t pos = find_pos_in_array(graph_ptr, degree, i);
+            // --- 尝试从 [原图] 取一个 ---
+            while (cursor_orig < degree) {
+                uint32_t candidate = src_orig_ptr[cursor_orig++];
+                
+                // 不添加自己
+                if (candidate == (uint32_t)j) continue;
+                // 不添加重复项 (在已生成的 new_neighbors 中查找)
+                if (is_duplicate(new_neighbors.data(), new_neighbors.size(), candidate)) continue;
 
-            // 2. 如果 i 已经在保护区 (前一半)，说明它非常重要，不需要动
-            if (pos < num_protected) {
-                continue;
+                // 找到有效节点，加入并跳出内层循环 (轮换给反向图)
+                new_neighbors.push_back(candidate);
+                added_any = true;
+                break; 
             }
 
-            // 3. 计算需要移动的元素数量
-            // 我们要把 i 插入到 num_protected 的位置
-            // 需要把 [num_protected, ...] 的元素往后挪
-            uint32_t shift_len = 0;
+            // 如果已经满了，就不需要再从反向图取了
+            if (new_neighbors.size() >= degree) break;
 
-            if (pos < degree) {
-                // 情况 A: i 已经在列表中，但在非保护区 (pos >= num_protected)
-                // 我们把它“提拔”到非保护区的首位
-                // 需要挪动 [num_protected, pos - 1] 这一段
-                shift_len = pos - num_protected;
-            } else {
-                // 情况 B: i 不在列表中
-                // 我们把它强行插入到非保护区首位
-                // 需要挪动 [num_protected, degree - 2] 这一段 (最后一个元素被丢弃)
-                shift_len = degree - num_protected - 1;
+            // --- 尝试从 [反向图] 取一个 ---
+            while (cursor_rev < rev_count) {
+                uint32_t candidate = src_rev_ptr[cursor_rev++];
+
+                if (candidate >= num_dataset) continue;
+                if (candidate == (uint32_t)j) continue;
+                
+                // 关键：去重。反向边可能和原图里还没遍历到的边重复，也可能和已加入的重复
+                if (is_duplicate(new_neighbors.data(), new_neighbors.size(), candidate)) continue;
+
+                new_neighbors.push_back(candidate);
+                added_any = true;
+                break;
             }
 
-            // 4. 执行数组移动 (memmove 处理重叠区域是安全的)
-            // 目标: graph_ptr + num_protected + 1
-            // 源:   graph_ptr + num_protected
-            if (shift_len > 0) {
-                std::memmove(graph_ptr + num_protected + 1,
-                             graph_ptr + num_protected,
-                             shift_len * sizeof(uint32_t));
-            }
+            // 如果这一轮“原图”和“反向图”都没有贡献任何新节点，说明都耗尽了，退出
+            if (!added_any) break;
+        }
 
-            // 5. 插入新邻居
-            graph_ptr[num_protected] = i;
+        // 5. 将构建好的列表写回 h_graph
+        uint32_t* dst_ptr = h_graph + j * degree;
+        
+        // 复制有效数据
+        size_t valid_count = new_neighbors.size();
+        for (size_t k = 0; k < valid_count; ++k) {
+            dst_ptr[k] = new_neighbors[k];
         }
     }
-
 }
-
 
 __global__ void cast_u32_to_i64_kernel(const uint32_t* src, int64_t* dst, size_t total_count) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;

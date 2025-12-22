@@ -6,7 +6,7 @@ import os
 #    可以是相对路径（相对于当前脚本所在位置）或绝对路径
 DIRECTORIES_TO_COUNT = [
     "./src",        # 示例：统计 src 目录
-    "./tests",      # 示例：统计 tests 目录
+    # "./tests",      # 示例：统计 tests 目录
 ]
 
 # 2. 指定需要统计的文件后缀名

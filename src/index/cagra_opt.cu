@@ -7,6 +7,8 @@
 #include "smem_cal.cuh"
 #include "insert.cuh"
 #include "cagra_opt.cuh"
+#include "common.cuh"
+
 
 #include <iostream>
 #include <vector>
@@ -258,7 +260,7 @@ __global__ void update_remote_edges_kernel(
 
         if (remote_filled >= max_remote) break;
     }
-    if (tid < 10) printf("Real remote edges filled: %d\n", remote_filled);
+    if (tid < 5) printf("Real remote edges filled: %d\n", remote_filled);
 }
 
 // =============================================================================
@@ -645,7 +647,7 @@ void build_global_remote_edges(const float* d_dataset,
     res.setTempMemory(1024 * 1024 * 512); // 512MB 临时显存
 
     faiss::gpu::GpuIndexIVFPQConfig config;
-    config.device = 1; // 确保与当前上下文一致
+    config.device = CUDA_DEVICE_ID; // 确保与当前上下文一致
 
     // 3. 构建并训练索引
     // 注意：faiss::METRIC_L2
@@ -662,7 +664,7 @@ void build_global_remote_edges(const float* d_dataset,
     // 申请输出显存
     int64_t* d_global_indices;
     float* d_global_dists;
-    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaSetDevice(CUDA_DEVICE_ID));
     CUDA_CHECK(cudaMalloc(&d_global_indices, num_dataset * global_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_global_dists, num_dataset * global_k * sizeof(float)));
 
@@ -889,7 +891,7 @@ void search_opt(const float* d_dataset,
         itopk_size, params.search_width, graph_degree, params.hash_bitlen
     );
 
-    std::cout << "seme size is (MB)" << smem_size / (1024.0 * 1024.0) << std::endl;
+    // std::cout << "seme size is (MB)" << smem_size / (1024.0 * 1024.0) << std::endl;
 
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
@@ -901,8 +903,8 @@ void search_opt(const float* d_dataset,
     uint32_t* d_pre_hashmap = nullptr;
     if (params.hash_bitlen > 13) {
         size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
-        printf("num query is %ld\n", num_queries);
-        printf("total_hash_size is %lu MB\n", total_hash_size / (1024u * 1024u));
+        // printf("num query is %ld\n", num_queries);
+        // printf("total_hash_size is %lu MB\n", total_hash_size / (1024u * 1024u));
         CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
     }
 
@@ -983,19 +985,28 @@ void search_bucket_opt(const float* d_dataset,
         throw std::runtime_error("Graph is null!");
     }
 
+    // // debug 输出入参
+    // std::cout << "[Bucket Search] num_queries: " << num_queries 
+    //           << ", k: " << k 
+    //           << ", total_degree: " << total_degree 
+    //           << ", local_degree: " << local_degree 
+    //           << ", num_seeds_per_query: " << num_seeds_per_query 
+    //           << std::endl;
+
+
     uint32_t topk = static_cast<uint32_t>(k);
     uint32_t itopk_size = std::max(topk, params.itopk_size);
-    if (itopk_size < 64) itopk_size = 64; 
+    if (itopk_size < 128) itopk_size = 128; 
 
     // B. 计算 Shared Memory
     // 注意：这里使用 local_degree 计算需求，因为我们只扩展这么多邻居
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, local_degree, params.hash_bitlen
+        itopk_size, params.search_width, total_degree, params.hash_bitlen
     );
 
     // std::cout << "[Bucket Search] SMEM Size: " << smem_size / 1024.0 << " KB" << std::endl;
 
-    uint32_t raw_needed = itopk_size + params.search_width * local_degree;
+    uint32_t raw_needed = itopk_size + params.search_width * total_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
 
@@ -1070,6 +1081,246 @@ void search_bucket_opt(const float* d_dataset,
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_out_indices_u32));
     if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+}
+
+void search_bucket_range(const float* d_dataset,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint64_t* d_ts,
+                       uint32_t total_degree,  // stride (32)
+                       uint32_t local_degree,  // active (28)
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       uint64_t start_bucket,
+                       uint64_t end_bucket,
+                       SearchParams params,
+                       int64_t* d_out_indices, 
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query)
+{
+    if (d_graph == nullptr) {
+        throw std::runtime_error("Graph is null!");
+    }
+
+    uint32_t topk = static_cast<uint32_t>(k);
+    uint32_t itopk_size = std::max(topk, params.itopk_size);
+    if (itopk_size < 64) itopk_size = 64; 
+
+    // B. 计算 Shared Memory
+    // 注意：这里使用 local_degree 计算需求，因为我们只扩展这么多邻居
+    size_t smem_size = cagra::detail::calculate_and_check_smem(
+        itopk_size, params.search_width, total_degree, params.hash_bitlen
+    );
+
+    // std::cout << "[Bucket Search] SMEM Size: " << smem_size / 1024.0 << " KB" << std::endl;
+
+    uint32_t raw_needed = itopk_size + params.search_width * total_degree;
+    uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
+                                       cagra::detail::next_power_of_2(raw_needed));
+
+    // C. 临时内存 (uint32 输出 & Global Hashmap)
+    uint32_t* d_out_indices_u32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+
+    uint32_t* d_pre_hashmap = nullptr;
+    if (params.hash_bitlen > 13) {
+        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
+        // printf("[Bucket Search] Allocating Global Hashmap: %.2f MB\n", total_hash_size / (1024.0 * 1024.0));
+        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
+        // 【关键】必须初始化，否则 Kernel 内读取全是垃圾数据
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, total_hash_size));
+    }
+
+    // D. 随机种子
+    std::random_device rd;
+    uint64_t rand_xor_mask = rd(); 
+    
+    // 目标总种子数
+    uint32_t num_seeds_target = (uint32_t)num_seeds_per_query;
+    if (num_seeds_target > itopk_size) num_seeds_target = itopk_size;
+
+    // E. 启动 Kernel (search_kernel_bucket)
+    dim3 grid(num_queries);
+    dim3 block(cagra::config::BLOCK_SIZE);
+
+    cagra::device::search_kernel_range<<<grid, block, smem_size>>>(
+        d_out_indices_u32,
+        d_out_dists,
+        d_queries,
+        d_dataset,
+        d_graph,
+        d_seeds,
+        d_ts,             
+        num_seeds_per_query,  
+        nullptr, 
+        
+        // Params
+        (uint32_t)num_queries,
+        num_dataset,
+        cagra::config::DIM, 
+        total_degree,   // graph_stride (32)
+        local_degree,   // active_degree (28) -> 只搜 Local!
+        start_bucket,
+        end_bucket,
+        
+        topk,
+        itopk_size,
+        params.search_width,
+        params.max_iterations,
+        num_seeds_target,     
+        rand_xor_mask,
+        params.hash_bitlen,
+        d_pre_hashmap,
+        queue_capacity
+    );
+    CUDA_CHECK(cudaGetLastError());
+    
+    // F. 类型转换 (uint32 -> int64)
+    size_t total_elements = num_queries * topk;
+    size_t convert_block = 256;
+    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
+    
+    cast_u32_to_i64_kernel<<<convert_grid, convert_block>>>(
+        d_out_indices_u32, 
+        d_out_indices, 
+        total_elements
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // G. 清理
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_out_indices_u32));
+    if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+}
+
+
+void insert(const float* d_dataset,
+                     uint32_t* d_graph,
+                     const uint64_t* d_ts,
+                     const uint32_t* d_seeds,
+                     size_t num_existing,
+                     size_t num_new,
+                     const float* d_queries,
+                     uint32_t dim,
+                     uint32_t total_degree,
+                     uint32_t local_degree,
+                     SearchParams params,
+                     uint32_t num_seeds_per_query)
+{
+    if (num_new == 0) return;
+
+    // std::cout << ">> [CAGRA Algo] Optimize Insert (Global + Local Search)..." << std::endl;
+
+    // 0. 准备指针
+    // 新数据既是 Data 也是 Query
+    // const float* d_queries = d_dataset + num_existing * dim;
+
+    // 1. 准备搜索结果缓冲区
+    // 我们需要两份结果：一份给 Local，一份给 Global
+    uint32_t search_k = params.itopk_size / 2;
+    
+    int64_t* d_indices_global;
+    float* d_dists_global;
+    int64_t* d_indices_local;
+    float* d_dists_local;
+
+    CUDA_CHECK(cudaMalloc(&d_indices_global, num_new * search_k * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_dists_global, num_new * search_k * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_indices_local, num_new * search_k * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_dists_local, num_new * search_k * sizeof(float)));
+
+    // -----------------------------------------------------------
+    // 2. Global Search (全量搜索，无 Seed)
+    // 用于填充 Remote Edges
+    // -----------------------------------------------------------
+    // 注意：只在 num_existing (老数据) 范围内搜索
+    cagra::search_opt(
+        d_dataset, 
+        num_existing,   // Search Space: Old Data
+        d_graph, 
+        total_degree,   // 使用完整的 32 度进行跳跃
+        d_queries, 
+        (int64_t)num_new, 
+        (int64_t)search_k, 
+        params, 
+        d_indices_global, 
+        d_dists_global, 
+        nullptr,        // 无 Seed -> 随机初始化
+        0
+    );
+
+    // -----------------------------------------------------------
+    // 3. Local Search (带 Seed 搜索)
+    // 用于填充 Local Edges
+    // -----------------------------------------------------------
+    cagra::search_bucket_opt(
+        d_dataset, 
+        num_existing,   // Search Space: Old Data
+        d_graph, 
+        total_degree,
+        local_degree,
+        d_queries, 
+        (int64_t)num_new, 
+        (int64_t)search_k, 
+        params, 
+        d_indices_local, 
+        d_dists_local, 
+        d_seeds,             // 传入桶内种子
+        num_seeds_per_query
+    );
+
+    // 对于查询结果，我们需要进行精排
+    refine_cagra_candidates(
+        d_dataset,
+        d_queries,
+        d_indices_local,
+        d_dists_local,
+        num_existing,
+        num_new,
+        dim,
+        search_k
+    );
+
+    refine_cagra_candidates(
+        d_dataset,
+        d_queries,
+        d_indices_global,
+        d_dists_global,
+        num_existing,
+        num_new,
+        dim,
+        search_k
+    );
+
+    // -----------------------------------------------------------
+    // 4. Update Topology (更新图结构)
+    // -----------------------------------------------------------
+    // 调用之前封装好的 update 函数
+    // 此时它会同时利用 local knn 和 global knn 填充新节点，
+    // 并生成请求更新老节点
+    cagra::update_topology_gpu_opt(
+        d_graph,
+        d_ts,
+        d_indices_local,  // d_search_indices (Local)
+        d_indices_global, // d_search_global (Global)
+        num_existing,
+        num_new,
+        total_degree,
+        local_degree,
+        search_k,
+        search_k
+    );
+
+    // 5. 清理
+    CUDA_CHECK(cudaFree(d_indices_global));
+    CUDA_CHECK(cudaFree(d_dists_global));
+    CUDA_CHECK(cudaFree(d_indices_local));
+    CUDA_CHECK(cudaFree(d_dists_local));
+
+    // std::cout << ">> [CAGRA Algo] Insert Complete." << std::endl;
 }
 
 } // namespace cagra

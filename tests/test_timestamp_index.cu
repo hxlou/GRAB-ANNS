@@ -67,10 +67,12 @@ bool parseMeta(const std::string& path, int& dim, int& total) {
 // =============================================================================
 // 主测试逻辑
 // =============================================================================
+
+#include "common.cuh"
+
 int main() {
     // 1. 环境配置 (选择空闲显卡)
-    int cuda_device = 1; 
-    CHECK_CUDA(cudaSetDevice(cuda_device));
+    CHECK_CUDA(cudaSetDevice(CUDA_DEVICE_ID));
 
     std::string meta_path = "../data/hotpotqa_fullwiki_train.meta.json";
     std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";

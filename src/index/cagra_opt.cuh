@@ -54,6 +54,34 @@ void search_bucket_opt(const float* d_dataset,
                        const uint32_t* d_seeds,
                        const uint32_t num_seeds_per_query);
 
+void search_bucket_range(const float* d_dataset,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint64_t* d_ts,
+                       uint32_t total_degree,  // stride (32)
+                       uint32_t local_degree,  // active (28)
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       uint64_t start_bucket,
+                       uint64_t end_bucket,
+                       SearchParams params,
+                       int64_t* d_out_indices, 
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query);
 
+void insert(const float* d_dataset,
+                     uint32_t* d_graph,
+                     const uint64_t* d_ts,
+                     const uint32_t* d_seeds,
+                     size_t num_existing,
+                     size_t num_new,
+                     const float* d_queries,
+                     uint32_t dim,
+                     uint32_t total_degree,
+                     uint32_t local_degree,
+                     SearchParams params,
+                     uint32_t num_seeds_per_query);
 
 } // namespace cagra

@@ -346,9 +346,10 @@ void run_test_full_baseline(const float* full_data, int dim, size_t n_total) {
     std::cout << "------------------------------------------------" << std::endl;
 }
 
+#include "common.cuh"
+
 int main() {
-    int cuda_device = 1;
-    CHECK_CUDA(cudaSetDevice(cuda_device));
+    CHECK_CUDA(cudaSetDevice(CUDA_DEVICE_ID));
 
 
     std::string meta_path = "../data/hotpotqa_fullwiki_train.meta.json";

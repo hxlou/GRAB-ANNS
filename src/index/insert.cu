@@ -207,73 +207,6 @@ void find_near_nodes(const float* d_dataset,
 }
 
 // =============================================================================
-// Helper: CPU 侧拓扑更新 (随机替换策略) 弃用
-// =============================================================================
-void update_topology_random_cpu(uint32_t* h_graph,
-                                const int64_t* h_search_indices,
-                                size_t num_existing,
-                                size_t num_new,
-                                uint32_t graph_degree,
-                                uint32_t search_k)
-{
-    // 保护区大小：前一半不动，后一半可以随机替换
-    const uint32_t num_protected = graph_degree / 2;
-    const uint32_t num_unprotected = graph_degree - num_protected;
-
-    // OpenMP 并行处理每个新插入的节点
-    #pragma omp parallel for
-    for (size_t i = 0; i < num_new; ++i) {
-        // 新节点的逻辑 ID 是接着旧节点后面的
-        size_t new_node_id = num_existing + i;
-        
-        // 伪随机数生成
-        uint64_t rng_state = new_node_id * 0x9e3779b97f4a7c15; 
-
-        // --- Part A: 填充新节点的出边 (我指向谁) ---
-        uint32_t* new_node_neighbors = h_graph + new_node_id * graph_degree;
-        
-        // 初始化
-        for(uint32_t k=0; k<graph_degree; ++k) new_node_neighbors[k] = 0xFFFFFFFF;
-
-        // 直接从搜索结果中取 Top-Degree
-        for (uint32_t k = 0; k < graph_degree; ++k) {
-            int64_t idx = h_search_indices[i * search_k + k];
-            // 确保指向的是有效的旧节点
-            if (idx >= 0 && idx < (int64_t)num_existing) {
-                new_node_neighbors[k] = (uint32_t)idx;
-            }
-        }
-
-        // --- Part B: 更新反向边 (随机替换谁指向我) ---
-        for (int m = 0; m < search_k; ++m) {
-            int64_t neighbor_idx_64 = h_search_indices[i * search_k + m];
-            if (neighbor_idx_64 < 0 || neighbor_idx_64 >= (int64_t)num_existing) continue;
-            
-            uint32_t old_id = (uint32_t)neighbor_idx_64;
-            uint32_t* old_neighbors = h_graph + old_id * graph_degree;
-
-            // 1. 查重
-            bool exists = false;
-            for (uint32_t x = 0; x < graph_degree; ++x) {
-                if (old_neighbors[x] == (uint32_t)new_node_id) {
-                    exists = true; 
-                    break;
-                }
-            }
-
-            if (!exists) {
-                // 2. 随机替换逻辑 (仅在 Unprotected 区域)
-                rng_state = rng_state * 6364136223846793005ULL + 1;
-                uint32_t random_offset = (rng_state >> 32) % num_unprotected;
-                uint32_t replace_idx = num_protected + random_offset;
-
-                old_neighbors[replace_idx] = (uint32_t)new_node_id;
-            }
-        }
-    }
-}
-
-// =============================================================================
 // Kernel A: 填充新节点的出边 (Part A)
 // 每个线程处理一个新节点的一条出边
 // =============================================================================
@@ -493,5 +426,520 @@ void update_topology_gpu_v1(uint32_t* d_graph,
     CUDA_CHECK(cudaFree(d_req_keys));
     CUDA_CHECK(cudaFree(d_req_vals));
 }
+
+
+
+// =============================================================================
+//  opt insert 函数实现
+// ============================================================================
+
+__global__ void fill_new_nodes_kernel_opt(
+    uint32_t* d_graph,              // [Total_N, 32] (写入目标)
+    const uint64_t* d_ts,           // [Total_N] 时间戳 (用于验证)
+    const int64_t* d_local_knn,     // [num_new, search_k_local]
+    const int64_t* d_global_knn,    // [num_new, search_k_global]
+    size_t num_existing,            // 老数据量 (即新数据的起始全局ID)
+    size_t num_new,                 // 新数据量
+    uint32_t total_degree,          // 32
+    uint32_t local_degree,          // 28
+    uint32_t search_k_local,        // 搜索结果的宽度 (e.g. 64)
+    uint32_t search_k_global        // 搜索结果的宽度 (e.g. 64)
+) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_new) return;
+
+    // 当前新节点的全局 ID
+    size_t my_global_id = num_existing + tid;
+    uint64_t my_ts = d_ts[my_global_id];
+
+    // 指向 d_graph 中当前新节点的行
+    uint32_t* my_graph_row = d_graph + my_global_id * total_degree;
+
+    // -------------------------------------------------------------
+    // Phase 1: 填充 Local Edges [0, local_degree-1]
+    // -------------------------------------------------------------
+    int filled_local = 0;
+    const int64_t* my_local_candidates = d_local_knn + tid * search_k_local;
+
+    for (uint32_t k = 0; k < search_k_local; ++k) {
+        if (filled_local >= local_degree) break;
+
+        int64_t cand_id_64 = my_local_candidates[k];
+        uint32_t cand_id = (uint32_t)cand_id_64;
+
+        // 过滤无效值
+        if (cand_id_64 < 0) continue;
+        if (cand_id == my_global_id) continue; // 不连自己
+        if (cand_id >= 0x7fffffff) continue; // 过滤异常大 ID
+
+        // 强制时间戳约束：必须同桶
+        if (d_ts[cand_id] == my_ts) {
+            my_graph_row[filled_local++] = (uint32_t)cand_id;
+        }
+    }
+
+    // 补齐 Local
+    while (filled_local < local_degree) {
+        my_graph_row[filled_local++] = 0xFFFFFFFF;
+    }
+
+    // -------------------------------------------------------------
+    // Phase 2: 填充 Remote Edges [local_degree, total_degree-1]
+    // -------------------------------------------------------------
+    int filled_remote = 0;
+    int max_remote = total_degree - local_degree;
+    const int64_t* my_global_candidates = d_global_knn + tid * search_k_global;
+
+    for (uint32_t k = 0; k < search_k_global; ++k) {
+        if (filled_remote >= max_remote) break;
+
+        int64_t cand_id_64 = my_global_candidates[k];
+        uint32_t cand_id = (uint32_t)cand_id_64;
+
+        if (cand_id_64 < 0) continue;
+        if (cand_id == my_global_id) continue;
+
+        // 查重：不要把已经在 Local 里的点再加一遍
+        // 虽然一个是 Local Search 来的，一个是 Global Search 来的，但可能有重叠
+        bool exists_in_local = false;
+        for (int i = 0; i < local_degree; ++i) {
+            if (my_graph_row[i] == cand_id) {
+                exists_in_local = true;
+                break;
+            }
+        }
+        if (exists_in_local) continue;
+
+        // 强制时间戳约束：优先异桶，或者强制异桶？
+        // 策略：既然叫 Remote Edge，我们强制要求它是异桶的。
+        // 如果实在找不到异桶的，再考虑同桶（这里先实现强制异桶）
+        if (d_ts[cand_id] != my_ts) {
+            my_graph_row[local_degree + filled_remote] = (uint32_t)cand_id;
+            filled_remote++;
+        }
+    }
+
+    // 补齐 Remote
+    while (filled_remote < max_remote) {
+        my_graph_row[local_degree + filled_remote] = 0xFFFFFFFF;
+        filled_remote++;
+    }
+}
+
+__global__ void generate_update_requests_kernel_opt(
+    const uint32_t* d_graph,         // [Total_N, 32] (读取新节点的行)
+    
+    // --- Local Mailbox ---
+    uint32_t* d_local_req_counts,    // [num_existing]
+    uint32_t* d_local_req_lists,     // [num_existing, max_requests]
+    
+    // --- Remote Mailbox ---
+    uint32_t* d_remote_req_counts,   // [num_existing]
+    uint32_t* d_remote_req_lists,    // [num_existing, max_requests]
+    
+    size_t num_existing,             // 老节点数量 (Mailbox 的大小)
+    size_t num_new,                  // 新节点数量
+    uint32_t total_degree,           // 32
+    uint32_t local_degree,           // 28
+    uint32_t local_max_requests,            // Mailbox 容量
+    uint32_t remote_max_requests           // Mailbox 容量
+) {
+    // 1. 线程索引：每个线程处理一个【新节点】
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_new) return;
+
+    // 当前新节点的全局 ID
+    uint32_t src_id = (uint32_t)(num_existing + tid);
+
+    // 指向我在图中的那一行
+    const uint32_t* my_neighbors = d_graph + (size_t)src_id * total_degree;
+
+    // 2. 遍历我的所有出边
+    for (int i = 0; i < total_degree; ++i) {
+        uint32_t dest_id = my_neighbors[i];
+
+        // 2.1 过滤无效边
+        if (dest_id == 0xFFFFFFFF) continue;
+
+        // 2.2 确保只向【老节点】发请求
+        // 既然 Mailbox 是按 num_existing 分配的，必须加这个判断防止越界
+        // if (dest_id >= num_existing) continue;
+
+        // 2.3 判定类型：直接根据索引 i 判断
+        // [0, local_degree-1] -> Local
+        // [local_degree, total_degree-1] -> Remote
+        if (i < local_degree) {
+            // --- Local Mailbox ---
+            uint32_t pos = atomicAdd(&d_local_req_counts[dest_id], 1);
+            if (pos < local_max_requests) {
+                // 写入请求：我是 src_id，我想连你
+                d_local_req_lists[(size_t)dest_id * local_max_requests + pos] = src_id;
+            }
+        } else {
+            // --- Remote Mailbox ---
+            uint32_t pos = atomicAdd(&d_remote_req_counts[dest_id], 1);
+            if (pos < remote_max_requests) {
+                d_remote_req_lists[(size_t)dest_id * remote_max_requests + pos] = src_id;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ uint32_t wang_hash_insert(uint32_t seed) {
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+__global__ void apply_topology_updates_kernel_opt(
+    uint32_t* d_graph,               // [Total_N, 32]
+    
+    // --- Local Mailbox ---
+    const uint32_t* d_local_req_counts,
+    const uint32_t* d_local_req_lists,
+    uint32_t max_requests_local,
+    
+    // --- Remote Mailbox ---
+    const uint32_t* d_remote_req_counts,
+    const uint32_t* d_remote_req_lists,
+    uint32_t max_requests_remote,
+
+    size_t num_existing,             
+    uint32_t total_degree,           // 32
+    uint32_t local_degree            // 28
+) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_existing) return;
+
+    // 1. 准备参数
+    uint32_t* my_row = d_graph + tid * total_degree;
+    uint32_t rng_state = wang_hash_insert((uint32_t)tid);
+
+    // 定义概率阈值 (10%)
+    const uint32_t PROB_THRESHOLD = 10; 
+
+    // -------------------------------------------------------------------------
+    // 处理 Local 请求
+    // -------------------------------------------------------------------------
+    uint32_t local_count = d_local_req_counts[tid];
+    if (local_count > 0) {
+        if (local_count > max_requests_local) local_count = max_requests_local;
+        const uint32_t* my_requests = d_local_req_lists + (size_t)tid * max_requests_local;
+        
+        // 计算区域边界
+        uint32_t local_half = local_degree / 2;
+        
+        // Strong 区域: [0, local_half)
+        // Weak   区域: [local_half, local_degree)
+        uint32_t strong_len = local_half;
+        uint32_t weak_len = local_degree - local_half;
+
+        for (uint32_t i = 0; i < local_count; ++i) {
+            uint32_t candidate = my_requests[i];
+            
+            // 1. 掷骰子决定攻击哪个区域
+            rng_state = wang_hash_insert(rng_state);
+            bool attack_strong = (rng_state % 100) < PROB_THRESHOLD;
+
+            // 2. 确定攻击范围
+            uint32_t target_start = attack_strong ? 0 : local_half;
+            uint32_t target_len   = attack_strong ? strong_len : weak_len;
+
+            // 3. 在目标范围内随机替换
+            if (target_len > 0) {
+                rng_state = wang_hash_insert(rng_state); // 更新随机数用于选槽位
+                int slot = target_start + (rng_state % target_len);
+                my_row[slot] = candidate;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 处理 Remote 请求
+    // -------------------------------------------------------------------------
+    uint32_t remote_count = d_remote_req_counts[tid];
+    if (remote_count > 0) {
+        if (remote_count > max_requests_remote) remote_count = max_requests_remote;
+        const uint32_t* my_requests = d_remote_req_lists + (size_t)tid * max_requests_remote;
+
+        // 计算区域边界
+        uint32_t remote_degree = total_degree - local_degree;
+        uint32_t remote_half = remote_degree / 2;
+        
+        // Strong 区域: [local_degree, local_degree + remote_half)
+        // Weak   区域: [local_degree + remote_half, total_degree)
+        uint32_t strong_start = local_degree;
+        uint32_t strong_len = remote_half;
+        
+        uint32_t weak_start = local_degree + remote_half;
+        uint32_t weak_len = remote_degree - remote_half;
+
+        for (uint32_t i = 0; i < remote_count; ++i) {
+            uint32_t candidate = my_requests[i];
+
+            // 1. 掷骰子
+            rng_state = wang_hash_insert(rng_state);
+            bool attack_strong = (rng_state % 100) < PROB_THRESHOLD;
+
+            // 2. 确定攻击范围
+            uint32_t target_start = attack_strong ? strong_start : weak_start;
+            uint32_t target_len   = attack_strong ? strong_len : weak_len;
+
+            // 3. 随机替换
+            if (target_len > 0) {
+                rng_state = wang_hash_insert(rng_state);
+                int slot = target_start + (rng_state % target_len);
+                my_row[slot] = candidate;
+            }
+        }
+    }
+}
+
+
+void update_topology_gpu_opt(
+    uint32_t* d_graph,              // [In/Out] 全量图
+    const uint64_t* d_ts,           // [In] 时间戳 (Fill阶段需要)
+    const int64_t* d_search_indices,// [In] 搜索结果
+    const int64_t* d_search_global,    // [In] 全局搜索结果 (优化版可共用)
+    size_t num_existing,            // 老节点数量
+    size_t num_new,                 // 新节点数量
+    uint32_t total_degree,          // 32
+    uint32_t local_degree,          // 28
+    uint32_t search_k_local,               // 128
+    uint32_t search_k_global               // 128
+) {
+    if (num_new == 0) return;
+
+    // -------------------------------------------------------------
+    // Step 1: 填充新节点的出边 (Fill Outbound)
+    // -------------------------------------------------------------
+    // Grid: 基于新节点数量
+    int block_size = 256;
+    int grid_size_new = (num_new + block_size - 1) / block_size;
+
+    // 你的 fill kernel 名字叫 fill_new_nodes_kernel_opt
+    // 假设 d_global_knn 和 d_local_knn 共用 d_search_indices
+    fill_new_nodes_kernel_opt<<<grid_size_new, block_size>>>(
+        d_graph,
+        d_ts,
+        d_search_indices, // local knn
+        d_search_global, // global knn
+        num_existing,
+        num_new,
+        total_degree,
+        local_degree,
+        search_k_local,
+        search_k_global
+    );
+    CUDA_CHECK(cudaGetLastError());
+    // 这里不需要 Sync，因为 Step 2 依赖 Step 1 的结果，同一个流内会自动串行
+
+    // -------------------------------------------------------------
+    // Step 2: 准备 Mailbox (中间存储)
+    // -------------------------------------------------------------
+    uint32_t local_max_requests = local_degree / 2;
+    uint32_t remote_max_requests = (total_degree - local_degree) / 2;
+    
+    // 申请显存 (只针对老节点 num_existing)
+    uint32_t *d_local_req_counts, *d_local_req_lists;
+    uint32_t *d_remote_req_counts, *d_remote_req_lists;
+
+    size_t counts_size = num_existing * sizeof(uint32_t);
+    size_t local_lists_size = num_existing * local_max_requests * sizeof(uint32_t);
+    size_t remote_lists_size = num_existing * remote_max_requests * sizeof(uint32_t);
+
+    CUDA_CHECK(cudaMalloc(&d_local_req_counts, counts_size));
+    CUDA_CHECK(cudaMalloc(&d_local_req_lists, local_lists_size));
+    CUDA_CHECK(cudaMalloc(&d_remote_req_counts, counts_size));
+    CUDA_CHECK(cudaMalloc(&d_remote_req_lists, remote_lists_size));
+
+    // 初始化计数器为 0
+    CUDA_CHECK(cudaMemset(d_local_req_counts, 0, counts_size));
+    CUDA_CHECK(cudaMemset(d_remote_req_counts, 0, counts_size));
+
+    // -------------------------------------------------------------
+    // Step 3: 生成请求 (Generate Requests)
+    // -------------------------------------------------------------
+    // Grid: 基于新节点数量 (因为是新节点发起请求)
+    // 使用优化版 Kernel (无需查 d_ts，直接根据 index 判断 local/remote)
+    
+    generate_update_requests_kernel_opt<<<grid_size_new, block_size>>>(
+        d_graph,
+        // d_ts, // 不需要了
+        d_local_req_counts, 
+        d_local_req_lists,
+        d_remote_req_counts, 
+        d_remote_req_lists,
+        num_existing,
+        num_new,
+        total_degree,
+        local_degree,
+        local_max_requests,
+        remote_max_requests
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // -------------------------------------------------------------
+    // Step 4: 应用更新 (Apply Updates)
+    // -------------------------------------------------------------
+    // Grid: 基于老节点数量 (因为是老节点处理收件箱)
+    int grid_size_existing = (num_existing + block_size - 1) / block_size;
+
+    apply_topology_updates_kernel_opt<<<grid_size_existing, block_size>>>(
+        d_graph,
+        d_local_req_counts, 
+        d_local_req_lists, 
+        local_max_requests, // local max
+        d_remote_req_counts, 
+        d_remote_req_lists, 
+        remote_max_requests, // remote max
+        num_existing,
+        total_degree,
+        local_degree
+    );
+    CUDA_CHECK(cudaGetLastError());
+    
+    // 等待所有操作完成
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // -------------------------------------------------------------
+    // Step 5: 清理资源
+    // -------------------------------------------------------------
+    CUDA_CHECK(cudaFree(d_local_req_counts));
+    CUDA_CHECK(cudaFree(d_local_req_lists));
+    CUDA_CHECK(cudaFree(d_remote_req_counts));
+    CUDA_CHECK(cudaFree(d_remote_req_lists));
+}
+
+// =============================================================================
+// Refine Kernel: 计算精确距离并重排序 (针对 Insert 阶段)
+// =============================================================================
+// 假设 K 是 2 的幂次 (64, 128, 256...)
+// 每个线程处理 N = K / 32 个候选
+template <int N>
+__global__ void refine_cagra_candidates_kernel(
+    const float* d_dataset,         // [num_existing, dim] 老数据集
+    const float* d_queries,         // [num_new, dim] 新插入的数据(作为Query)
+    int64_t* d_indices,             // [num_new, K] 输入/输出索引
+    float* d_dists,                 // [num_new, K] 输入/输出距离
+    size_t num_existing,
+    size_t num_new,
+    uint32_t dim,
+    uint32_t K
+) {
+    // 1. 计算当前 Warp 负责的 Query ID
+    // 假设 BlockDim = 256 (8 Warps)
+    size_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    size_t lane_id = threadIdx.x % 32;
+
+    if (warp_id >= num_new) return;
+
+    // 当前 Query 向量指针
+    const float* query_vec = d_queries + warp_id * dim;
+    
+    // 当前 Query 在 indices/dists 数组中的偏移
+    size_t row_offset = warp_id * K;
+
+    // 2. 寄存器数组：存储分给当前线程的候选点
+    float my_dists[N];
+    uint32_t my_indices[N];
+
+    // 初始化
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        my_dists[i] = 3.40282e38f; // MAX_FLOAT
+        my_indices[i] = 0xFFFFFFFF;
+    }
+
+    // 3. 加载候选点并计算精确距离 (Warp 协作)
+    // --------------------------------------------------------
+    // 我们需要遍历 K 个候选。
+    // 为了利用 calc_l2_dist_1024 (Warp级算子)，我们必须所有线程同步处理同一个候选。
+    
+    for (int k = 0; k < K; ++k) {
+        // 读取索引 (广播读取，大家读一样的)
+        // 注意：d_indices 是 int64，但我们内部处理用 uint32，最后再转回
+        int64_t idx_64 = d_indices[row_offset + k];
+        
+        float dist = 3.40282e38f;
+
+        // 验证索引合法性
+        if (idx_64 >= 0 && idx_64 < num_existing) {
+            uint32_t idx_32 = (uint32_t)idx_64;
+            const float* cand_vec = d_dataset + (size_t)idx_32 * dim;
+            
+            // Warp 协作计算精确 L2
+            dist = cagra::device::calc_l2_dist_1024(query_vec, cand_vec);
+        }
+
+        // 分发结果到对应的寄存器
+        // 候选 k 属于线程 (k % 32) 的第 (k / 32) 个槽位
+        int owner_lane = k % 32;
+        int reg_idx = k / 32;
+
+        if (lane_id == owner_lane) {
+            my_dists[reg_idx] = dist;
+            my_indices[reg_idx] = (uint32_t)idx_64; // 暂时截断为 u32 用于排序
+        }
+    }
+
+    // 4. 双调排序 (Warp Sort)
+    // --------------------------------------------------------
+    // 升序排列：距离小的在前
+    cagra::bitonic::warp_sort<float, uint32_t, N>(my_dists, my_indices, true);
+
+    // 5. 写回 Global Memory
+    // --------------------------------------------------------
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        int k = i * 32 + lane_id;
+        // 写回时转回 int64
+        if (k < K) {
+            uint32_t idx = my_indices[i];
+            d_indices[row_offset + k] = (idx == 0xFFFFFFFF) ? -1 : (int64_t)idx;
+            d_dists[row_offset + k] = my_dists[i];
+        }
+    }
+}
+
+// Host Wrapper
+void refine_cagra_candidates(const float* d_dataset,
+                             const float* d_queries,
+                             int64_t* d_indices,
+                             float* d_dists,
+                             size_t num_existing,
+                             size_t num_new,
+                             uint32_t dim,
+                             uint32_t k)
+{
+    // std::cout << ">> [CAGRA Algo] Refining " << num_new << " queries (K=" << k << ")..." << std::endl;
+
+    int block_size = 256; // 8 Warps per block
+    int warps_per_block = 8;
+    int grid_size = (num_new + warps_per_block - 1) / warps_per_block;
+
+    // 根据 K 选择模板 N
+    if (k <= 64) {
+        refine_cagra_candidates_kernel<2><<<grid_size, block_size>>>(
+            d_dataset, d_queries, d_indices, d_dists, num_existing, num_new, dim, k);
+    } else if (k <= 128) {
+        refine_cagra_candidates_kernel<4><<<grid_size, block_size>>>(
+            d_dataset, d_queries, d_indices, d_dists, num_existing, num_new, dim, k);
+    } else if (k <= 256) {
+        refine_cagra_candidates_kernel<8><<<grid_size, block_size>>>(
+            d_dataset, d_queries, d_indices, d_dists, num_existing, num_new, dim, k);
+    } else {
+        // Fallback for larger K (512)
+        refine_cagra_candidates_kernel<16><<<grid_size, block_size>>>(
+            d_dataset, d_queries, d_indices, d_dists, num_existing, num_new, dim, k);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 
 } // namespace cagra

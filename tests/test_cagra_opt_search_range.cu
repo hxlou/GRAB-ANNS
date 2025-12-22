@@ -1,3 +1,7 @@
+/**
+ * TODO: 因为设备1被占用，还未实际进行测试
+ */
+
 #include "cagraIndexOpt.cuh"
 
 #include <iostream>
@@ -18,7 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// FAISS (CPU 版本，用于动态生成 Local GT)
+// FAISS (CPU 版本，用于动态生成 Range GT)
 #include <faiss/IndexFlat.h>
 
 #define CHECK_CUDA(call) do { cudaError_t err = call; if (err != cudaSuccess) { fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); exit(1); } } while (0)
@@ -36,7 +40,6 @@ private:
     std::chrono::high_resolution_clock::time_point start_;
 };
 
-// 解析 Meta
 bool parseMeta(const std::string& path, int& dim, int& total) {
     std::ifstream file(path);
     if (!file.is_open()) return false;
@@ -64,20 +67,19 @@ int main() {
     std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << "CagraIndexOpt RANDOM LOCAL Test (100 Iters x 32 Queries)" << std::endl;
+    std::cout << "CagraIndexOpt RANGE Query Test (Time Filtering)" << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 1. 加载数据 (限制 50w)
+    // 1. 加载数据
     int dim = 1024, file_total = 0;
     parseMeta(meta_path, dim, file_total);
     
     int total = 40000; 
     if (file_total < total) total = file_total;
 
-    // 分桶策略：每 5w 一个桶
-    size_t bucket_nums = 4;
-    size_t bucket_size = total / bucket_nums;
-    size_t num_buckets = bucket_nums;
+    // 分桶
+    size_t num_buckets = 8;
+    size_t bucket_size = total / num_buckets;
 
     std::cout << "Dataset: " << total << " vectors. Buckets: " << num_buckets << " (size ~" << bucket_size << ")" << std::endl;
 
@@ -93,92 +95,103 @@ int main() {
 
     // 3. 构建索引
     std::cout << ">> [Build] Building Index..." << std::endl;
-    cagra::CagraIndexOpt index(dim, 64); 
-    index.setBuildParams(128, 32); // KNN=64, Graph=32
+    cagra::CagraIndexOpt index(dim, 32); 
+    index.setBuildParams(64, 32); // KNN=64, Graph=32
     index.add(total, host_data, timestamps.data());
+    
+    Timer timer;
     index.build();
-    std::cout << "   Index Built." << std::endl;
+    std::cout << "   Build Time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-    // 随机找几个输出一下他们的邻居节点
-    const uint32_t* data_ptr = index.get_graph();
-    for (int test_id = 0; test_id < 5; ++test_id) {
-        int gid = test_id * 5000; // 跨度取点
-        std::cout << "[Debug] Neighbors of GID=" << gid << ": ";
-        for (int n = 0; n < 32; ++n) {
-            // 这里直接访问内部数据结构，假设邻居存储在紧邻的位置
-            uint32_t neighbor_id = data_ptr[gid * 32 + n];
-            std::cout << neighbor_id << " ";
-            if (n == 15) std::cout << std::endl;
-        }
-        std::cout << std::endl;
-    }
+    // 4. 随机 Range 测试配置
+    const int TEST_ITERS = 100;
+    const int QUERIES_PER_ITER = 32;
+    const int K = 10;
 
-
-    // 4. 随机测试配置
-    const int TEST_ITERS = 100;     // 测试轮数
-    const int QUERIES_PER_ITER = 32; // 每轮查询数
-    const int K = 10;                // Top-K
-
-    // 搜索参数 (Local Search 需要宽搜以保证桶内覆盖)
+    // 搜索参数：启用宽搜和多跳，因为 Range Query 需要跨桶
     index.setQueryParams(
-        128,  // itopk
+        256,  // itopk (加大一点，防止过滤掉太多)
         4,    // search_width
         0,    // min_iter
-        50,   // max_iter
+        50,   // max_iter (跨桶需要更多步数)
         14    // hash_bitlen
     );
 
-    std::mt19937 rng(999);
-    std::uniform_int_distribution<int> bucket_dist(0, num_buckets - 1);
+    std::mt19937 rng(5678);
 
     long long total_queries_cnt = 0;
     long long total_hits = 0;
     long long total_bound_errors = 0;
     double total_search_time = 0.0;
 
-    std::cout << "\n>> [Test] Starting Random Tests..." << std::endl;
+    std::cout << "\n>> [Test] Starting Random Range Tests..." << std::endl;
     std::cout << "   Progress: ";
 
     for (int iter = 0; iter < TEST_ITERS; ++iter) {
         if (iter % 10 == 0) std::cout << "." << std::flush;
 
-        // A. 随机选一个桶
-        int target_ts = bucket_dist(rng);
-        
-        // 计算该桶的数据范围
-        size_t global_start = target_ts * bucket_size;
-        size_t current_bucket_len = std::min(bucket_size, total - global_start);
-        const float* bucket_data_ptr = host_data + global_start * dim;
+        // A. 随机生成范围 [start, end)
+        // start: 0 ~ num_buckets-2
+        // length: 2 ~ 10 (随机跨度)
+        int start_bucket = std::uniform_int_distribution<int>(0, num_buckets - 2)(rng);
+        int max_len = std::min((int)num_buckets - start_bucket, 10); // 最大跨度10个桶
+        int len = std::uniform_int_distribution<int>(1, max_len)(rng);
+        int end_bucket = start_bucket + len;
 
-        // B. 随机选 32 个 Query
+        // 计算该范围的数据 ID 区间
+        size_t range_global_start = start_bucket * bucket_size;
+        size_t range_global_end = std::min((size_t)end_bucket * bucket_size, (size_t)total);
+        size_t range_len = range_global_end - range_global_start;
+        const float* range_data_ptr = host_data + range_global_start * dim;
+
+        // B. 从该范围内随机选 Query
         std::vector<float> queries(QUERIES_PER_ITER * dim);
-        std::uniform_int_distribution<int> q_dist(0, current_bucket_len - 1);
+        std::uniform_int_distribution<int> q_dist(0, range_len - 1);
         
         for (int i = 0; i < QUERIES_PER_ITER; ++i) {
             int local_idx = q_dist(rng);
-            std::copy(bucket_data_ptr + local_idx * dim,
-                      bucket_data_ptr + (local_idx + 1) * dim,
+            std::copy(range_data_ptr + local_idx * dim,
+                      range_data_ptr + (local_idx + 1) * dim,
                       queries.data() + i * dim);
         }
 
-        // C. 动态生成 Local GT (CPU FAISS)
-        // 这一步很快，5w 数据毫秒级
-        std::vector<int64_t> gt_indices_local(QUERIES_PER_ITER * K);
+        // C. 动态生成 Range GT (CPU FAISS)
+        // 只把范围内的数据加入 Index
+        std::vector<int64_t> gt_indices_range(QUERIES_PER_ITER * K);
         std::vector<float> gt_dists(QUERIES_PER_ITER * K);
         {
             faiss::IndexFlatL2 cpu_index(dim);
-            cpu_index.add(current_bucket_len, bucket_data_ptr);
-            cpu_index.search(QUERIES_PER_ITER, queries.data(), K, gt_dists.data(), gt_indices_local.data());
+            cpu_index.add(range_len, range_data_ptr);
+            cpu_index.search(QUERIES_PER_ITER, queries.data(), K, gt_dists.data(), gt_indices_range.data());
         }
 
-        // D. 执行 CAGRA Local Query
+        // D. 执行 CAGRA Range Query
         std::vector<int64_t> out_indices(QUERIES_PER_ITER * K);
         std::vector<float> out_dists(QUERIES_PER_ITER * K);
         
-        Timer timer;
-        // 指定 local_degree=28
-        index.query_local(queries.data(), QUERIES_PER_ITER, K, target_ts, 
-                          out_indices.data(), out_dists.data(), 28);
+        timer.reset();
+        
+        // 【核心】调用 query_range
+        // 传入 start_bucket 和 end_bucket 作为过滤条件
+        // 传入 local_degree=28 (虽然这里没用上，但这通常用于控制是否只搜Local，
+        // 对于Range Query，我们其实是用 Total Degree 在搜，因为要跨桶)
+        // 你的接口定义里有 local_degree，我们可以传 32 或 28，
+        // 实际上底层 search_bucket_range 用的是 active_degree，
+        // 如果要做跨桶搜索，这里的 active_degree 应该传入 32 (total)！
+        // 
+        // 修正：在 cagraIndexOpt.cu 的 query_range 实现中，
+        // 你应该把 active_degree 设为 graph_degree_ (32)，以便利用 Remote Edge 跳跃。
+        // 但这里为了接口一致，我们可以传 32。
+        
+        index.query_range(queries.data(), 
+                          QUERIES_PER_ITER, 
+                          K, 
+                          (uint64_t)start_bucket, 
+                          (uint64_t)end_bucket, 
+                          out_indices.data(), 
+                          out_dists.data(), 
+                          32); // 这里传32，允许走Remote Edge
+        
         total_search_time += timer.elapsed_ms();
 
         // E. 验证
@@ -186,21 +199,20 @@ int main() {
             std::unordered_set<int64_t> gt_set;
             // GT 转 Global ID
             for (int j = 0; j < K; ++j) {
-                gt_set.insert(gt_indices_local[i * K + j] + global_start);
+                gt_set.insert(gt_indices_range[i * K + j] + range_global_start);
             }
 
             for (int j = 0; j < K; ++j) {
                 int64_t result_gid = out_indices[i * K + j];
                 
-                // 1. 越界检查
+                // 1. 越界检查 (Filtering Check)
+                // 结果必须落在 [start_bucket, end_bucket) 的 ID 范围内
                 if (result_gid != -1) {
-                    if (result_gid < global_start || result_gid >= global_start + current_bucket_len) {
+                    if (result_gid < range_global_start || result_gid >= range_global_end) {
                         total_bound_errors++;
-                        // 严重错误，打印一次即可
-                        if (1) {
-                            std::cerr << "\n[FATAL] Boundary Error! TS=" << target_ts 
-                                      << " Found GID=" << result_gid 
-                                      << " Range=[" << global_start << ", " << global_start + current_bucket_len << ")" << std::endl;
+                        if (total_bound_errors == 1) {
+                            std::cerr << "\n[FATAL] Filter Failed! Range=[" << start_bucket << ", " << end_bucket << ")"
+                                      << " Found GID=" << result_gid << std::endl;
                         }
                     }
                 }
@@ -225,17 +237,17 @@ int main() {
     std::cout << "   Total Search Time: " << total_search_time << " ms" << std::endl;
     std::cout << "   Avg QPS:           " << std::fixed << std::setprecision(2) << (total_queries_cnt * 1000.0 / total_search_time) << std::endl;
     std::cout << "   Avg Recall@" << K << ":      " << avg_recall << "%" << std::endl;
-    std::cout << "   Bound Errors:      " << total_bound_errors << " (Must be 0)" << std::endl;
+    std::cout << "   Filter Errors:     " << total_bound_errors << " (Must be 0)" << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
     munmap((void*)host_data, sz);
     close(fd);
 
     if (total_bound_errors == 0 && avg_recall > 95.0) {
-        std::cout << "PASSED: Robust local search." << std::endl;
+        std::cout << "PASSED: High recall with perfect filtering." << std::endl;
         return 0;
     } else {
-        std::cout << "FAILED: Issues detected." << std::endl;
+        std::cout << "FAILED: Recall low or filtering broken." << std::endl;
         return 1;
     }
 }

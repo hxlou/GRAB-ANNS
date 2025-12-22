@@ -76,5 +76,37 @@ __global__ void search_kernel_bucket(
     uint32_t queue_capacity     
 );
 
+__global__ void search_kernel_range(
+    uint32_t* result_indices_ptr,       
+    float* result_distances_ptr,        
+    const float* queries_ptr,           
+    const float* dataset_ptr,           
+    const uint32_t* knn_graph,         
+    const uint32_t* seed_ptr,
+    uint64_t* d_ts,
+    uint32_t num_provided_seeds,        
+    uint32_t* num_executed_iterations,  
+    
+    // --- 核心参数 ---
+    uint32_t num_queries,
+    size_t num_dataset,
+    uint32_t dim,               
+    uint32_t graph_stride,      // 图的物理宽度 (32)
+    uint32_t active_degree,     // 实际使用的逻辑宽度 (28 - Local Edge)
+    uint64_t start_bucket,      // 范围搜索起始桶号 [start, end)
+    uint64_t end_bucket,        // 范围搜索结束桶号 (不包含)
+    
+    uint32_t topk,              
+    uint32_t itopk_size,        
+    uint32_t search_width,      
+    uint32_t max_iterations,    
+    uint32_t num_seeds,         
+    uint64_t rand_xor_mask,     
+    uint32_t hash_bitlen,
+    uint32_t* pre_hashmap,   
+    uint32_t queue_capacity     
+);
+
+
 } // namespace device
 } // namespace cagra

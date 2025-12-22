@@ -55,9 +55,10 @@ bool parseMeta(const std::string& path, int& dim, int& total) {
     } catch (...) { return false; }
 }
 
+#include "common.cuh"
+
 int main() {
-    int cuda_device = 1;
-    CHECK_CUDA(cudaSetDevice(cuda_device));
+    CHECK_CUDA(cudaSetDevice(CUDA_DEVICE_ID));
 
     // ---------------------------------------------------------
     // 1. 配置
