@@ -27,7 +27,7 @@ public:
         
         // 【新增关键步骤】设置 Runtime API 使用设备 1，并建立 Context
         // 如果不加这两行，cudaMemcpy 可能会尝试去操作设备 0，导致 invalid argument
-        cudaSetDevice(1); 
+        cudaSetDevice(0); 
         cudaFree(0);      
 
         // 2. 获取粒度
@@ -35,8 +35,8 @@ public:
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         
-        // 【修改点 1】这里指定物理内存分配在 Device 1 上
-        prop.location.id = 1; 
+        // 【修改点 1】这里指定物理内存分配在 Device 0 上
+        prop.location.id = 0; 
         
         DRIVER_CHECK(cuMemGetAllocationGranularity(&granularity_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
@@ -83,8 +83,8 @@ public:
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         
-        // 【修改点 2】这里指定新增的物理内存也在 Device 1
-        prop.location.id = 1;
+        // 【修改点 2】这里指定新增的物理内存也在 Device 0
+        prop.location.id = 0;
 
         DRIVER_CHECK(cuMemCreate(&handle, size_diff, &prop, 0));
         handles_.push_back(handle);
@@ -96,8 +96,8 @@ public:
         CUmemAccessDesc accessDesc = {};
         accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         
-        // 【修改点 3】这里告诉 GPU，Device 1 拥有读写这块内存的权限
-        accessDesc.location.id = 1;
+        // 【修改点 3】这里告诉 GPU，Device 0 拥有读写这块内存的权限
+        accessDesc.location.id = 0;
         
         accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         DRIVER_CHECK(cuMemSetAccess(d_ptr_ + current_size_, size_diff, &accessDesc, 1));

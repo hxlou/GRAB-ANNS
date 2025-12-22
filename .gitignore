@@ -1,0 +1,7 @@
+# Build directory
+build/
+
+# Data directory
+data/
+
+**/.claude/**

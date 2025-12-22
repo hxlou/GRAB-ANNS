@@ -645,7 +645,7 @@ void build_global_remote_edges(const float* d_dataset,
     res.setTempMemory(1024 * 1024 * 512); // 512MB 临时显存
 
     faiss::gpu::GpuIndexIVFPQConfig config;
-    config.device = 1; // 确保与当前上下文一致
+    config.device = 0; // 确保与当前上下文一致
 
     // 3. 构建并训练索引
     // 注意：faiss::METRIC_L2
@@ -662,7 +662,7 @@ void build_global_remote_edges(const float* d_dataset,
     // 申请输出显存
     int64_t* d_global_indices;
     float* d_global_dists;
-    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaMalloc(&d_global_indices, num_dataset * global_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_global_dists, num_dataset * global_k * sizeof(float)));
 

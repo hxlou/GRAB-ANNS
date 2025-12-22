@@ -108,6 +108,8 @@ add_cagra_test(test_timestamp_index_random tests/test_timestamp_index_random.cu)
 
 add_cagra_test(test_cagra_opt tests/test_cagra_opt.cu)
 add_cagra_test(test_cagra_opt_search_bucket tests/test_cagra_opt_search_bucket.cu)
+add_cagra_test(test_cagra_opt_bucket_hdfs tests/test_cagra_opt_bucket_hdfs.cu)
+add_cagra_test(test_cagra_index_hdfs tests/test_cagra_index_hdfs.cu)
 
 
 # FAISS HNSW 对比测试 (如果有的话)
