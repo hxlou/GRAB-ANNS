@@ -105,6 +105,7 @@ void generate_knn_graph(const float* d_dataset,
     // 扩大搜索范围以提高 Recall
     int search_k = k * 5; 
     search_k = std::min((size_t)search_k, num_dataset);
+    search_k = std::min(search_k, 2048); // 限制最大搜索数为 1024
 
     int max_batch_size = 1024; // 每个 Batch 处理 1024 个 Query
 
@@ -863,7 +864,7 @@ void search(const float* d_dataset,
 
     // B. 计算 Shared Memory
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, graph_degree, params.hash_bitlen
+        itopk_size, config::DIM, params.search_width, graph_degree, params.hash_bitlen
     );
 
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
@@ -873,6 +874,11 @@ void search(const float* d_dataset,
     // C. 临时内存 (uint32)
     uint32_t* d_out_indices_u32 = nullptr;
     CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+    uint32_t* d_pre_hashmap = nullptr;
+    if (params.hash_bitlen > 14) {
+        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, sizeof(uint32_t) * (1u << params.hash_bitlen)));
+    }
 
     // D. 随机种子
     std::random_device rd;
@@ -906,7 +912,7 @@ void search(const float* d_dataset,
         num_seeds,
         rand_xor_mask,
         params.hash_bitlen,
-        nullptr,
+        d_pre_hashmap,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
@@ -952,6 +958,7 @@ void insert(const float* d_dataset,     // 旧数据
     // 这里的逻辑是：把 d_new_data 作为 query，在 d_dataset (旧库) 中搜索
     // auto t1 = std::chrono::high_resolution_clock::now();
     find_near_nodes(d_dataset, 
+                    config::DIM,
                     num_existing, 
                     num_new, 
                     d_new_data, // 直接传入新数据指针

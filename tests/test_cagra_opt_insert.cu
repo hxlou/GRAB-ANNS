@@ -96,6 +96,15 @@ int main() {
     std::cout << "CagraIndexOpt Comprehensive Test (Multi-Round)" << std::endl;
     std::cout << "==========================================================" << std::endl;
 
+    uint32_t init_degree = 128;
+    // CAGRA 全局搜索参数 (可以激进一点)
+    uint32_t itopk_size = 512;
+    uint32_t search_width = 6;
+    uint32_t min_iterations = 0;
+    uint32_t max_iterations = 100;
+    uint32_t hash_bitlen = 16;
+
+
     // 1. 加载数据
     int dim = 1024, file_total = 0;
     parseMeta(meta_path, dim, file_total);
@@ -105,7 +114,7 @@ int main() {
     if (file_total < total) total = file_total;
 
     // 分桶策略：40 个桶 (每个桶约 2.2w)
-    size_t num_buckets = 40;
+    size_t num_buckets = 500;
     size_t bucket_size = total / num_buckets;
 
     std::cout << "Dataset: " << total << " vectors. Buckets: " << num_buckets << " (size ~" << bucket_size << ")" << std::endl;
@@ -145,9 +154,8 @@ int main() {
 
     // 4. 初始化与构建
     std::cout << ">> [Setup] Initializing Index..." << std::endl;
-    uint32_t init_degree = 64;
     cagra::CagraIndexOpt index(dim, init_degree);
-    index.setBuildParams(128, init_degree);
+    index.setBuildParams(init_degree * 2, init_degree);
 
     // Phase 1: Build
     Timer timer;
@@ -176,11 +184,16 @@ int main() {
     global_gt_index.add(total, index.get_data()); // 全量数据
 
     const int NUM_ROUNDS_GLOBAL = 5;
-    const int QUERIES_PER_ROUND = 100;
+    const int QUERIES_PER_ROUND = 512;
     const int K = 20;
     
-    // CAGRA 全局搜索参数 (可以激进一点)
-    index.setQueryParams(512, 6, 0, 100, 16);
+
+    index.setQueryParams(itopk_size, search_width, min_iterations, max_iterations, hash_bitlen);
+    std::cout << "Global search with params of itopk=" << itopk_size 
+              << ", search_width=" << search_width 
+              << ", max_iterations=" << max_iterations 
+              << ", hash_bitlen=" << hash_bitlen << std::endl;
+
 
     TestStats global_stats;
 
@@ -242,7 +255,11 @@ int main() {
     
     uint32_t true_test_buckets = 0;
     // CAGRA 局部搜索参数 (需要宽搜以覆盖桶内)
-    index.setQueryParams(256, 6, 0, 100, 16);
+    index.setQueryParams(itopk_size, search_width, min_iterations, max_iterations, hash_bitlen);
+    std::cout << "Local search with params of itopk=" << itopk_size 
+              << ", search_width=" << search_width 
+              << ", max_iterations=" << max_iterations 
+              << ", hash_bitlen=" << hash_bitlen << std::endl;
 
     TestStats total_local_stats;
 

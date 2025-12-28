@@ -324,6 +324,14 @@ void run_test_full_baseline(const float* full_data, int dim, size_t n_total) {
 
     double total_search_time_ms = 0.0;
 
+    index.setQueryParams(
+        128,  // itopk
+        4,    // search_width
+        0,    // min_iter
+        50,   // max_iter
+        13    // hash_bitlen
+    );
+
     for (int b = 0; b < NUM_BATCHES; ++b) {
         float* batch_queries = all_queries.data() + b * BATCH_SIZE * dim;
         int64_t* batch_out_indices = all_out_indices.data() + b * BATCH_SIZE * K;

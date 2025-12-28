@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <omp.h> // 使用 OpenMP 加速 CPU 排序
 #include <random>
+#include <chrono>
 // FAISS 头文件
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/GpuIndexIVFPQ.h>
@@ -122,7 +123,14 @@ __global__ void refine_and_sort_kernel(
         if (idx_64 >= 0 && idx_64 < num_dataset) {
              const float* candidate_vec = d_dataset + (size_t)idx_64 * dim;
              // 全员参与计算
-             dist = cagra::device::calc_l2_dist_1024(query_vec, candidate_vec);
+            if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_vec, candidate_vec);
+            else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, candidate_vec);
+            else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, candidate_vec);
+            else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, candidate_vec);
+            else {
+                // 对于非特殊维度，调用通用版本
+                printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+            }
         }
 
         // 分发结果：计算出来的 dist 是广播给全 Warp 的
@@ -866,6 +874,7 @@ void build_time_partitioned_graph(const float* d_dataset,
 }
 
 void search_opt(const float* d_dataset,
+            uint32_t dim,
             size_t num_dataset,
             const uint32_t* d_graph,    
             uint32_t graph_degree,      
@@ -888,7 +897,7 @@ void search_opt(const float* d_dataset,
 
     // B. 计算 Shared Memory
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, graph_degree, params.hash_bitlen
+        itopk_size, dim, params.search_width, graph_degree, params.hash_bitlen
     );
 
     // std::cout << "seme size is (MB)" << smem_size / (1024.0 * 1024.0) << std::endl;
@@ -934,7 +943,7 @@ void search_opt(const float* d_dataset,
         // Params
         (uint32_t)num_queries,
         num_dataset,
-        cagra::config::DIM, 
+        dim, 
         graph_degree,
         topk,
         itopk_size,
@@ -968,6 +977,7 @@ void search_opt(const float* d_dataset,
 }
 
 void search_bucket_opt(const float* d_dataset,
+                        uint32_t dim,
                        size_t num_dataset,
                        const uint32_t* d_graph,
                        uint32_t total_degree,  // stride (32)
@@ -1001,7 +1011,7 @@ void search_bucket_opt(const float* d_dataset,
     // B. 计算 Shared Memory
     // 注意：这里使用 local_degree 计算需求，因为我们只扩展这么多邻居
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, total_degree, params.hash_bitlen
+        itopk_size, dim, params.search_width, total_degree, params.hash_bitlen
     );
 
     // std::cout << "[Bucket Search] SMEM Size: " << smem_size / 1024.0 << " KB" << std::endl;
@@ -1049,7 +1059,7 @@ void search_bucket_opt(const float* d_dataset,
         // Params
         (uint32_t)num_queries,
         num_dataset,
-        cagra::config::DIM, 
+        dim, 
         total_degree,   // graph_stride (32)
         local_degree,   // active_degree (28) -> 只搜 Local!
         
@@ -1080,10 +1090,11 @@ void search_bucket_opt(const float* d_dataset,
     // G. 清理
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_out_indices_u32));
-    if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
 }
 
 void search_bucket_range(const float* d_dataset,
+                        uint32_t dim,
                        size_t num_dataset,
                        const uint32_t* d_graph,
                        uint64_t* d_ts,
@@ -1111,7 +1122,7 @@ void search_bucket_range(const float* d_dataset,
     // B. 计算 Shared Memory
     // 注意：这里使用 local_degree 计算需求，因为我们只扩展这么多邻居
     size_t smem_size = cagra::detail::calculate_and_check_smem(
-        itopk_size, params.search_width, total_degree, params.hash_bitlen
+        itopk_size, dim, params.search_width, total_degree, params.hash_bitlen
     );
 
     // std::cout << "[Bucket Search] SMEM Size: " << smem_size / 1024.0 << " KB" << std::endl;
@@ -1160,7 +1171,7 @@ void search_bucket_range(const float* d_dataset,
         // Params
         (uint32_t)num_queries,
         num_dataset,
-        cagra::config::DIM, 
+        dim, 
         total_degree,   // graph_stride (32)
         local_degree,   // active_degree (28) -> 只搜 Local!
         start_bucket,
@@ -1193,7 +1204,7 @@ void search_bucket_range(const float* d_dataset,
     // G. 清理
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_out_indices_u32));
-    if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
 }
 
 
@@ -1213,7 +1224,6 @@ void insert(const float* d_dataset,
     if (num_new == 0) return;
 
     // std::cout << ">> [CAGRA Algo] Optimize Insert (Global + Local Search)..." << std::endl;
-
     // 0. 准备指针
     // 新数据既是 Data 也是 Query
     // const float* d_queries = d_dataset + num_existing * dim;
@@ -1232,6 +1242,8 @@ void insert(const float* d_dataset,
     CUDA_CHECK(cudaMalloc(&d_indices_local, num_new * search_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists_local, num_new * search_k * sizeof(float)));
 
+    // auto t1 = std::chrono::high_resolution_clock::now();
+
     // -----------------------------------------------------------
     // 2. Global Search (全量搜索，无 Seed)
     // 用于填充 Remote Edges
@@ -1239,6 +1251,7 @@ void insert(const float* d_dataset,
     // 注意：只在 num_existing (老数据) 范围内搜索
     cagra::search_opt(
         d_dataset, 
+        dim,
         num_existing,   // Search Space: Old Data
         d_graph, 
         total_degree,   // 使用完整的 32 度进行跳跃
@@ -1258,6 +1271,7 @@ void insert(const float* d_dataset,
     // -----------------------------------------------------------
     cagra::search_bucket_opt(
         d_dataset, 
+        dim,
         num_existing,   // Search Space: Old Data
         d_graph, 
         total_degree,
@@ -1272,28 +1286,30 @@ void insert(const float* d_dataset,
         num_seeds_per_query
     );
 
-    // 对于查询结果，我们需要进行精排
-    refine_cagra_candidates(
-        d_dataset,
-        d_queries,
-        d_indices_local,
-        d_dists_local,
-        num_existing,
-        num_new,
-        dim,
-        search_k
-    );
+    // auto t2 = std::chrono::high_resolution_clock::now();
 
-    refine_cagra_candidates(
-        d_dataset,
-        d_queries,
-        d_indices_global,
-        d_dists_global,
-        num_existing,
-        num_new,
-        dim,
-        search_k
-    );
+    // // 对于查询结果，我们需要进行精排
+    // refine_cagra_candidates(
+    //     d_dataset,
+    //     d_queries,
+    //     d_indices_local,
+    //     d_dists_local,
+    //     num_existing,
+    //     num_new,
+    //     dim,
+    //     search_k
+    // );
+
+    // refine_cagra_candidates(
+    //     d_dataset,
+    //     d_queries,
+    //     d_indices_global,
+    //     d_dists_global,
+    //     num_existing,
+    //     num_new,
+    //     dim,
+    //     search_k
+    // );
 
     // -----------------------------------------------------------
     // 4. Update Topology (更新图结构)
@@ -1313,6 +1329,15 @@ void insert(const float* d_dataset,
         search_k,
         search_k
     );
+
+    // auto t3 = std::chrono::high_resolution_clock::now();
+
+    // std::chrono::duration<double> global_search_time = t2 - t1;
+    // std::chrono::duration<double> update_time = t3 - t2;
+
+    // std::cout << ">> [CAGRA Algo] Insert Timing: Global Search = " 
+    //           << global_search_time.count() << " s, Update Topology = " 
+    //           << update_time.count() << " s." << std::endl;
 
     // 5. 清理
     CUDA_CHECK(cudaFree(d_indices_global));

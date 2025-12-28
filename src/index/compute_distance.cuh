@@ -32,6 +32,69 @@ __device__ __forceinline__ float calc_l2_dist_1024(const float* vec_a, const flo
     return sum_sq;
 }
 
+__device__ __forceinline__ float calc_l2_dist_960(const float* vec_a, const float* vec_b) {
+    const int lane_id = threadIdx.x % 32;
+    float sum_sq = 0.0f;
+
+    // 每个线程处理 32 个元素 (32 * 32 = 1024)
+    #pragma unroll
+    for (int i = 0; i < 30; ++i) {
+        int idx = i * 32 + lane_id;
+        float diff = vec_a[idx] - vec_b[idx];
+        sum_sq += diff * diff;
+    }
+
+    // Warp 归约求和
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    
+    return sum_sq;
+}
+
+__device__ __forceinline__ float calc_l2_dist_256(const float* vec_a, const float* vec_b) {
+    const int lane_id = threadIdx.x % 32;
+    float sum_sq = 0.0f;
+
+    // 每个线程处理 32 个元素 (32 * 32 = 1024)
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int idx = i * 32 + lane_id;
+        float diff = vec_a[idx] - vec_b[idx];
+        sum_sq += diff * diff;
+    }
+
+    // Warp 归约求和
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    
+    return sum_sq;
+}
+
+__device__ __forceinline__ float calc_l2_dist_128(const float* vec_a, const float* vec_b) {
+    const int lane_id = threadIdx.x % 32;
+    float sum_sq = 0.0f;
+
+    // 每个线程处理 32 个元素 (32 * 32 = 1024)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int idx = i * 32 + lane_id;
+        float diff = vec_a[idx] - vec_b[idx];
+        sum_sq += diff * diff;
+    }
+
+    // Warp 归约求和
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    
+    return sum_sq;
+}
+
 // ============================================================================
 // 阶段 1: 初始化 (随机选取节点计算距离)
 // ============================================================================
@@ -71,7 +134,15 @@ __device__ inline void compute_distance_to_random_nodes(
 
         // 计算距离
         const float* node_ptr = dataset_ptr + (size_t)node_id * dim;
-        float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+        float dist = 3.40282e38f; // MAX_FLOAT
+        if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+        else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+        else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+        else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+        else {
+            // 对于非特殊维度，调用通用版本
+            printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+        }
 
         // 写入结果队列的前 num_seeds 个位置
         if (lane_id == 0) {
@@ -128,7 +199,15 @@ __device__ inline void compute_distance_to_init_nodes(
 
         // 3. 计算距离 (Warp 级并行)
         const float* node_ptr = dataset_ptr + (size_t)node_id * dim;
-        float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+        float dist = 3.40282e38f; // MAX_FLOAT
+        if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+        else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+        else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+        else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+        else {
+            // 对于非特殊维度，调用通用版本
+            printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+        }
 
         // 4. 写入队列 & 哈希表 (仅 Lane 0 执行)
         if (lane_id == 0) {
@@ -210,7 +289,15 @@ __device__ inline void compute_distance_to_child_nodes(
                 if (not_visited) {
                     // 6. 没访问过 -> 计算距离
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
-                    float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+                    float dist = 3.40282e38f; // MAX_FLOAT
+                    if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+                    else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+                    else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else {
+                        // 对于非特殊维度，调用通用版本
+                        printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+                    }
 
                     // 7. 写入结果
                     if (lane_id == 0) {
@@ -325,7 +412,15 @@ __device__ inline void compute_distance_to_child_nodes_strided(
                 if (not_visited) {
                     // 6. 没访问过 -> 计算距离
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
-                    float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+                    float dist = 3.40282e38f; // MAX_FLOAT
+                    if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+                    else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+                    else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else {
+                        // 对于非特殊维度，调用通用版本
+                        printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+                    }
 
                     // 7. 写入结果
                     if (lane_id == 0) {
@@ -406,15 +501,15 @@ __device__ inline void compute_distance_to_child_nodes_range(
         uint32_t parent_idx = task_id / graph_degree;
         uint32_t neighbor_offset = task_id % graph_degree;
 
-        // 仅处理前 active_degree 个邻居
-        if (neighbor_offset >= active_degree) {
-            // 写入无效值
-            if (lane_id == 0) {
-                candidate_indices[task_id] = 0xFFFFFFFF;
-                candidate_distances[task_id] = 3.40282e38f;
-            }
-            continue;
-        }
+        // // 仅处理前 active_degree 个邻居
+        // if (neighbor_offset >= active_degree) {
+        //     // 写入无效值
+        //     if (lane_id == 0) {
+        //         candidate_indices[task_id] = 0xFFFFFFFF;
+        //         candidate_distances[task_id] = 3.40282e38f;
+        //     }
+        //     continue;
+        // }
 
         // 2. 获取父节点 ID
         uint32_t parent_id = parent_list[parent_idx];
@@ -454,7 +549,15 @@ __device__ inline void compute_distance_to_child_nodes_range(
                 if (not_visited) {
                     // 6. 没访问过 -> 计算距离
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
-                    float dist = calc_l2_dist_1024(query_buffer, node_ptr);
+                    float dist = 3.40282e38f; // MAX_FLOAT
+                    if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+                    else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+                    else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else {
+                        // 对于非特殊维度，调用通用版本
+                        printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+                    }
 
                     // 7. 写入结果
                     if (lane_id == 0) {

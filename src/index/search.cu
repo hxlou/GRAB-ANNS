@@ -281,23 +281,40 @@ __global__ void search_kernel(
             // Shadow variable issue: 之前代码这里定义了 local queue_capacity 导致错误
             // 这里我们使用传入的 queue_capacity 参数，并用 switch/if 处理模板参数 N
             
-            if (queue_capacity == 64) {
-                load_sort_store<2>(result_dists, result_indices, 64);
-            } else if (queue_capacity == 128) {
-                load_sort_store<4>(result_dists, result_indices, 128);
-            } else if (queue_capacity == 256) {
-                load_sort_store<8>(result_dists, result_indices, 256);
-            } else if (queue_capacity == 512) {
-                load_sort_store<16>(result_dists, result_indices, 512);
-            } else if (queue_capacity == 1024) {
-                load_sort_store<32>(result_dists, result_indices, 1024);
-            } else if (queue_capacity == 2048) {
-                load_sort_store<64>(result_dists, result_indices, 2048);
-            } else if (queue_capacity == 4096) {
-                load_sort_store<128>(result_dists, result_indices, 4096);
-            } else if (queue_capacity == 8192) {
-                load_sort_store<256>(result_dists, result_indices, 8192);
-            } else {
+            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
+            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else {
                 // 不支持的容量大小
                 if (tid == 0) {
                     printf(">> [search_kernel] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
@@ -334,14 +351,39 @@ __global__ void search_kernel(
     // -------------------------------------------------------------
     // 最后再排一次序
     if (tid < 32) {
-        if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-        else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-        else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-        else if (queue_capacity == 512) load_sort_store<16>(result_dists, result_indices, 512);
-        else if (queue_capacity == 1024) load_sort_store<32>(result_dists, result_indices, 1024);
-        else if (queue_capacity == 2048) load_sort_store<64>(result_dists, result_indices, 2048);
-        else if (queue_capacity == 4096) load_sort_store<128>(result_dists, result_indices, 4096);
-        else if (queue_capacity == 8192) load_sort_store<256>(result_dists, result_indices, 8192);
+            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
+            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
     }
     __syncthreads();
 
@@ -494,6 +536,9 @@ __global__ void search_kernel_bucket(
             else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
             else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
             else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -588,6 +633,9 @@ __global__ void search_kernel_bucket(
         else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
         else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
         else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+        else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+        else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+        else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
         else {
             // 不支持的容量大小
             if (tid == 0) {
@@ -722,8 +770,44 @@ __global__ void search_kernel_range(
         if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 512) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else {
+                // 不支持的容量大小
+                if (tid == 0) {
+                    printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+                }
+            }
+            
         }
         __syncthreads();
 
@@ -748,7 +832,7 @@ __global__ void search_kernel_range(
             dataset_ptr, 
             knn_graph, 
             graph_stride,   // 物理宽度 32
-            active_degree,  // 逻辑宽度 28 (Local Only)
+            graph_stride,  // 逻辑宽度 28 (Local Only)
             dim,
             visited_hash, 
             hash_bitlen, 
@@ -763,10 +847,45 @@ __global__ void search_kernel_range(
 
     // 5. 写回 (完全复用)
     if (tid < 32) {
-        if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-        else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-        else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-        else if (queue_capacity == 512) load_sort_store<16>(result_dists, result_indices, 512);
+            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
+            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
+            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
+            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
+            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
+            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
+            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
+            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
+            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
+            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
+            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
+            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
+            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
+            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
+            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
+            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
+            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
+            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
+            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
+            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else {
+                // 不支持的容量大小
+                if (tid == 0) {
+                    printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+                }
+            }
     }
     __syncthreads();
 

@@ -261,7 +261,8 @@ void CagraIndexOpt::query(const float* host_queries,
     // 3. 调用底层无状态算法 (search_opt)
     // 这里我们只进行全量搜索，不传 timestamp 相关的参数
     cagra::search_opt(
-        d_dataset, 
+        d_dataset,
+        dim_,
         current_size_, 
         d_graph, 
         graph_degree_, 
@@ -389,6 +390,7 @@ void CagraIndexOpt::query_local(const float* host_queries,
     // -----------------------------------------------------
     cagra::search_bucket_opt(
         d_dataset, 
+        dim_,
         current_size_, 
         d_graph, 
         graph_degree_,       // total_degree (32)
@@ -432,7 +434,7 @@ void CagraIndexOpt::query_range(const float* host_queries,
                                 uint32_t local_degree)  // 通常传入 graph_degree_ (32) 以启用 Remote Edge
 {
     if (current_size_ == 0) return;
-
+    local_degree = local_degree_;
     // =========================================================
     // 1. 种子采样 (Seed Sampling)
     // 从指定的时间桶范围内 [start, end) 采样种子
@@ -519,6 +521,7 @@ void CagraIndexOpt::query_range(const float* host_queries,
     // 调用 cagra_opt.cu 中的 search_bucket_range
     cagra::search_bucket_range(
         d_dataset,
+        dim_,
         current_size_,
         d_graph,
         d_timestamps,       // 传入时间戳数组
@@ -584,13 +587,11 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     // 2. Batch 处理图更新
     // -------------------------------------------------------
     // 设定 Batch Size (例如 1024 或由外部指定，这里先硬编码或作为成员变量)
-    size_t batch_size = 64;
+    size_t batch_size = 128;
     uint32_t num_seeds_per_query = std::max(32u, search_params_.itopk_size);
     const float* d_new = d_dataset + old_size * dim_;
 
     std::cout << "[CagraIndexOpt] Inserting " << new_vectors << " vectors (Batch Size: " << batch_size << ")..." << std::endl;
-
-    
 
     for (size_t offset = 0; offset < new_vectors; offset += batch_size) {
         size_t current_batch_size = std::min(batch_size, new_vectors - offset);
@@ -670,9 +671,9 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
 
         this->setQueryParams(
             256,  // itopk
-            6,    // search_width
+            4,    // search_width
             0,    // min_iter
-            50,   // max_iter
+            100,   // max_iter
             14    // hash_bitlen
         );
 

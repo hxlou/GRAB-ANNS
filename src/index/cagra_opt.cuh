@@ -28,6 +28,7 @@ void build_time_partitioned_graph(const float* d_dataset,
                                   uint32_t local_degree);
 
 void search_opt(const float* d_dataset,
+            uint32_t dim,
             size_t num_dataset,
             const uint32_t* d_graph,    
             uint32_t graph_degree,      
@@ -41,6 +42,7 @@ void search_opt(const float* d_dataset,
             const uint32_t num_seeds_per_query);
 
 void search_bucket_opt(const float* d_dataset,
+                       uint32_t dim,
                        size_t num_dataset,
                        const uint32_t* d_graph,
                        uint32_t total_degree,  // stride (32)
@@ -55,6 +57,7 @@ void search_bucket_opt(const float* d_dataset,
                        const uint32_t num_seeds_per_query);
 
 void search_bucket_range(const float* d_dataset,
+                       uint32_t dim,
                        size_t num_dataset,
                        const uint32_t* d_graph,
                        uint64_t* d_ts,

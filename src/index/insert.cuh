@@ -36,6 +36,7 @@ __global__ void insert_sort_kernel(int64_t* d_indices,
 } // namespace detail
 
 void find_near_nodes(const float* d_dataset,       
+                            uint32_t dim,
                             size_t num_existing,          
                             size_t num_new,               
                             const float* d_new_data,      

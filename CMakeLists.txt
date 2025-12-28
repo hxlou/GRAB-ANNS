@@ -138,6 +138,10 @@ add_cagra_test(test_cagra_opt tests/test_cagra_opt.cu)
 add_cagra_test(test_cagra_opt_search_bucket tests/test_cagra_opt_search_bucket.cu)
 add_cagra_test(test_cagra_opt_search_range tests/test_cagra_opt_search_range.cu)
 add_cagra_test(test_cagra_opt_insert tests/test_cagra_opt_insert.cu)
+add_cagra_test(test_cagra_opt_build_auto tests/test_cagra_opt_build_auto.cu)
+add_cagra_test(test_cagra_opt_insert_auto tests/test_cagra_opt_insert_auto.cu)
+
+# add_cagra_test(test_faiss_cagra tests/test_faiss_cagra.cu)
 
 # FAISS HNSW 对比测试 (如果有的话)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_faiss_hnsw_insert.cpp")

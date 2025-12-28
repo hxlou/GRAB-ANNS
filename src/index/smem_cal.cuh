@@ -26,6 +26,7 @@ inline uint32_t next_power_of_2(uint32_t n) {
  * @brief 计算并检查 Shared Memory 需求
  */
 inline size_t calculate_and_check_smem(uint32_t itopk_size, 
+                                       uint32_t dim,
                                        uint32_t search_width, 
                                        uint32_t graph_degree,
                                        uint32_t hash_bitlen)
@@ -35,7 +36,7 @@ inline size_t calculate_and_check_smem(uint32_t itopk_size,
 
     // 1. Query Buffer [1024 * 4 bytes] = 4KB
     // 必须 16 字节对齐
-    size_t query_size = DIM * sizeof(float);
+    size_t query_size = dim * sizeof(float);
     smem += (query_size + 15) & ~15;
 
     // 2. Visited Hashmap [4096 * 4 bytes] = 16KB

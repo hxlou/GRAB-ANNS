@@ -52,7 +52,15 @@ __global__ void insert_refine_kernel_warp(const float* d_queries,       // [batc
         const float* vec_n = d_dataset + (size_t)neighbor_id * dim;
 
         // 调用 device::calc_l2_dist_1024 (Warp Collective)
-        dist = cagra::device::calc_l2_dist_1024(vec_q, vec_n);
+
+        if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(vec_q, vec_n);
+        else if (dim == 960) dist = cagra::device::calc_l2_dist_960(vec_q, vec_n);
+        else if (dim == 256) dist = cagra::device::calc_l2_dist_256(vec_q, vec_n);
+        else if (dim == 128) dist = cagra::device::calc_l2_dist_128(vec_q, vec_n);
+        else {
+            // 对于非特殊维度，调用通用版本
+            printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+        }
     }
 
     // 4. 写回结果 (只有 Lane 0 负责写入，避免竞争)
@@ -127,7 +135,8 @@ __global__ void insert_sort_kernel(int64_t* d_indices,
 // =============================================================================
 // Helper: 内部搜索函数 (用于 Insert 阶段寻找最近邻)
 // =============================================================================
-void find_near_nodes(const float* d_dataset,       
+void find_near_nodes(const float* d_dataset,
+                            uint32_t dim,   
                             size_t num_existing,          
                             size_t num_new,               
                             const float* d_new_data,      
@@ -144,7 +153,7 @@ void find_near_nodes(const float* d_dataset,
     for (size_t offset = 0; offset < num_new; offset += batch_size) {
         size_t current_batch = std::min(batch_size, num_new - offset);
 
-        const float* curr_queries_ptr = d_new_data + offset * cagra::config::DIM;
+        const float* curr_queries_ptr = d_new_data + offset * dim;
         int64_t* curr_indices_ptr = d_out_indices + offset * search_k;
         float* curr_dists_ptr = d_out_dists + offset * search_k;
 
@@ -175,7 +184,7 @@ void find_near_nodes(const float* d_dataset,
             curr_indices_ptr,
             curr_dists_ptr,
             num_existing,
-            cagra::config::DIM, // 1024
+            dim, // 1024
             search_k,
             total_pairs
         );
@@ -872,7 +881,15 @@ __global__ void refine_cagra_candidates_kernel(
             const float* cand_vec = d_dataset + (size_t)idx_32 * dim;
             
             // Warp 协作计算精确 L2
-            dist = cagra::device::calc_l2_dist_1024(query_vec, cand_vec);
+            float dist = 0.0f;
+            if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_vec, cand_vec);
+            else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, cand_vec);
+            else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, cand_vec);
+            else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, cand_vec);
+            else {
+                // 对于非特殊维度，调用通用版本
+                printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
+            }
         }
 
         // 分发结果到对应的寄存器
