@@ -6,7 +6,7 @@
 #include "hashmap.cuh"
 #include "bitonic.cuh"
 #include "compute_distance.cuh"
-
+#include "warp_merge_sort.cuh"
 namespace cagra {
 namespace device {
 
@@ -283,37 +283,12 @@ __global__ void search_kernel(
             
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -353,37 +328,12 @@ __global__ void search_kernel(
     if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
     }
     __syncthreads();
 
@@ -508,37 +458,12 @@ __global__ void search_kernel_bucket(
         if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -605,37 +530,12 @@ __global__ void search_kernel_bucket(
     if (tid < 32) {
         if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
         else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-        else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-        else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-        else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
         else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-        else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-        else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-        else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-        else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-        else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-        else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-        else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-        else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-        else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-        else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-        else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-        else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-        else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-        else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-        else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-        else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-        else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-        else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-        else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-        else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-        else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-        else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-        else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-        else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-        else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-        else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-        else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+        else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+        else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+        else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+        else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+        else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
         else {
             // 不支持的容量大小
             if (tid == 0) {
@@ -758,6 +658,10 @@ __global__ void search_kernel_range(
     uint32_t iter = 0;
     uint32_t hash_reset_iter = 30;
 
+    uint64_t step1_cost = 0;
+    uint64_t step2_cost = 0;
+    uint64_t step3_cost = 0;
+
     for (; iter < max_iterations; ++iter) {
         if (iter > 0 && (iter % hash_reset_iter == 0)) {
             cagra::hashmap::init(visited_hash, hash_bitlen);
@@ -767,40 +671,16 @@ __global__ void search_kernel_range(
         }
 
         // A. Sort (完全复用)
+        auto t1 = clock64();
         if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -810,8 +690,10 @@ __global__ void search_kernel_range(
             
         }
         __syncthreads();
+        auto t2 = clock64();
 
         // B. Pickup Parents (完全复用)
+        auto t3 = clock64();
         if (tid < 32) {
             cagra::device::pickup_next_parents(
                 (uint32_t*)terminate_flag, parent_list, result_indices,
@@ -819,12 +701,14 @@ __global__ void search_kernel_range(
             );
         }
         __syncthreads();
+        auto t4 = clock64();
 
         // C. Check
         if (*terminate_flag == 1) break;
 
         // D. Expand (使用 STRIDED 版本)
         // 【核心差异】使用 compute_distance_to_child_nodes_strided
+        auto t5 = clock64();
         cagra::device::compute_distance_to_child_nodes_range(
             result_indices + itopk_size,
             result_dists + itopk_size,
@@ -843,43 +727,23 @@ __global__ void search_kernel_range(
             d_ts
         );
         __syncthreads();
+        auto t6 = clock64();
+
+        step1_cost += (t2 - t1);
+        step2_cost += (t4 - t3);
+        step3_cost += (t6 - t5);
     }
 
     // 5. 写回 (完全复用)
     if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 160) load_sort_store<5>(result_dists, result_indices, 160);
-            else if (queue_capacity == 192) load_sort_store<6>(result_dists, result_indices, 192);
-            else if (queue_capacity == 224) load_sort_store<7>(result_dists, result_indices, 224);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 9) load_sort_store<9>(result_dists, result_indices, 288);
-            else if (queue_capacity == 32 * 10) load_sort_store<10>(result_dists, result_indices, 320);
-            else if (queue_capacity == 32 * 11) load_sort_store<11>(result_dists, result_indices, 352);
-            else if (queue_capacity == 32 * 12) load_sort_store<12>(result_dists, result_indices, 384);
-            else if (queue_capacity == 32 * 13) load_sort_store<13>(result_dists, result_indices, 416);
-            else if (queue_capacity == 32 * 14) load_sort_store<14>(result_dists, result_indices, 448);
-            else if (queue_capacity == 32 * 15) load_sort_store<15>(result_dists, result_indices, 480);
-            else if (queue_capacity == 32 * 16) load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 17) load_sort_store<17>(result_dists, result_indices, 544);
-            else if (queue_capacity == 32 * 18) load_sort_store<18>(result_dists, result_indices, 576);
-            else if (queue_capacity == 32 * 19) load_sort_store<19>(result_dists, result_indices, 608);
-            else if (queue_capacity == 32 * 20) load_sort_store<20>(result_dists, result_indices, 640);
-            else if (queue_capacity == 32 * 21) load_sort_store<21>(result_dists, result_indices, 672);
-            else if (queue_capacity == 32 * 22) load_sort_store<22>(result_dists, result_indices, 704);
-            else if (queue_capacity == 32 * 23) load_sort_store<23>(result_dists, result_indices, 736);
-            else if (queue_capacity == 32 * 24) load_sort_store<24>(result_dists, result_indices, 768);
-            else if (queue_capacity == 32 * 25) load_sort_store<25>(result_dists, result_indices, 800);
-            else if (queue_capacity == 32 * 26) load_sort_store<26>(result_dists, result_indices, 832);
-            else if (queue_capacity == 32 * 27) load_sort_store<27>(result_dists, result_indices, 864);
-            else if (queue_capacity == 32 * 28) load_sort_store<28>(result_dists, result_indices, 896);
-            else if (queue_capacity == 32 * 29) load_sort_store<29>(result_dists, result_indices, 928);
-            else if (queue_capacity == 32 * 30) load_sort_store<30>(result_dists, result_indices, 960);
-            else if (queue_capacity == 32 * 31) load_sort_store<31>(result_dists, result_indices, 992);
-            else if (queue_capacity == 32 * 32) load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
+            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
+            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -895,6 +759,17 @@ __global__ void search_kernel_range(
         float dist = result_dists[i];
         if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
+    }
+
+    if (tid == 0 && query_id == 1) {
+        printf("query %u finished in %u iterations, and queue capacity is %u.\n", query_id, iter, queue_capacity);
+        printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1_cost, step2_cost, step3_cost);
+        // 转换成百分比再输出一下
+        printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
+            step1_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+            step2_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+            step3_cost * 100.0 / (step1_cost + step2_cost + step3_cost)
+        );
     }
 
     if (tid == 0 && num_executed_iterations) {
