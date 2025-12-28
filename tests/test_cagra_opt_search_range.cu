@@ -252,8 +252,8 @@ int main() {
     int cuda_device = 0; 
     CHECK_CUDA(cudaSetDevice(cuda_device));
 
-    std::string sift_path = "../data/GIST1M/gist_base.fvecs";
-    std::string csv_file  = "benchmark_range_gist.csv";
+    std::string sift_path = "../data/sift-1m/sift/sift_base.fvecs";
+    std::string csv_file  = "benchmark_range_sift.csv";
 
     // 1. 加载 SIFT 数据
     std::vector<float> host_full_data;

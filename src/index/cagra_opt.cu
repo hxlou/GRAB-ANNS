@@ -124,6 +124,7 @@ __global__ void refine_and_sort_kernel(
              const float* candidate_vec = d_dataset + (size_t)idx_64 * dim;
              // 全员参与计算
             if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_vec, candidate_vec);
+            else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_vec, candidate_vec);
             else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, candidate_vec);
             else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, candidate_vec);
             else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, candidate_vec);

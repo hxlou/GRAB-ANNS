@@ -32,6 +32,28 @@ __device__ __forceinline__ float calc_l2_dist_1024(const float* vec_a, const flo
     return sum_sq;
 }
 
+__device__ __forceinline__ float calc_l2_dist_2048(const float* vec_a, const float* vec_b) {
+    const int lane_id = threadIdx.x % 32;
+    float sum_sq = 0.0f;
+
+    // 每个线程处理 32 个元素 (32 * 64 = 2048)
+    #pragma unroll
+    for (int i = 0; i < 64; ++i) {
+        int idx = i * 32 + lane_id;
+        float diff = vec_a[idx] - vec_b[idx];
+        sum_sq += diff * diff;
+    }
+
+    // Warp 归约求和
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    
+    return sum_sq;
+}
+
+
 __device__ __forceinline__ float calc_l2_dist_960(const float* vec_a, const float* vec_b) {
     const int lane_id = threadIdx.x % 32;
     float sum_sq = 0.0f;
@@ -136,6 +158,7 @@ __device__ inline void compute_distance_to_random_nodes(
         const float* node_ptr = dataset_ptr + (size_t)node_id * dim;
         float dist = 3.40282e38f; // MAX_FLOAT
         if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+        else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
@@ -201,6 +224,7 @@ __device__ inline void compute_distance_to_init_nodes(
         const float* node_ptr = dataset_ptr + (size_t)node_id * dim;
         float dist = 3.40282e38f; // MAX_FLOAT
         if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+        else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
@@ -291,6 +315,7 @@ __device__ inline void compute_distance_to_child_nodes(
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
                     float dist = 3.40282e38f; // MAX_FLOAT
                     if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
@@ -414,6 +439,7 @@ __device__ inline void compute_distance_to_child_nodes_strided(
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
                     float dist = 3.40282e38f; // MAX_FLOAT
                     if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
@@ -551,6 +577,7 @@ __device__ inline void compute_distance_to_child_nodes_range(
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
                     float dist = 3.40282e38f; // MAX_FLOAT
                     if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+                    else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);

@@ -54,6 +54,7 @@ __global__ void insert_refine_kernel_warp(const float* d_queries,       // [batc
         // 调用 device::calc_l2_dist_1024 (Warp Collective)
 
         if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(vec_q, vec_n);
+        else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(vec_q, vec_n);
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(vec_q, vec_n);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(vec_q, vec_n);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(vec_q, vec_n);
@@ -883,6 +884,7 @@ __global__ void refine_cagra_candidates_kernel(
             // Warp 协作计算精确 L2
             float dist = 0.0f;
             if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_vec, cand_vec);
+            else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_vec, cand_vec);
             else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, cand_vec);
             else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, cand_vec);
             else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, cand_vec);
