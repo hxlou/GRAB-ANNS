@@ -527,16 +527,6 @@ __device__ inline void compute_distance_to_child_nodes_range(
         uint32_t parent_idx = task_id / graph_degree;
         uint32_t neighbor_offset = task_id % graph_degree;
 
-        // // 仅处理前 active_degree 个邻居
-        // if (neighbor_offset >= active_degree) {
-        //     // 写入无效值
-        //     if (lane_id == 0) {
-        //         candidate_indices[task_id] = 0xFFFFFFFF;
-        //         candidate_distances[task_id] = 3.40282e38f;
-        //     }
-        //     continue;
-        // }
-
         // 2. 获取父节点 ID
         uint32_t parent_id = parent_list[parent_idx];
         
@@ -550,17 +540,6 @@ __device__ inline void compute_distance_to_child_nodes_range(
 
             // 4. 检查邻居是否有效 (填充值)
             if (neighbor_id != 0xFFFFFFFF) {
-                
-                // 检查邻居是否在指定桶范围内
-                uint64_t bucket_id = d_ts[neighbor_id];
-                if (bucket_id < start_bucket || bucket_id >= end_bucket) {
-                    // 不在范围内，写入无效值
-                    if (lane_id == 0) {
-                        candidate_indices[task_id] = 0xFFFFFFFF;
-                        candidate_distances[task_id] = 3.40282e38f;
-                    }
-                    continue;
-                }
 
                 // 5. 查重：Hashmap
                 // 只有 Lane 0 负责查重 (原子操作)，结果广播给全 Warp
@@ -571,6 +550,13 @@ __device__ inline void compute_distance_to_child_nodes_range(
                 }
                 // 广播查重结果
                 not_visited = __shfl_sync(0xFFFFFFFF, not_visited, 0);
+
+                // 检查邻居是否在指定桶范围内 优先哈希表过滤
+                uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
+                if (bucket_id < start_bucket || bucket_id >= end_bucket) {
+                    // 不在范围内，写入无效值
+                    continue;
+                }
 
                 if (not_visited) {
                     // 6. 没访问过 -> 计算距离
@@ -593,23 +579,7 @@ __device__ inline void compute_distance_to_child_nodes_range(
                     }
                 } else {
                     // 已访问过 -> 写入无效值
-                    if (lane_id == 0) {
-                        candidate_indices[task_id] = 0xFFFFFFFF;
-                        candidate_distances[task_id] = 3.40282e38f;
-                    }
                 }
-            } else {
-                // 无效邻居 -> 写入无效值
-                if (lane_id == 0) {
-                    candidate_indices[task_id] = 0xFFFFFFFF;
-                    candidate_distances[task_id] = 3.40282e38f;
-                }
-            }
-        } else {
-            // 无效父节点 -> 写入无效值
-            if (lane_id == 0) {
-                candidate_indices[task_id] = 0xFFFFFFFF;
-                candidate_distances[task_id] = 3.40282e38f;
             }
         }
     }

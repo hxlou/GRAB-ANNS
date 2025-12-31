@@ -77,7 +77,7 @@ void generate_knn_graph(const float* d_dataset,
     res.setTempMemory(1024 * 1024 * 512); 
 
     // 2. 配置参数
-    int nlist = static_cast<int>(2 * std::sqrt(static_cast<double>(num_dataset)));
+    int nlist = static_cast<int>(0.3 * std::sqrt(static_cast<double>(num_dataset)));
     nlist = std::max(1, std::min((int)num_dataset, nlist));
     int M = 32; 
     int nbits = 8;

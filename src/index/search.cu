@@ -7,6 +7,7 @@
 #include "bitonic.cuh"
 #include "compute_distance.cuh"
 #include "warp_merge_sort.cuh"
+#include "radix_sort.cuh"
 namespace cagra {
 namespace device {
 
@@ -262,6 +263,11 @@ __global__ void search_kernel(
     // -------------------------------------------------------------
     uint32_t iter = 0;
     uint32_t hash_reset_iter = 30; // 每隔这么多轮重置 Hashmap
+
+    uint64_t step1 = 0;
+    uint64_t step2 = 0;
+    uint64_t step3 = 0;
+
     for (; iter < max_iterations; ++iter) {
         // 更新哈希表，清空并加入topk中的数据到哈希表中
         if (iter > 0 && (iter % hash_reset_iter == 0)) {
@@ -276,30 +282,24 @@ __global__ void search_kernel(
             __syncthreads();
         }
 
-        // --- Step A: 排序 (仅 Warp 0 工作) ---        
-        if (tid < 32) {
-            // Shadow variable issue: 之前代码这里定义了 local queue_capacity 导致错误
-            // 这里我们使用传入的 queue_capacity 参数，并用 switch/if 处理模板参数 N
-            
-            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
-            else {
-                // 不支持的容量大小
-                if (tid == 0) {
-                    printf(">> [search_kernel] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
-                }
+        // --- Step A: 排序 (仅 Warp 0 工作) ---  
+        auto t1 = clock64();      
+        if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+        else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+        else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+        else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+        else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+        else {
+            // 不支持的容量大小
+            if (tid == 0) {
+                printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
             }
-            // 如果更大，可以继续加 case
         }
         __syncthreads();
+        auto t2 = clock64();
 
         // --- Step B: 选父节点 ---
+        auto t3 = clock64();
         if (tid < 32) {
             cagra::device::pickup_next_parents(
                 (uint32_t*)terminate_flag, parent_list, result_indices,
@@ -307,11 +307,13 @@ __global__ void search_kernel(
             );
         }
         __syncthreads();
+        auto t4 = clock64();
 
         // --- Step C: 检查终止 ---
         if (*terminate_flag == 1) break;
 
         // --- Step D: 扩展 ---
+        auto t5 = clock64();
         cagra::device::compute_distance_to_child_nodes(
             result_indices + itopk_size,
             result_dists + itopk_size,
@@ -319,21 +321,27 @@ __global__ void search_kernel(
             visited_hash, hash_bitlen, parent_list, search_width
         );
         __syncthreads();
+        auto t6 = clock64();
+
+        step1 += t2 - t1;
+        step2 += t4 - t3;
+        step3 += t6 - t5;
     }
 
     // -------------------------------------------------------------
     // 5. 结果写回
     // -------------------------------------------------------------
     // 最后再排一次序
-    if (tid < 32) {
-            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
+    if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+    else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+    else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+    else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+    else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+    else {
+        // 不支持的容量大小
+        if (tid == 0) {
+            printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+        }
     }
     __syncthreads();
 
@@ -345,6 +353,18 @@ __global__ void search_kernel(
         if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
     }
+
+    // if (tid == 0 && query_id == 1) {
+    //     printf("query %u finished in %u iterations, and queue capacity is %u, and total time cost is %llu.\n", query_id, iter, queue_capacity, step1 + step2 + step3);
+    //     printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1, step2, step3);
+    //     // 转换成百分比再输出一下
+    //     printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
+    //         step1 * 100.0 / (step1 + step2 + step3),
+    //         step2 * 100.0 / (step1 + step2 + step3),
+    //         step3 * 100.0 / (step1 + step2 + step3)
+    //     );
+    // }
+
 
     // if (tid == 0) printf("[iter] iter nums is %d\n", iter);
 }
@@ -446,6 +466,11 @@ __global__ void search_kernel_bucket(
     uint32_t iter = 0;
     uint32_t hash_reset_iter = 30;
 
+    // auto step1 = 0;
+    // auto step2 = 0;
+    // auto step3 = 0;
+
+
     for (; iter < max_iterations; ++iter) {
         if (iter > 0 && (iter % hash_reset_iter == 0)) {
             cagra::hashmap::init(visited_hash, hash_bitlen);
@@ -454,16 +479,17 @@ __global__ void search_kernel_bucket(
             __syncthreads();
         }
 
+        // auto t1 = clock64();
         // A. Sort (完全复用)
         if (tid < 32) {
             if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
             else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
+            else if (queue_capacity == 32 * 16) cagra::radix::load_sort_store(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+            // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
+            // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
+            // else if (queue_capacity == 32 * 256) cagra::radix::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -531,11 +557,11 @@ __global__ void search_kernel_bucket(
         if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
         else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
         else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-        else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-        else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-        else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-        else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-        else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
+        else if (queue_capacity == 32 * 16) cagra::radix::load_sort_store(result_dists, result_indices, 512);
+        else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+        // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
+        // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
+        // else if (queue_capacity == 32 * 256) cagra::radix::load_sort_store<256>(result_dists, result_indices, 8192);
         else {
             // 不支持的容量大小
             if (tid == 0) {
@@ -591,6 +617,7 @@ __global__ void search_kernel_range(
     uint32_t* pre_hashmap,   
     uint32_t queue_capacity     
 ) {
+    auto t_start = clock64();
     // 1. Shared Memory Init (完全复用，代码一样)
     extern __shared__ uint8_t smem[]; 
     size_t offset = 0;
@@ -672,15 +699,15 @@ __global__ void search_kernel_range(
 
         // A. Sort (完全复用)
         auto t1 = clock64();
-        if (tid < 32) {
-            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
+        // if (tid < 32) {
+            if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+            else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+            // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
+            // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
+            // else if (queue_capacity == 32 * 256) cagra::radix::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
                 // 不支持的容量大小
                 if (tid == 0) {
@@ -688,7 +715,7 @@ __global__ void search_kernel_range(
                 }
             }
             
-        }
+        // }
         __syncthreads();
         auto t2 = clock64();
 
@@ -735,21 +762,16 @@ __global__ void search_kernel_range(
     }
 
     // 5. 写回 (完全复用)
-    if (tid < 32) {
-            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
-            else if (queue_capacity == 32 * 32) cagra::merge::load_sort_store<32>(result_dists, result_indices, 1024);
-            else if (queue_capacity == 32 * 64) cagra::merge::load_sort_store<64>(result_dists, result_indices, 2048);
-            else if (queue_capacity == 32 * 128) cagra::merge::load_sort_store<128>(result_dists, result_indices, 4096);
-            else if (queue_capacity == 32 * 256) cagra::merge::load_sort_store<256>(result_dists, result_indices, 8192);
-            else {
-                // 不支持的容量大小
-                if (tid == 0) {
-                    printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
-                }
-            }
+    if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+    else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+    else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+    else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
+    else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
+    else {
+        // 不支持的容量大小
+        if (tid == 0) {
+            printf(">> [search_kernel_range] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
+        }
     }
     __syncthreads();
 
@@ -761,19 +783,18 @@ __global__ void search_kernel_range(
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
     }
 
-    if (tid == 0 && query_id == 1) {
-        printf("query %u finished in %u iterations, and queue capacity is %u.\n", query_id, iter, queue_capacity);
-        printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1_cost, step2_cost, step3_cost);
-        // 转换成百分比再输出一下
-        printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
-            step1_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
-            step2_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
-            step3_cost * 100.0 / (step1_cost + step2_cost + step3_cost)
-        );
-    }
+    auto t_end = clock64();
 
-    if (tid == 0 && num_executed_iterations) {
-        num_executed_iterations[query_id] = iter;
+    if (tid == 0 && query_id <= 5) {
+        // printf("query %u finished in %u iterations, and queue capacity is %u, and total time cost is %llu.\n", query_id, iter, queue_capacity, step1_cost + step2_cost + step3_cost);
+        // printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1_cost, step2_cost, step3_cost);
+        // // 转换成百分比再输出一下
+        // printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
+        //     step1_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+        //     step2_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+        //     step3_cost * 100.0 / (step1_cost + step2_cost + step3_cost)
+        // );
+        printf("total function time cost: %llu\n", t_end - t_start);
     }
 }
 

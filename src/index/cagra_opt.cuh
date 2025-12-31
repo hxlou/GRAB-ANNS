@@ -23,6 +23,7 @@ void build_time_partitioned_graph(const float* d_dataset,
                                   uint32_t dim,
                                   uint32_t* d_graph,
                                   uint64_t* d_ts,
+                                  uint64_t* h_ts,
                                   const std::vector<size_t>& bucket_sizes,
                                   uint32_t total_degree,
                                   uint32_t local_degree);
@@ -39,7 +40,8 @@ void search_opt(const float* d_dataset,
             int64_t* d_out_indices, 
             float* d_out_dists,
             const uint32_t* d_seeds,
-            const uint32_t num_seeds_per_query);
+            const uint32_t num_seeds_per_query,
+            cudaStream_t stream = 0);
 
 void search_bucket_opt(const float* d_dataset,
                        uint32_t dim,
@@ -54,7 +56,8 @@ void search_bucket_opt(const float* d_dataset,
                        int64_t* d_out_indices, 
                        float* d_out_dists,
                        const uint32_t* d_seeds,
-                       const uint32_t num_seeds_per_query);
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream = 0);
 
 void search_bucket_range(const float* d_dataset,
                        uint32_t dim,

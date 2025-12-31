@@ -1,5 +1,38 @@
 cmake_minimum_required(VERSION 3.20)
 
+# =========================================================
+# 【关键修改】在 project() 之前强制指定 Conda 编译器
+# =========================================================
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_ROOT "$ENV{CONDA_PREFIX}")
+    message(STATUS ">> Detecting Conda Env: ${CONDA_ROOT}")
+    
+    # Conda 的编译器通常位于 $CONDA_PREFIX/bin 下，且有特定的前缀
+    set(CONDA_C_COMPILER   "${CONDA_ROOT}/bin/x86_64-conda-linux-gnu-gcc")
+    set(CONDA_CXX_COMPILER "${CONDA_ROOT}/bin/x86_64-conda-linux-gnu-g++")
+    
+    if(EXISTS "${CONDA_C_COMPILER}" AND EXISTS "${CONDA_CXX_COMPILER}")
+        message(STATUS ">> Forcing use of Conda Compilers to avoid GLIBC conflict:")
+        message(STATUS "   > C Compiler:   ${CONDA_C_COMPILER}")
+        message(STATUS "   > CXX Compiler: ${CONDA_CXX_COMPILER}")
+        
+        # 强制设置 C 和 C++ 编译器
+        set(CMAKE_C_COMPILER "${CONDA_C_COMPILER}")
+        set(CMAKE_CXX_COMPILER "${CONDA_CXX_COMPILER}")
+        
+        # 【非常重要】告诉 NVCC 使用 Conda 的 g++ 作为宿主编译器
+        set(CMAKE_CUDA_HOST_COMPILER "${CONDA_CXX_COMPILER}")
+    else()
+        message(WARNING ">> gxx_linux-64 not found in Conda bin! using system compiler (Risk of GLIBC error).")
+    endif()
+else()
+    message(WARNING ">> Not in a Conda environment.")
+endif()
+# =======
+
+set(CMAKE_CXX_STANDARD 17) # RAFT 需要 C++17 或更高
+set(CMAKE_CUDA_STANDARD 17)
+
 # 设置 GPU 架构 (native 表示针对当前机器的显卡自动优化)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES "native")
@@ -64,9 +97,38 @@ endif()
 # 2.2 查找 OpenMP
 find_package(OpenMP REQUIRED)
 
+# 查找 RMM (Conda 安装后会有 rmm-config.cmake)
+find_package(rmm REQUIRED)
+
+# 查找 RAFT (Conda 安装后会有 raft-config.cmake)
+find_package(raft REQUIRED)
+
 # 2.3 查找 CUDA Toolkit (核心)
 # 这提供了 CUDA::cudart (Runtime) 和 CUDA::cuda_driver (Driver API for VMM)
 find_package(CUDAToolkit REQUIRED)
+# 2. 如果标准目标 CUDA::cuda_driver 不存在，手动创建一个别名
+if(NOT TARGET CUDA::cuda_driver)
+    message(STATUS ">> CUDA::cuda_driver target missing, trying to find libcuda.so manually...")
+    
+    # 在系统常用路径查找 libcuda
+    find_library(CUDA_DRIVER_LIB 
+        NAMES cuda libcuda 
+        HINTS 
+        "/usr/lib/x86_64-linux-gnu"
+        "/usr/lib64"
+        "/usr/local/cuda/lib64/stubs" # 很多时候在这里
+    )
+
+    if(CUDA_DRIVER_LIB)
+        message(STATUS ">> Found CUDA Driver manually: ${CUDA_DRIVER_LIB}")
+        add_library(CUDA::cuda_driver UNKNOWN IMPORTED)
+        set_target_properties(CUDA::cuda_driver PROPERTIES IMPORTED_LOCATION "${CUDA_DRIVER_LIB}")
+    else()
+        message(FATAL_ERROR "Could not find libcuda.so (CUDA Driver API). Please check your driver installation.")
+    endif()
+endif()
+message(STATUS ">> CUDA Toolkit Found: ${CUDAToolkit_FOUND}")
+message(STATUS ">> CUDA Driver Lib: ${CUDA_cuda_driver_LIBRARY}")
 include_directories(${CUDAToolkit_INCLUDE_DIRS})
 
 # 2.4 查找 FAISS
@@ -84,7 +146,7 @@ add_library(light_cagra SHARED
     
     
     src/cagraIndex.cu  # 确保你的文件是 .cu 后缀
-    src/timeStampIndex.cu
+    # src/timeStampIndex.cu
     src/cagraIndexOpt.cu
     
 )
@@ -101,6 +163,8 @@ target_link_libraries(light_cagra PUBLIC
     CUDA::cublas       # FAISS 依赖
     CUDA::cuda_driver  # 【重要】CUDA Driver API (cuInit, cuMemCreate for VMM)
     OpenMP::OpenMP_CXX
+    raft::raft
+    rmm::rmm
 )
 
 # ==========================================
@@ -131,8 +195,8 @@ add_cagra_test(test_cagra        tests/test_cagra.cu)
 add_cagra_test(test_cagra_index  tests/test_cagra_index.cu)
 add_cagra_test(test_cagra_insert tests/test_cagra_insert.cu)
 
-add_cagra_test(test_timestamp_index tests/test_timestamp_index.cu)
-add_cagra_test(test_timestamp_index_random tests/test_timestamp_index_random.cu)
+# add_cagra_test(test_timestamp_index tests/test_timestamp_index.cu)
+# add_cagra_test(test_timestamp_index_random tests/test_timestamp_index_random.cu)
 
 add_cagra_test(test_cagra_opt tests/test_cagra_opt.cu)
 add_cagra_test(test_cagra_opt_search_bucket tests/test_cagra_opt_search_bucket.cu)

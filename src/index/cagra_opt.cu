@@ -23,6 +23,7 @@
 #include <faiss/gpu/GpuIndexFlat.h> 
 #include <faiss/impl/AuxIndexStructures.h>
 
+#include "raft_help.cuh"
 namespace cagra {
 
 // ===============================
@@ -185,13 +186,16 @@ void refine_search_results(const float* d_dataset,
             d_dataset, d_input_indices, d_refined_indices, d_refined_dists,
             num_dataset, dim, k
         );
-    } else {
+    } else if (k <= 256) {
         // 默认支持到 256
         refine_and_sort_kernel<8><<<grid_size, block_size>>>(
             d_dataset, d_input_indices, d_refined_indices, d_refined_dists,
             num_dataset, dim, k
         );
+    } else {
+        printf("[ERROR] refine_search_results: Unsupported k=%u (max 256)!\n", k);
     }
+
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -199,11 +203,12 @@ void refine_search_results(const float* d_dataset,
 
 // =============================================================================
 // Remote Edge 更新 Kernel (适配 FAISS int64 输出) step 1
+// 逻辑更新：remote edge中，前一半用于连接 临近20% 桶范围内的点，后一半用于全连通的节点
 // =============================================================================
 __global__ void update_remote_edges_kernel(
     uint32_t* d_graph,              // [N, 32] 最终图
     uint64_t* d_ts,                 // 反查表
-    const uint32_t* d_global_knn,    // [N, K_global] FAISS 输出是 int64
+    uint32_t* d_global_knn,    // [N, K_global] FAISS 输出是 int64
     const float* d_global_dists,    // [N, K_global] (可选)
     size_t num_dataset,
     uint32_t total_degree,          // 32
@@ -213,36 +218,27 @@ __global__ void update_remote_edges_kernel(
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_dataset) return;
 
-    // --- [DEBUG START] ---
-    // 只让第0个线程打印，防止刷屏
-    if (tid == 0) {
-        printf("\n[KERNEL DEBUG] Inside update_remote_edges_kernel:\n");
-        printf("  d_graph:        %p\n", d_graph);
-        printf("  d_ts:           %p\n", d_ts);
-        printf("  d_global_knn:   %p\n", d_global_knn);
-        printf("  d_global_dists: %p\n", d_global_dists);
-        printf("  num_dataset:    %lu\n", (unsigned long)num_dataset); // size_t 用 %lu
-        printf("  total_degree:   %u\n", total_degree);
-        printf("  local_degree:   %u\n", local_degree);
-        printf("  global_k:       %u\n", global_k);
-        printf("--------------------------------------------------\n");
-    }
-
-    // return;
-    // --- [DEBUG END] ---
-
     // 1. 读取本地邻居 (Local Neighbors) 用于查重
-    uint32_t local_neighbors[32]; 
     uint32_t* my_graph_row = d_graph + tid * total_degree;
     uint64_t my_timestamps = d_ts[tid];
+
+    uint64_t total_buckets = d_ts[num_dataset - 1] + 1;
+    uint64_t fanwei = std::max(1ull, (unsigned long long)total_buckets / 5); // 20% 范围
+    uint64_t min_ts = my_timestamps >= fanwei ? my_timestamps - fanwei : 0;
+    uint64_t max_ts = my_timestamps + fanwei >= total_buckets ? total_buckets - 1 : my_timestamps + fanwei;
+
     // 2. 遍历全局候选
     // 直接读取 int64，FAISS 的结果就在显存里
     if (tid == 0) printf("num_dataset: %u and global_k is %u\n", num_dataset, global_k);
     // printf("tid is %d and  my_candidate offset is %d\n", tid, tid * global_k);
-    const uint32_t* my_candidates = d_global_knn + tid * global_k;
+    uint32_t* my_candidates = d_global_knn + tid * global_k;
     
-    int remote_filled = 0;
-    int max_remote = total_degree - local_degree;
+
+    /**
+     * nearby_max 最多写入 (total_degree - local_degree) / 2 个
+     */
+    int nearby_filled = 0;
+    int nearby_max = (total_degree - local_degree) / 3;
 
     for (int k = 0; k < global_k; ++k) {
         uint32_t cand_id = my_candidates[k];
@@ -250,26 +246,59 @@ __global__ void update_remote_edges_kernel(
         // 2.1 基础过滤：不能是自己，不能是无效值(-1)
         if (cand_id == (uint32_t)tid) continue;
 
-        // 2.2 查重：不能已经是本地邻居
-        bool is_local = false;
-        for (int i = 0; i < local_degree; ++i) {
-            if (local_neighbors[i] == cand_id) {
-                is_local = true;
-                break;
-            }
-        }
-        if (is_local) continue;
+        // 检查：最好和自己的time stamp不相同
+        if (d_ts[cand_id] == my_timestamps || (d_ts[cand_id] < min_ts || d_ts[cand_id] > max_ts)) continue;
+
+        // 2.3 写入 Remote 槽位
+        my_graph_row[local_degree + nearby_filled] = cand_id;
+        nearby_filled++;
+        my_candidates[k] = 0xFFFFFFFF; // 标记为已使用
+
+        if (nearby_filled >= nearby_max) break;
+    }
+
+    /**
+     * nearby_filled 写入之后，剩余的部分全部用于写入 global 范围内的点
+     */
+    int remote_filled = 0;
+    int remote_max = (total_degree - local_degree) - nearby_filled;
+
+    for (int k = 0; k < global_k; ++k) {
+        uint32_t cand_id = my_candidates[k];
+
+        // 3.1 基础过滤：不能是自己，不能是无效值(-1)
+        if (cand_id == (uint32_t)tid || cand_id == 0xFFFFFFFF) continue;
+
+        // 检查：最好和自己的time stamp不相同
+        if (d_ts[cand_id] == my_timestamps || (d_ts[cand_id] >= min_ts && d_ts[cand_id] <= max_ts)) continue;
+
+        // 3.3 写入 Remote 槽位
+        my_graph_row[local_degree + nearby_filled + remote_filled] = cand_id;
+        remote_filled++;
+        my_candidates[k] = 0xFFFFFFFF; // 标记为已使用
+
+        if (remote_filled >= remote_max) break;
+    }
+
+    /**
+     * 如果 remote_filled 没有填满，则继续从 global_knn 里找
+     */
+    for (int k = 0; k < global_k && remote_filled < remote_max; ++k) {
+        uint32_t cand_id = my_candidates[k];
+
+        // 4.1 基础过滤：不能是自己，不能是无效值(-1)
+        if (cand_id == (uint32_t)tid || cand_id == 0xFFFFFFFF) continue;
 
         // 检查：最好和自己的time stamp不相同
         if (d_ts[cand_id] == my_timestamps) continue;
 
-        // 2.3 写入 Remote 槽位
-        my_graph_row[local_degree + remote_filled] = cand_id;
+        // 4.3 写入 Remote 槽位
+        my_graph_row[local_degree + nearby_filled + remote_filled] = cand_id;
         remote_filled++;
-
-        if (remote_filled >= max_remote) break;
     }
-    if (tid < 5) printf("Real remote edges filled: %d\n", remote_filled);
+    
+
+    if (tid < 5) printf("Real remote edges filled: %d and nearby edges filled %d\n", remote_filled, nearby_filled);
 }
 
 // =============================================================================
@@ -570,6 +599,140 @@ __global__ void kern_inject_global_reverse_edges(
 }
 
 // =============================================================================
+// Step 3.2 (New): 交错注入 Remote Edges (支持大度数)
+// 策略：Forward[0], Reverse[0], Forward[1], Reverse[1]...
+// =============================================================================
+__global__ void kern_interleave_remote_edges(
+    uint32_t* d_graph,               // [N, total_degree] (读/写)
+    const uint32_t* d_rev_graph,     // [N, max_rev]
+    const uint32_t* d_rev_counts,    // [N]
+    size_t num_dataset,
+    uint32_t total_degree,
+    uint32_t local_degree,
+    uint32_t max_rev_degree
+) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_dataset) return;
+
+    // 计算实际需要的 Remote 数量
+    uint32_t num_remote = total_degree - local_degree;
+    if (num_remote <= 0) return;
+
+    // --- 【修改点】定义安全上限 ---
+    // 128 足够应对 total_degree=128 且 local=0 的极端情况
+    // 如果你的图度数可能更大，请调大这个值
+    constexpr int MAX_REMOTE_BUF = 128;
+
+    // 防御性截断：如果配置的度数超过了 Buffer，只处理前 128 个
+    if (num_remote > MAX_REMOTE_BUF) num_remote = MAX_REMOTE_BUF;
+
+    // 指向当前节点的行
+    uint32_t* my_graph_row = d_graph + tid * total_degree;
+
+    // 1. 读取现有的 Forward Remote Edges (暂存)
+    uint32_t fwd_candidates[MAX_REMOTE_BUF]; 
+    for(int i=0; i<num_remote; ++i) {
+        fwd_candidates[i] = my_graph_row[local_degree + i];
+    }
+
+    // 2. 读取 Reverse Remote Edges (暂存)
+    uint32_t rev_candidates[MAX_REMOTE_BUF];
+    
+    uint32_t rev_count = d_rev_counts[tid];
+    // 限制读取上限
+    if (rev_count > max_rev_degree) rev_count = max_rev_degree;
+    // 我们只需要读取足够我们“交错”的数量即可，没必要读几千个
+    if (rev_count > MAX_REMOTE_BUF) rev_count = MAX_REMOTE_BUF;
+
+    const uint32_t* my_rev_list = d_rev_graph + (size_t)tid * max_rev_degree;
+    for(int i=0; i<rev_count; ++i) {
+        rev_candidates[i] = my_rev_list[i];
+    }
+
+    // 3. 交错填充 (Interleave Logic)
+    uint32_t final_remotes[MAX_REMOTE_BUF];
+    int filled_count = 0;
+
+    int f_ptr = 0; // Forward 指针
+    int r_ptr = 0; // Reverse 指针
+    
+    // 循环填空
+    while (filled_count < num_remote) {
+        bool f_available = (f_ptr < num_remote);
+        bool r_available = (r_ptr < rev_count);
+
+        if (!f_available && !r_available) break; // 没数据了
+
+        // --- 尝试填入 Forward ---
+        if (f_available && filled_count < num_remote) {
+            uint32_t cand = fwd_candidates[f_ptr++];
+            
+            // 查重 (Check Duplicates)
+            bool duplicate = false;
+            
+            // 1. 和自身/无效值比较
+            if (cand == 0xFFFFFFFF || cand == (uint32_t)tid) duplicate = true;
+
+            // 2. 和已填入的 Remote 比较
+            // (注意：这里必须遍历，因为是未排序数组)
+            if (!duplicate) {
+                for(int i=0; i<filled_count; ++i) {
+                    if (final_remotes[i] == cand) { duplicate = true; break; }
+                }
+            }
+
+            // 3. 和 Local Edges 比较 (避免浪费 Remote 槽位)
+            // 直接读取 Global Memory，避免占用过多寄存器
+            if (!duplicate) {
+                for(int i=0; i<local_degree; ++i) {
+                    if (my_graph_row[i] == cand) { duplicate = true; break; }
+                }
+            }
+
+            if (!duplicate) {
+                final_remotes[filled_count++] = cand;
+            }
+        }
+
+        // --- 尝试填入 Reverse ---
+        if (r_available && filled_count < num_remote) {
+            uint32_t cand = rev_candidates[r_ptr++];
+            
+            // 查重逻辑同上
+            bool duplicate = false;
+            if (cand == 0xFFFFFFFF || cand == (uint32_t)tid) duplicate = true;
+
+            if (!duplicate) {
+                for(int i=0; i<filled_count; ++i) {
+                    if (final_remotes[i] == cand) { duplicate = true; break; }
+                }
+            }
+
+            if (!duplicate) {
+                for(int i=0; i<local_degree; ++i) {
+                    if (my_graph_row[i] == cand) { duplicate = true; break; }
+                }
+            }
+
+            if (!duplicate) {
+                final_remotes[filled_count++] = cand;
+            }
+        }
+    }
+
+    // 5. 补齐空位 (Padding)
+    while (filled_count < num_remote) {
+        final_remotes[filled_count++] = 0xFFFFFFFF;
+        printf("Warning: Node %u remote edges not fully filled, padding with 0xFFFFFFFF\n", (uint32_t)tid);
+    }
+
+    // 6. 写回 Global Memory
+    for(int i=0; i<num_remote; ++i) {
+        my_graph_row[local_degree + i] = final_remotes[i];
+    }
+}
+
+// =============================================================================
 // Host 函数: Step 3 (构建反向图 + 注入)
 // =============================================================================
 void enhance_global_connectivity(size_t num_dataset,
@@ -641,7 +804,7 @@ void build_global_remote_edges(const float* d_dataset,
 
     // 1. 配置参数
     // 搜索足够多的候选以应对去重 (Top-64)
-    uint32_t global_k = 64; 
+    uint32_t global_k = std::max(64u, (total_degree - local_degree ) * 4);
     
     // IVF-PQ 参数
     int nlist = static_cast<int>(4 * std::sqrt(static_cast<double>(num_dataset)));
@@ -667,7 +830,7 @@ void build_global_remote_edges(const float* d_dataset,
     index.add(num_dataset, d_dataset);
 
     // 设置探测桶数，平衡速度和精度
-    index.nprobe = (std::min(nlist, 32));
+    index.nprobe = (std::min(nlist, 100));
 
     // 4. 执行全量搜索 (Self-Search)
     // 申请输出显存
@@ -697,11 +860,14 @@ void build_global_remote_edges(const float* d_dataset,
     CUDA_CHECK(cudaFree(d_global_indices));
     CUDA_CHECK(cudaFree(d_global_dists));
 
+    printf("Refinement done! and global k is %u\n", global_k);
+
     // 5. 启动 Update Kernel
     // 直接使用 d_global_indices (int64*)
     int block_size = 256;
     int grid_size = (num_dataset + block_size - 1) / block_size;
 
+    // 更新remote edge
     std::cout << "Launching update_remote_edges_kernel with grid size " << grid_size << " and block size " << block_size << " and golbal_k " << global_k << std::endl;
     update_remote_edges_kernel<<<grid_size, block_size>>>(
         d_graph,
@@ -761,6 +927,7 @@ void build_time_partitioned_graph(const float* d_dataset,
                                   uint32_t dim,
                                   uint32_t* d_graph,
                                   uint64_t* d_ts,
+                                  uint64_t* h_ts,
                                   const std::vector<size_t>& bucket_sizes,
                                   uint32_t total_degree,   // 32
                                   uint32_t local_degree)   // 28
@@ -775,60 +942,121 @@ void build_time_partitioned_graph(const float* d_dataset,
     // KNN 搜索的 K 值，通常比图度数大，用于剪枝
     uint32_t intermediate_degree = total_degree * 2; 
 
-    for (size_t i = 0; i < bucket_sizes.size(); ++i) {
 
-        std::cout << "Processing bucket " << i << " with size " << bucket_sizes[i] << std::endl;
+    // TODO 重构，添加并行度优化
+    // 注意到，生成方向图只取决于当前的图，所以我们可以先全量并行的构建出每一个时间戳内部的knn图，后续只需要走一遍流程即可
+    // 问题的难点：怎么最大化并行构建所有桶数据的粗略的ann图？
+    if (total_num / bucket_sizes.size() > 15000 ) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (size_t i = 0; i < bucket_sizes.size(); ++i) {
 
-        size_t b_size = bucket_sizes[i];
-        if (b_size == 0) continue;
+            std::cout << "Processing bucket " << i << " with size " << bucket_sizes[i] << std::endl;
 
-        // 1.1 准备当前桶的数据指针
-        const float* d_bucket_data = d_dataset + current_offset * dim;
+            size_t b_size = bucket_sizes[i];
+            if (b_size == 0) continue;
 
-        // 1.2 生成 Local KNN (Host)
-        std::vector<uint32_t> h_local_knn(b_size * intermediate_degree);
-        generate_knn_graph(d_bucket_data, b_size, dim, intermediate_degree, h_local_knn.data());
+            // 1.1 准备当前桶的数据指针
+            const float* d_bucket_data = d_dataset + current_offset * dim;
 
-        // 1.3 执行图优化 (CPU) -> 输出 32 度的图
-        std::vector<uint32_t> h_local_graph(b_size * total_degree); // 申请 32 宽度的空间
-        std::vector<uint32_t> h_rev_graph(b_size * total_degree);
-        std::vector<uint32_t> h_rev_counts(b_size);
+            // 1.2 生成 Local KNN (Host)
+            std::vector<uint32_t> h_local_knn(b_size * intermediate_degree);
+            generate_knn_graph(d_bucket_data, b_size, dim, intermediate_degree, h_local_knn.data());
 
-        // Step 1: Prune (剪枝到 32)
-        optimize_prune(h_local_knn.data(), h_local_graph.data(), 
-                       b_size, intermediate_degree, total_degree);
+            // 1.3 执行图优化 (CPU) -> 输出 32 度的图
+            std::vector<uint32_t> h_local_graph(b_size * total_degree); // 申请 32 宽度的空间
+            std::vector<uint32_t> h_rev_graph(b_size * total_degree);
+            std::vector<uint32_t> h_rev_counts(b_size);
 
-        // Step 2: Reverse (构建 32 度的反向图)
-        optimize_create_reverse_graph(h_local_graph.data(), h_rev_graph.data(), 
-                                      h_rev_counts.data(), b_size, total_degree);
+            // Step 1: Prune (剪枝到 32)
+            optimize_prune(h_local_knn.data(), h_local_graph.data(), 
+                        b_size, intermediate_degree, total_degree);
 
-        // Step 3: Merge (注入反向边)
-        optimize_merge_graphs(h_local_graph.data(), h_rev_graph.data(), 
-                              h_rev_counts.data(), b_size, total_degree);
+            // Step 2: Reverse (构建 32 度的反向图)
+            optimize_create_reverse_graph(h_local_graph.data(), h_rev_graph.data(), 
+                                        h_rev_counts.data(), b_size, total_degree);
 
-        // 此时图中的每个边都需要加上offset
-        uint32_t local_offset = static_cast<uint32_t>(current_offset);
+            // Step 3: Merge (注入反向边)
+            optimize_merge_graphs(h_local_graph.data(), h_rev_graph.data(), 
+                                h_rev_counts.data(), b_size, total_degree);
+
+            // 此时图中的每个边都需要加上offset
+            uint32_t local_offset = static_cast<uint32_t>(current_offset);
+
+            #pragma omp parallel for
+            for (size_t idx = 0; idx < b_size * total_degree; ++idx) {
+                if (h_local_graph[idx] != 0xFFFFFFFF) {
+                    h_local_graph[idx] += local_offset;
+                }
+            }
+
+
+            // 1.4 直接拷贝到全局显存 (无需 Memcpy2D，因为宽度匹配)
+            // 目标地址
+            uint32_t* d_dest_ptr = d_graph + current_offset * total_degree;
+            
+            // 简单的一维拷贝
+            CUDA_CHECK(cudaMemcpy(d_dest_ptr, h_local_graph.data(), 
+                                b_size * total_degree * sizeof(uint32_t), 
+                                cudaMemcpyHostToDevice));
+
+            // 更新偏移量
+            current_offset += b_size;
+        }
+    } else {
+        // 重构，调用raft加速
+        std::vector<uint32_t> h_local_knn(total_num * intermediate_degree);
+        std::vector<uint32_t> h_global_graph(total_num * total_degree); // 申请 32 宽度的空间
+        std::vector<uint32_t> h_global_reverse_graph(total_num * total_degree);
+        
+        uint32_t* d_global_knn;
+        CUDA_CHECK(cudaMalloc(&d_global_knn, total_num * intermediate_degree * sizeof(uint32_t)));
+
+        build_batch_knn_graphs(
+            d_dataset,
+            dim,
+            bucket_sizes,
+            intermediate_degree,
+            d_global_knn
+        );
+
+        // 拷贝回主机
+        CUDA_CHECK(cudaMemcpy(h_local_knn.data(), d_global_knn,
+                              total_num * intermediate_degree * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        
+        // 主机测更新local index 到 global index
+        std::vector<uint32_t> bucket_offsets(bucket_sizes.size() + 1, 0);
+        for (size_t i = 1; i <= bucket_sizes.size(); ++i) {
+            bucket_offsets[i] = bucket_offsets[i - 1] + bucket_sizes[i - 1];
+        }
 
         #pragma omp parallel for
-        for (size_t idx = 0; idx < b_size * total_degree; ++idx) {
-            if (h_local_graph[idx] != 0xFFFFFFFF) {
-                h_local_graph[idx] += local_offset;
+        for (int i = 0; i < total_num; ++i) {
+            uint32_t my_offset = bucket_offsets[h_ts[i]];
+            for (int j = 0; j < intermediate_degree; ++j) {
+                h_local_knn[i * intermediate_degree + j] += my_offset;
             }
         }
 
+        // prune
+        optimize_prune(h_local_knn.data(), h_global_graph.data(), 
+                       total_num, intermediate_degree, total_degree);
 
-        // 1.4 直接拷贝到全局显存 (无需 Memcpy2D，因为宽度匹配)
-        // 目标地址
-        uint32_t* d_dest_ptr = d_graph + current_offset * total_degree;
-        
-        // 简单的一维拷贝
-        CUDA_CHECK(cudaMemcpy(d_dest_ptr, h_local_graph.data(), 
-                              b_size * total_degree * sizeof(uint32_t), 
+        // reverse
+        std::vector<uint32_t> h_rev_counts(total_num);
+        optimize_create_reverse_graph(h_global_graph.data(), h_global_reverse_graph.data(), 
+                                      h_rev_counts.data(), total_num, total_degree);
+
+        // merge
+        optimize_merge_graphs(h_global_graph.data(), h_global_reverse_graph.data(), 
+                              h_rev_counts.data(), total_num, total_degree);
+
+        // 直接拷贝到全局显存 (无需 Memcpy2D，因为宽度匹配)
+        CUDA_CHECK(cudaMemcpy(d_graph, h_global_graph.data(),
+                              total_num * total_degree * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
-
-        // 更新偏移量
-        current_offset += b_size;
     }
+
 
     // 2. [Global Phase] 覆盖 Remote Edges
     // 这一步会找到全局最近邻，并从第 local_degree (28) 列开始写入
@@ -841,35 +1069,6 @@ void build_time_partitioned_graph(const float* d_dataset,
                               d_ts,
                               total_degree, 
                               local_degree); // 传入 28，表示前 28 个受保护
-
-    // // 直接调用原先cagra的构建反向图的一串思路试试 TOOD
-    // std::vector<uint32_t> h_graph(total_num * total_degree);
-    // std::vector<uint32_t> h_optimized_graph(total_num * total_degree);
-    // std::vector<uint32_t> h_rev_graph(total_num * total_degree);
-    // std::vector<uint32_t> h_rev_counts(total_num);
-
-    // std::cout << ">> [CAGRA Build] Starting Final Graph Optimization..." << std::endl;
-
-    // // 从 GPU 取回最终图
-    // CUDA_CHECK(cudaMemcpy(h_graph.data(), d_graph, 
-    //                       total_num * total_degree * sizeof(uint32_t), 
-    //                       cudaMemcpyDeviceToHost));
-
-    // optimize_prune(h_graph.data(), h_optimized_graph.data(), 
-    //                total_num, total_degree, total_degree);
-
-    // // 构建反向图
-    // optimize_create_reverse_graph(h_optimized_graph.data(), h_rev_graph.data(), 
-    //                               h_rev_counts.data(), total_num, total_degree);
-
-    // optimize_merge_graphs(h_optimized_graph.data(), h_rev_graph.data(), 
-    //                       h_rev_counts.data(), total_num, total_degree);
-
-    // // 拷贝回 GPU
-    // CUDA_CHECK(cudaMemcpy(d_graph, h_optimized_graph.data(), 
-    //                       total_num * total_degree * sizeof(uint32_t), 
-    //                       cudaMemcpyHostToDevice));
-
 
     std::cout << ">> [CAGRA Build] Construction Complete." << std::endl;
 }
@@ -886,7 +1085,8 @@ void search_opt(const float* d_dataset,
             int64_t* d_out_indices, 
             float* d_out_dists,
             const uint32_t* d_seeds,
-            const uint32_t num_seeds_per_query
+            const uint32_t num_seeds_per_query,
+            cudaStream_t stream
 ){
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
@@ -931,7 +1131,7 @@ void search_opt(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    cagra::device::search_kernel<<<grid, block, smem_size>>>(
+    cagra::device::search_kernel<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
         d_queries,
@@ -990,7 +1190,8 @@ void search_bucket_opt(const float* d_dataset,
                        int64_t* d_out_indices, 
                        float* d_out_dists,
                        const uint32_t* d_seeds,
-                       const uint32_t num_seeds_per_query)
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream)
 {
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
@@ -1047,7 +1248,7 @@ void search_bucket_opt(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    cagra::device::search_kernel_bucket<<<grid, block, smem_size>>>(
+    cagra::device::search_kernel_bucket<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
         d_queries,
@@ -1231,7 +1432,7 @@ void insert(const float* d_dataset,
 
     // 1. 准备搜索结果缓冲区
     // 我们需要两份结果：一份给 Local，一份给 Global
-    uint32_t search_k = params.itopk_size / 2;
+    uint32_t search_k = params.itopk_size;
     
     int64_t* d_indices_global;
     float* d_dists_global;
@@ -1243,51 +1444,68 @@ void insert(const float* d_dataset,
     CUDA_CHECK(cudaMalloc(&d_indices_local, num_new * search_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists_local, num_new * search_k * sizeof(float)));
 
-    // auto t1 = std::chrono::high_resolution_clock::now();
+    cudaStream_t stream_global, stream_local;
+    CUDA_CHECK(cudaStreamCreate(&stream_global));
+    CUDA_CHECK(cudaStreamCreate(&stream_local));
 
-    // -----------------------------------------------------------
-    // 2. Global Search (全量搜索，无 Seed)
-    // 用于填充 Remote Edges
-    // -----------------------------------------------------------
-    // 注意：只在 num_existing (老数据) 范围内搜索
-    cagra::search_opt(
-        d_dataset, 
-        dim,
-        num_existing,   // Search Space: Old Data
-        d_graph, 
-        total_degree,   // 使用完整的 32 度进行跳跃
-        d_queries, 
-        (int64_t)num_new, 
-        (int64_t)search_k, 
-        params, 
-        d_indices_global, 
-        d_dists_global, 
-        nullptr,        // 无 Seed -> 随机初始化
-        0
-    );
+    auto t1 = std::chrono::high_resolution_clock::now();
 
-    // -----------------------------------------------------------
-    // 3. Local Search (带 Seed 搜索)
-    // 用于填充 Local Edges
-    // -----------------------------------------------------------
-    cagra::search_bucket_opt(
-        d_dataset, 
-        dim,
-        num_existing,   // Search Space: Old Data
-        d_graph, 
-        total_degree,
-        local_degree,
-        d_queries, 
-        (int64_t)num_new, 
-        (int64_t)search_k, 
-        params, 
-        d_indices_local, 
-        d_dists_local, 
-        d_seeds,             // 传入桶内种子
-        num_seeds_per_query
-    );
 
-    // auto t2 = std::chrono::high_resolution_clock::now();
+    // #pragma omp parallel sections       // 开启多线程优化
+    // {
+        // -----------------------------------------------------------
+        // 2. Global Search (全量搜索，无 Seed)
+        // 用于填充 Remote Edges
+        // -----------------------------------------------------------
+        // 注意：只在 num_existing (老数据) 范围内搜索
+        // #pragma omp section
+        {
+            cagra::search_opt(
+                d_dataset, 
+                dim,
+                num_existing,   // Search Space: Old Data
+                d_graph, 
+                total_degree,   // 使用完整的 32 度进行跳跃
+                d_queries, 
+                (int64_t)num_new, 
+                (int64_t)search_k, 
+                params, 
+                d_indices_global, 
+                d_dists_global, 
+                nullptr,        // 无 Seed -> 随机初始化
+                0,
+                stream_global
+            );
+        }
+
+        auto t11 = std::chrono::high_resolution_clock::now();
+
+        // -----------------------------------------------------------
+        // 3. Local Search (带 Seed 搜索)
+        // 用于填充 Local Edges
+        // -----------------------------------------------------------
+        // #pragma omp section
+        {
+            cagra::search_bucket_opt(
+                d_dataset, 
+                dim,
+                num_existing,   // Search Space: Old Data
+                d_graph, 
+                total_degree,
+                local_degree,
+                d_queries, 
+                (int64_t)num_new, 
+                (int64_t)search_k, 
+                params, 
+                d_indices_local, 
+                d_dists_local, 
+                d_seeds,             // 传入桶内种子
+                num_seeds_per_query,
+                stream_local
+            );
+        }
+    // }
+    auto t2 = std::chrono::high_resolution_clock::now();
 
     // // 对于查询结果，我们需要进行精排
     // refine_cagra_candidates(
@@ -1331,14 +1549,16 @@ void insert(const float* d_dataset,
         search_k
     );
 
-    // auto t3 = std::chrono::high_resolution_clock::now();
+    auto t3 = std::chrono::high_resolution_clock::now();
 
-    // std::chrono::duration<double> global_search_time = t2 - t1;
-    // std::chrono::duration<double> update_time = t3 - t2;
+    std::chrono::duration<double> global_search_time = t11 - t1;
+    std::chrono::duration<double> local_search_time = t2 - t11;
+    std::chrono::duration<double> update_time = t3 - t2;
 
-    // std::cout << ">> [CAGRA Algo] Insert Timing: Global Search = " 
-    //           << global_search_time.count() << " s, Update Topology = " 
-    //           << update_time.count() << " s." << std::endl;
+    std::cout << ">> [CAGRA Insert Algo] Insert Timing: Global Search = " 
+              << global_search_time.count() << " s, Local Search = "
+              << local_search_time.count() << " s, Update Topology = " 
+              << update_time.count() << " s." << std::endl;
 
     // 5. 清理
     CUDA_CHECK(cudaFree(d_indices_global));

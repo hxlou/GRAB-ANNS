@@ -49,6 +49,30 @@ struct SearchConfig {
     }
 };
 
+// 加载 SIFT .fvecs 格式
+void load_fvecs(const std::string& filename, std::vector<float>& data, int& dim, size_t& num) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Error opening " << filename << std::endl;
+        exit(1);
+    }
+    in.read((char*)&dim, sizeof(int));
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    size_t row_size = sizeof(int) + dim * sizeof(float);
+    num = file_size / row_size;
+
+    std::cout << ">> Loading SIFT from " << filename << " (Dim=" << dim << ", N=" << num << ")..." << std::endl;
+    data.resize(num * dim);
+    in.seekg(0, std::ios::beg);
+    for (size_t i = 0; i < num; ++i) {
+        int d;
+        in.read((char*)&d, sizeof(int));
+        if (d != dim) { std::cerr << "Dim mismatch!" << std::endl; exit(1); }
+        in.read((char*)(data.data() + i * dim), dim * sizeof(float));
+    }
+}
+
 // 任务包：一个构建配置 + 一组搜索配置
 struct BenchmarkTask {
     BuildConfig build_conf;
@@ -313,16 +337,16 @@ int main() {
     int cuda_device = 0; 
     CHECK_CUDA(cudaSetDevice(cuda_device));
 
-    std::string meta_path = "../data/hotpotqa_fullwiki_train.meta.json";
-    std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";
-    std::string csv_file = "benchmark_insert_results.csv";
+    // std::string meta_path = "../data/hotpotqa_fullwiki_train.meta.json";
+    // std::string bin_path  = "../data/hotpotqa_fullwiki_train.bin";
+    std::string fvecs_path = "../data/sift-1m/sift/sift_base.fvecs";
+    std::string csv_file = "benchmark_insert_sift.csv";
 
     // 加载全量数据
-    int dim = 1024, file_total = 0;
-    if (!parseMeta(meta_path, dim, file_total)) return 1;
-    int fd = open(bin_path.c_str(), O_RDONLY);
-    size_t file_sz = (size_t)file_total * dim * sizeof(float);
-    const float* host_full_data = (const float*)mmap(nullptr, file_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    int dim = 1024;
+    size_t file_total = 0;
+    std::vector<float> host_full_data_vec;
+    load_fvecs(fvecs_path, host_full_data_vec, dim, file_total);
 
     // ==========================================================
     // 定义测试任务 (Build Configs + Search Configs)
@@ -330,46 +354,133 @@ int main() {
     std::vector<BenchmarkTask> tasks;
 
     // Task 1: 50w数据, 10个桶, Degree 32
-    tasks.push_back({
-        {880000, 2, 32}, // Build Config
-        { // Search Configs to test on this index
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
+    // tasks.push_back({
+    //     {880000, 2, 32}, // Build Config
+    //     { // Search Configs to test on this index
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 2, 64}, // Build Config
+    //     { // Search Configs to test on this index
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 2, 128}, // Build Config
+    //     { // Search Configs to test on this index
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+
+    //     }
+    // });
+
+    // // Task 2: 50w数据, 40个桶, Degree 32 (更细碎的桶，测试连通性)
+    // tasks.push_back({
+    //     {880000, 10, 32},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 10, 64},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 10, 128},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+
+    // // Task 3: 全量88w数据, 80个桶 (压力测试)
+    // tasks.push_back({
+    //     {880000, 50, 32},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 50, 64},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // tasks.push_back({
+    //     {880000, 50, 128},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
+
+    // // Task 4: 全量88w数据, 80个桶 (压力测试)
+    // tasks.push_back({
+    //     {1000000, 100, 32},
+    //     {
+    //         {128, 4, 50},
+    //         {128, 4, 100},
+    //         {256, 4, 50},
+    //         {256, 4, 100},
+    //         {512, 4, 100},
+    //         {512, 4, 200}
+    //     }
+    // });
 
     tasks.push_back({
-        {880000, 2, 64}, // Build Config
-        { // Search Configs to test on this index
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 2, 128}, // Build Config
-        { // Search Configs to test on this index
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-
-        }
-    });
-
-    // Task 2: 50w数据, 40个桶, Degree 32 (更细碎的桶，测试连通性)
-    tasks.push_back({
-        {880000, 10, 32},
+        {1000000, 100, 64},
         {
             {128, 4, 50},
             {128, 4, 100},
@@ -381,94 +492,7 @@ int main() {
     });
 
     tasks.push_back({
-        {880000, 10, 64},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 10, 128},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-
-    // Task 3: 全量88w数据, 80个桶 (压力测试)
-    tasks.push_back({
-        {880000, 50, 32},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 50, 64},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 50, 128},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    // Task 4: 全量88w数据, 80个桶 (压力测试)
-    tasks.push_back({
-        {880000, 100, 32},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 100, 64},
-        {
-            {128, 4, 50},
-            {128, 4, 100},
-            {256, 4, 50},
-            {256, 4, 100},
-            {512, 4, 100},
-            {512, 4, 200}
-        }
-    });
-
-    tasks.push_back({
-        {880000, 100, 128},
+        {1000000, 100, 128},
         {
             {128, 4, 50},
             {128, 4, 100},
@@ -484,11 +508,9 @@ int main() {
     for (const auto& task : tasks) {
         // 确保数据量不超限
         if (task.build_conf.total_data_size <= file_total) {
-            run_task(host_full_data, dim, task, csv_file);
+            run_task(host_full_data_vec.data(), dim, task, csv_file);
         }
     }
 
-    munmap((void*)host_full_data, file_sz);
-    close(fd);
     return 0;
 }

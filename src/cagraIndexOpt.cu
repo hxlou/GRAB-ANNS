@@ -201,6 +201,7 @@ void CagraIndexOpt::build() {
         dim_,
         d_graph,
         (uint64_t*)d_ts_vmm_->data(),
+        h_timestamps_.data(),
         bucket_sizes,
         graph_degree_, // total (e.g. 32)
         local_degree   // local (e.g. 28)
@@ -290,8 +291,6 @@ void CagraIndexOpt::query(const float* host_queries,
     CUDA_CHECK(cudaFree(d_dists));
     if (d_seeds) CUDA_CHECK(cudaFree(d_seeds));
 }
-
-#include "index/cagra_opt.cuh" // 包含 search_bucket_opt
 
 // ...
 
@@ -644,21 +643,6 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
             }
         }
 
-        // // debug 输出当前 Batch 的所有种子
-        // for (int i = 0; i < current_batch_size; ++i) {
-        //     std::cout << "insert vector of timestamp " << insert_timestamps[offset + i] << " seeds: ";
-        //     for (int j = 0; j < num_seeds_per_query; ++j) {
-        //         uint32_t seed = batch_seeds_host[i * num_seeds_per_query + j];
-        //         if (seed == 0xFFFFFFFF) {
-        //             std::cout << "N/A ";
-        //         } else {
-        //             std::cout << seed << " ";
-        //         }
-        //     }
-        //     std::cout << std::endl;
-        // }
-
-
         // 拷贝种子到 GPU (临时显存)
         uint32_t* d_batch_seeds = nullptr;
         size_t seeds_bytes = batch_seeds_host.size() * sizeof(uint32_t);
@@ -670,11 +654,11 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
         // 虽然物理上它们在 d_dataset 里，但 search_opt 内部会根据 num_existing 限制搜索范围。
 
         this->setQueryParams(
-            256,  // itopk
+            128,  // itopk
             4,    // search_width
             0,    // min_iter
-            100,   // max_iter
-            14    // hash_bitlen
+            50,   // max_iter
+            13    // hash_bitlen
         );
 
         cagra::insert(
@@ -708,26 +692,6 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     CUDA_CHECK(cudaMemcpy(h_graph_.data(), d_graph, 
                           new_total * graph_degree_ * sizeof(uint32_t), 
                           cudaMemcpyDeviceToHost));
-
-    // debug 随机找几个点输出一下他们的邻居
-    // for (int i = 0; i < current_size_; i += current_size_ / 40) {
-    //     std::cout << "Node " << i << " neighbors: ";
-    //     for (int j = 0; j < graph_degree_; ++j) {
-    //         std::cout << h_graph_[i * graph_degree_ + j] << " ";
-    //         if (j == local_degree_ - 1) {
-    //             std::cout << "| "; // 分隔 Local 和 Remote
-    //         }
-    //     }
-    //     std::cout << std::endl;
-    // }
-    
-
-
-    // 3. 最后：可选的图回写
-    // 为了 Save 功能，我们需要把更新后的图拷回 Host
-    // 考虑到性能，可以不在 insert 时做，而是 save 时做。
-    // 这里为了保持一致性先不拷，save 时直接从 GPU 拷。
-    // (但在你的 save 实现里目前是写 h_graph_，所以如果想随时 save，这里最好拷回来，或者修改 save 逻辑)
 }
 
 } // namespace cagra
