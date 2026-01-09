@@ -20,6 +20,7 @@ public:
      */
     CagraIndexOpt(uint32_t dim, 
                   uint32_t graph_degree = 32,
+                  uint32_t local_degree = 16,
                   size_t vmm_max_bytes = 20ULL * 1024 * 1024 * 1024);
 
     ~CagraIndexOpt();
@@ -109,7 +110,13 @@ public:
 
     // --- 数据访问 ---
     const float* get_data() const { return h_data_.data(); }
-    const uint32_t* get_graph() const { return h_graph_.data(); }
+    uint32_t* get_graph() { 
+        // 把图从 VMM 读回 Host (仅测试用)
+        h_graph_.resize(current_size_ * graph_degree_);
+        uint32_t* d_graph_ptr = (uint32_t*)d_graph_vmm_->data();        // 显存指针
+        cudaMemcpy(h_graph_.data(), d_graph_ptr, current_size_ * graph_degree_ * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        return h_graph_.data(); 
+    }
     std::vector<uint32_t> get_ids_by_timestamp(uint64_t ts) const {
         if (ts_to_ids_.count(ts)) return ts_to_ids_.at(ts);
         return {};

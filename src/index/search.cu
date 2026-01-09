@@ -481,11 +481,11 @@ __global__ void search_kernel_bucket(
 
         // auto t1 = clock64();
         // A. Sort (完全复用)
-        if (tid < 32) {
-            if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-            else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-            else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-            else if (queue_capacity == 32 * 16) cagra::radix::load_sort_store(result_dists, result_indices, 512);
+        // if (tid < 32) {
+            if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+            else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+            else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
             else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
             // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
             // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
@@ -496,7 +496,7 @@ __global__ void search_kernel_bucket(
                     printf(">> [search_kernel_bucket] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
                 }
             }
-        }
+        // }
         __syncthreads();
 
         // // 输出itopk中的内容，调试用
@@ -529,7 +529,6 @@ __global__ void search_kernel_bucket(
 
         // C. Check
         if (*terminate_flag == 1) break;
-
         // D. Expand (使用 STRIDED 版本)
         // 【核心差异】使用 compute_distance_to_child_nodes_strided
         cagra::device::compute_distance_to_child_nodes_strided(
@@ -553,11 +552,11 @@ __global__ void search_kernel_bucket(
 
     }
 
-    if (tid < 32) {
-        if (queue_capacity == 64) load_sort_store<2>(result_dists, result_indices, 64);
-        else if (queue_capacity == 128) load_sort_store<4>(result_dists, result_indices, 128);
-        else if (queue_capacity == 256) load_sort_store<8>(result_dists, result_indices, 256);
-        else if (queue_capacity == 32 * 16) cagra::radix::load_sort_store(result_dists, result_indices, 512);
+    // if (tid < 32) {
+        if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
+        else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
+        else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+        else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
         else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
         // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
         // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
@@ -568,7 +567,7 @@ __global__ void search_kernel_bucket(
                 printf(">> [search_kernel_bucket] ERROR: Unsupported queue_capacity %u\n", queue_capacity);
             }
         }
-    }
+    // }
     __syncthreads();
 
     uint32_t output_offset = query_id * topk;
@@ -785,17 +784,17 @@ __global__ void search_kernel_range(
 
     auto t_end = clock64();
 
-    if (tid == 0 && query_id <= 5) {
-        // printf("query %u finished in %u iterations, and queue capacity is %u, and total time cost is %llu.\n", query_id, iter, queue_capacity, step1_cost + step2_cost + step3_cost);
-        // printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1_cost, step2_cost, step3_cost);
-        // // 转换成百分比再输出一下
-        // printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
-        //     step1_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
-        //     step2_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
-        //     step3_cost * 100.0 / (step1_cost + step2_cost + step3_cost)
-        // );
-        printf("total function time cost: %llu\n", t_end - t_start);
-    }
+    // if (tid == 0 && query_id <= 5) {
+    //     // printf("query %u finished in %u iterations, and queue capacity is %u, and total time cost is %llu.\n", query_id, iter, queue_capacity, step1_cost + step2_cost + step3_cost);
+    //     // printf("sort time: %llu, pickup time: %llu, expand time: %llu\n", step1_cost, step2_cost, step3_cost);
+    //     // // 转换成百分比再输出一下
+    //     // printf("sort perc: %.2f%%, pickup perc: %.2f%%, expand perc: %.2f%%\n", 
+    //     //     step1_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+    //     //     step2_cost * 100.0 / (step1_cost + step2_cost + step3_cost),
+    //     //     step3_cost * 100.0 / (step1_cost + step2_cost + step3_cost)
+    //     // );
+    //     printf("total function time cost: %llu\n", t_end - t_start);
+    // }
 }
 
 } // namespace device

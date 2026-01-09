@@ -44,8 +44,8 @@ project(LightCagra LANGUAGES CXX CUDA)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 # 定义 CUDA 设备 ID（可以通过命令行覆盖）
-set(CUDA_DEVICE_ID "0" CACHE STRING "CUDA device ID to use")
-add_compile_definitions(CUDA_DEVICE_ID=${CUDA_DEVICE_ID})
+# set(CUDA_DEVICE_ID "1" CACHE STRING "CUDA device ID to use")
+# add_compile_definitions(CUDA_DEVICE_ID=${CUDA_DEVICE_ID})
 
 # # 1. 首先设置构建类型
 # set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
@@ -204,6 +204,8 @@ add_cagra_test(test_cagra_opt_search_range tests/test_cagra_opt_search_range.cu)
 add_cagra_test(test_cagra_opt_insert tests/test_cagra_opt_insert.cu)
 add_cagra_test(test_cagra_opt_build_auto tests/test_cagra_opt_build_auto.cu)
 add_cagra_test(test_cagra_opt_insert_auto tests/test_cagra_opt_insert_auto.cu)
+add_cagra_test(test_cagra_opt_local tests/test_cagra_opt_local.cu)
+
 
 # add_cagra_test(test_faiss_cagra tests/test_faiss_cagra.cu)
 

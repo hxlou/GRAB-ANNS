@@ -244,7 +244,7 @@ __global__ void update_remote_edges_kernel(
         uint32_t cand_id = my_candidates[k];
 
         // 2.1 基础过滤：不能是自己，不能是无效值(-1)
-        if (cand_id == (uint32_t)tid) continue;
+        if (cand_id == (uint32_t)tid || cand_id == 0xFFFFFFFF) continue;
 
         // 检查：最好和自己的time stamp不相同
         if (d_ts[cand_id] == my_timestamps || (d_ts[cand_id] < min_ts || d_ts[cand_id] > max_ts)) continue;
@@ -804,7 +804,8 @@ void build_global_remote_edges(const float* d_dataset,
 
     // 1. 配置参数
     // 搜索足够多的候选以应对去重 (Top-64)
-    uint32_t global_k = std::max(64u, (total_degree - local_degree ) * 4);
+    uint32_t global_k = (total_degree - local_degree ) * 4;
+    global_k = std::max(64u, (global_k + 32) - (global_k % 32)); // 向上取整到32的倍数，至少64
     
     // IVF-PQ 参数
     int nlist = static_cast<int>(4 * std::sqrt(static_cast<double>(num_dataset)));
@@ -1036,6 +1037,33 @@ void build_time_partitioned_graph(const float* d_dataset,
             for (int j = 0; j < intermediate_degree; ++j) {
                 h_local_knn[i * intermediate_degree + j] += my_offset;
             }
+        }
+
+        std::vector<float> h_dataset(total_num * dim);
+        CUDA_CHECK(cudaMemcpy(h_dataset.data(), d_dataset,
+                              total_num * dim * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+
+        // DEBUG 采样 初始 knn 图，第一行输出他的所有邻居，第二行输出他的对应的距离
+        for (size_t ii = 10; ii < total_num; ii += total_num / 50) {
+            std::cout << "Sample knn for point " << ii << ": ";
+            for (size_t j = 0; j < intermediate_degree; ++j) {
+                std::cout << h_local_knn[ii * intermediate_degree + j] << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "dist with point " << ii << ": ";
+            for (size_t j = 0; j < intermediate_degree; ++j) {
+                float dist = 0.0f;
+                // 直接计算距离即可，获取两个点的坐标
+                const float* p1 = h_dataset.data() + ii * dim;
+                const float* p2 = h_dataset.data() + h_local_knn[ii * intermediate_degree + j] * dim;
+                for (size_t d = 0; d < dim; ++d) {
+                    float diff = p1[d] - p2[d];
+                    dist += diff * diff;
+                }
+                std::cout << dist << " ";
+            }
+            std::cout << std::endl << std::endl;
         }
 
         // prune
@@ -1410,12 +1438,242 @@ void search_bucket_range(const float* d_dataset,
 }
 
 
+/** =====================================================================
+ * INSERT
+ * =============================================================================
+ */
+
+// 交换函数：如果 dist[i] > dist[j]，则交换它们 (升序)
+__device__ inline void compare_and_swap(float* s_dists, int64_t* s_indices, int i, int j, bool dir) {
+    float dist_i = s_dists[i];
+    float dist_j = s_dists[j];
+    
+    // dir=true (升序), dir=false (降序)
+    // Bitonic sort 需要根据阶段交替方向
+    // 如果 (dist_i > dist_j) == dir，说明顺序不对，需要交换
+    // 这里我们还需要处理 FLT_MAX 的情况，确保它们总是沉到底部
+    
+    bool swap_condition = (dist_i > dist_j) == dir;
+    
+    if (swap_condition) {
+        // 交换 float
+        s_dists[i] = dist_j;
+        s_dists[j] = dist_i;
+        
+        // 交换 int64_t
+        int64_t idx_i = s_indices[i];
+        int64_t idx_j = s_indices[j];
+        s_indices[i] = idx_j;
+        s_indices[j] = idx_i;
+    }
+}
+
+template <int CAPACITY>
+__global__ void merge_topk_kernel(
+    int64_t* __restrict__ d_indices_local, 
+    float*   __restrict__ d_dists_local, 
+    int search_k,
+    const int64_t* __restrict__ d_indices_tmp, 
+    const float*   __restrict__ d_dists_tmp, 
+    int tmp_size,
+    int n_rows
+) {
+    // 1. 声明共享内存
+    // 大小为 CAPACITY * (sizeof(float) + sizeof(int64_t))
+    extern __shared__ char smem[];
+    float* s_dists = (float*)smem;
+    int64_t* s_indices = (int64_t*)&s_dists[CAPACITY]; // 紧接着 float 存放
+
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+    
+    if (row >= n_rows) return;
+
+    // 计算全局偏移
+    int local_offset = row * search_k;
+    int tmp_offset   = row * tmp_size;
+    int total_elements = search_k + tmp_size;
+
+    // -----------------------------------------------------------
+    // A. 数据加载 (Load) - 处理边界
+    // -----------------------------------------------------------
+    // 每个线程负责加载一个或多个元素到 Shared Memory
+    // 我们的目标是填满 CAPACITY 长度，不足的部分填 FLT_MAX
+    
+    for (int i = tid; i < CAPACITY; i += blockDim.x) {
+        float val = FLT_MAX;
+        int64_t idx = -1;
+
+        if (i < search_k) {
+            // 加载 local 部分
+            val = d_dists_local[local_offset + i];
+            idx = d_indices_local[local_offset + i];
+        } 
+        else if (i < total_elements) {
+            // 加载 tmp 部分
+            int offset = i - search_k;
+            val = d_dists_tmp[tmp_offset + offset];
+            idx = d_indices_tmp[tmp_offset + offset];
+        }
+        // else: 保持 FLT_MAX (Padding)
+
+        s_dists[i] = val;
+        s_indices[i] = idx;
+    }
+
+    __syncthreads(); // 必须同步，确保所有数据加载完毕
+
+    // -----------------------------------------------------------
+    // B. 双调排序 (Bitonic Sort)
+    // -----------------------------------------------------------
+    // 这是一个标准的并行 Bitonic Sort 实现
+    
+    // 外层循环：构建不同长度的双调序列 (2, 4, 8, ... CAPACITY)
+    for (unsigned int size = 2; size <= CAPACITY; size <<= 1) {
+        
+        // 决定当前阶段的排序方向
+        // Bitonic Merge 阶段：我们需要构造“波峰波谷”
+        // 最终我们需要全升序，所以最后一个阶段 (size=CAPACITY) 所有比较都是升序
+        
+        // 内层循环：合并双调序列
+        for (unsigned int stride = size / 2; stride > 0; stride >>= 1) {
+            
+            // 确保之前的交换完成
+            __syncthreads(); 
+            
+            // 每个线程处理一对比较
+            // 我们需要覆盖 0 ~ CAPACITY/2 的比较对
+            for (int i = tid; i < CAPACITY / 2; i += blockDim.x) {
+                
+                int pos = 2 * i - (i & (stride - 1)); // 映射到比较索引
+                int comparator_idx = i; // 仅仅用于判断方向逻辑
+                
+                // 这种映射方式对于 Bitonic 来说比较 trick，我们换一种更直观的写法：
+                // 实际上我们只需要遍历所有下标 j
+                // 如果 j & stride == 0，则 j 和 j + stride 比较
+                
+                // --- 修正后的通用并行 Bitonic 逻辑 ---
+                // 每个线程计算它要处理的一对索引 (idx_a, idx_b)
+                // 逻辑：所有 index j，如果 (j & stride) == 0，则与 j+stride 比较
+                
+                // 重新映射：让线程 i 映射到具体的对
+                // i 从 0 到 CAPACITY/2 - 1
+                // 举例 stride=1: 0->(0,1), 1->(2,3) => idx_a = 2*i
+                // 举例 stride=2: 0->(0,2), 1->(1,3), 2->(4,6) ...
+                
+                int idx_a = (i % stride) + (i / stride) * 2 * stride;
+                int idx_b = idx_a + stride;
+
+                // 决定方向：
+                // 如果是最后一次合并(size == CAPACITY)，全升序(true)
+                // 否则，方向由所在的 size 块决定
+                bool dir = ((idx_a & size) == 0); 
+                
+                compare_and_swap(s_dists, s_indices, idx_a, idx_b, dir);
+            }
+        }
+    }
+
+    __syncthreads(); // 排序完成
+
+    // -----------------------------------------------------------
+    // C. 写回 (Store)
+    // -----------------------------------------------------------
+    // 只写回前 search_k 个结果
+    for (int i = tid; i < search_k; i += blockDim.x) {
+        d_dists_local[local_offset + i] = s_dists[i];
+        d_indices_local[local_offset + i] = s_indices[i];
+    }
+}
+
+void launch_merge_topk_kernel(
+    int64_t* d_indices_local, 
+    float*   d_dists_local, 
+    int search_k,
+    const int64_t* d_indices_tmp, 
+    const float*   d_dists_tmp, 
+    int tmp_size,
+    int n_rows,
+    cudaStream_t stream
+) {
+    // 1. 确定总数据量
+    int total_len = search_k + tmp_size;
+    
+    // 2. 寻找最近的 2 的幂次 (Power of 2)
+    // 我们的 Capacity 至少要能容纳 total_len
+    int capacity = 1;
+    while (capacity < total_len) {
+        capacity *= 2;
+    }
+
+    // 3. 计算 Shared Memory 大小
+    // float array + int64 array
+    size_t smem_size = capacity * (sizeof(float) + sizeof(int64_t));
+    
+    // 4. 配置 Kernel 参数
+    // 线程数：对于 Bitonic Sort，一个 Block 最少需要 capacity/2 个线程，
+    // 但为了方便加载数据，建议直接设置为 capacity (或 min(capacity, 256))。
+    // 这里我们直接用 256 个线程，通常足够处理 capacity=512 的情况 (每个线程处理2个元素)
+    int threads_per_block = 256;
+    if (capacity < 256) threads_per_block = capacity; // 如果数据很少，线程数减少
+
+    // 5. 模板派发 (Template Dispatch)
+    // CUDA Kernel 的 shared memory 大小如果是动态分配，需要在 <<<>>> 第三个参数指定
+    // Capacity 必须是编译期常量 (Template)，所以需要 switch-case
+    if (capacity <= 64) {
+        merge_topk_kernel<64><<<n_rows, threads_per_block, smem_size, stream>>>(
+            d_indices_local, d_dists_local, search_k, d_indices_tmp, d_dists_tmp, tmp_size, n_rows
+        );
+    } else if (capacity <= 128) {
+        merge_topk_kernel<128><<<n_rows, threads_per_block, smem_size, stream>>>(
+            d_indices_local, d_dists_local, search_k, d_indices_tmp, d_dists_tmp, tmp_size, n_rows
+        );
+    } else if (capacity <= 256) {
+        merge_topk_kernel<256><<<n_rows, threads_per_block, smem_size, stream>>>(
+            d_indices_local, d_dists_local, search_k, d_indices_tmp, d_dists_tmp, tmp_size, n_rows
+        );
+    } else if (capacity <= 512) {
+        merge_topk_kernel<512><<<n_rows, threads_per_block, smem_size, stream>>>(
+            d_indices_local, d_dists_local, search_k, d_indices_tmp, d_dists_tmp, tmp_size, n_rows
+        );
+    } else if (capacity <= 1024) {
+        merge_topk_kernel<1024><<<n_rows, threads_per_block, smem_size, stream>>>(
+            d_indices_local, d_dists_local, search_k, d_indices_tmp, d_dists_tmp, tmp_size, n_rows
+        );
+    } else {
+        // 如果超过 1024，需要报错或者使用更通用的 Global Memory 排序
+        // 但根据你的场景 (k=128)，这基本不会发生
+        fprintf(stderr, "Error: Capacity %d exceeds supported kernel limits\n", capacity);
+    }
+}
+
+__global__ void add_offset_kernel(
+    int64_t* d_indices, 
+    size_t total_elements, 
+    int64_t offset
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        // 只有有效的索引才加 offset
+        // 假设无效索引可能是 -1，如果是 -1 则不处理
+        // 但 brute_force search 只要 k <= N 通常不会有 -1
+        int64_t val = d_indices[idx];
+
+        if (val > total_elements) printf("Something wrong here!\n");
+
+        if (val >= 0) {
+            d_indices[idx] = val + offset;
+        }
+    }
+}
+
 void insert(const float* d_dataset,
                      uint32_t* d_graph,
                      const uint64_t* d_ts,
                      const uint32_t* d_seeds,
                      size_t num_existing,
                      size_t num_new,
+                     int target_ts,
                      const float* d_queries,
                      uint32_t dim,
                      uint32_t total_degree,
@@ -1424,11 +1682,6 @@ void insert(const float* d_dataset,
                      uint32_t num_seeds_per_query)
 {
     if (num_new == 0) return;
-
-    // std::cout << ">> [CAGRA Algo] Optimize Insert (Global + Local Search)..." << std::endl;
-    // 0. 准备指针
-    // 新数据既是 Data 也是 Query
-    // const float* d_queries = d_dataset + num_existing * dim;
 
     // 1. 准备搜索结果缓冲区
     // 我们需要两份结果：一份给 Local，一份给 Global
@@ -1439,26 +1692,26 @@ void insert(const float* d_dataset,
     int64_t* d_indices_local;
     float* d_dists_local;
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     CUDA_CHECK(cudaMalloc(&d_indices_global, num_new * search_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists_global, num_new * search_k * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_indices_local, num_new * search_k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists_local, num_new * search_k * sizeof(float)));
 
+
     cudaStream_t stream_global, stream_local;
     CUDA_CHECK(cudaStreamCreate(&stream_global));
     CUDA_CHECK(cudaStreamCreate(&stream_local));
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-
-    // #pragma omp parallel sections       // 开启多线程优化
-    // {
+    #pragma omp parallel sections       // 开启多线程优化
+    {
         // -----------------------------------------------------------
         // 2. Global Search (全量搜索，无 Seed)
         // 用于填充 Remote Edges
         // -----------------------------------------------------------
         // 注意：只在 num_existing (老数据) 范围内搜索
-        // #pragma omp section
+        #pragma omp section
         {
             cagra::search_opt(
                 d_dataset, 
@@ -1478,57 +1731,170 @@ void insert(const float* d_dataset,
             );
         }
 
-        auto t11 = std::chrono::high_resolution_clock::now();
+        // auto t11 = std::chrono::high_resolution_clock::now();
 
         // -----------------------------------------------------------
         // 3. Local Search (带 Seed 搜索)
         // 用于填充 Local Edges
         // -----------------------------------------------------------
-        // #pragma omp section
+        #pragma omp section
         {
-            cagra::search_bucket_opt(
-                d_dataset, 
-                dim,
-                num_existing,   // Search Space: Old Data
-                d_graph, 
-                total_degree,
-                local_degree,
-                d_queries, 
-                (int64_t)num_new, 
-                (int64_t)search_k, 
-                params, 
-                d_indices_local, 
-                d_dists_local, 
-                d_seeds,             // 传入桶内种子
-                num_seeds_per_query,
-                stream_local
-            );
+            bool use_cagra_bucket = true;
+            if (use_cagra_bucket) {
+                cagra::search_bucket_opt(
+                    d_dataset, 
+                    dim,
+                    num_existing,   // Search Space: Old Data
+                    d_graph, 
+                    total_degree,
+                    local_degree,
+                    d_queries, 
+                    (int64_t)num_new, 
+                    (int64_t)search_k, 
+                    params, 
+                    d_indices_local, 
+                    d_dists_local, 
+                    d_seeds,             // 传入桶内种子
+                    num_seeds_per_query,
+                    stream_local
+                );
+            } else {
+                rmm::mr::cuda_memory_resource cuda_mr;
+                rmm::mr::set_current_device_resource(&cuda_mr);
+
+                // 整理当前桶内的所有数据，我们使用暴力来找到local knn
+                size_t offset = target_ts * (size_t)10000;
+                float* d_bucket_data;
+                size_t bucket_size = 10000 * dim * sizeof(float);
+                CUDA_CHECK(cudaMalloc(&d_bucket_data, bucket_size));
+                CUDA_CHECK(cudaMemcpyAsync(d_bucket_data, d_dataset + offset * dim,
+                                           bucket_size, cudaMemcpyDeviceToDevice, stream_local));
+                
+                cudaStream_t stream;
+                cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+                raft::device_resources local_res(stream);
+                rmm::cuda_stream_view stream_view(stream);
+
+                auto dataset_view = raft::make_device_matrix_view<const float, int64_t>(d_bucket_data, 10000, dim);
+                auto indices_view = raft::make_device_matrix_view<int64_t, int64_t>(d_indices_local, num_new, search_k);
+                auto dists_view = raft::make_device_matrix_view<float, int64_t>(d_dists_local, num_new, search_k);
+                auto queries_view = raft::make_device_matrix_view<const float, int64_t>(d_queries, num_new, dim);
+
+                cudaDeviceSynchronize();
+
+                auto index = raft::neighbors::brute_force::build(local_res, dataset_view);
+                raft::neighbors::brute_force::search(
+                    local_res,
+                    index,
+                    queries_view,
+                    indices_view,
+                    dists_view
+                );
+
+                // 修正索引偏移
+                size_t total_elements = num_new * search_k;
+                size_t block_size = 256;
+                size_t grid_size = (total_elements + block_size - 1) / block_size;
+                int64_t index_offset = static_cast<int64_t>(offset);
+
+                add_offset_kernel<<<grid_size, block_size, 0, stream>>>(
+                    d_indices_local,
+                    total_elements,
+                    index_offset
+                );
+                CUDA_CHECK(cudaGetLastError());
+
+                // 释放资源
+                CUDA_CHECK(cudaFree(d_bucket_data));
+                cudaStreamDestroy(stream);
+            }
         }
-    // }
+    }
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    // // 对于查询结果，我们需要进行精排
-    // refine_cagra_candidates(
-    //     d_dataset,
-    //     d_queries,
-    //     d_indices_local,
-    //     d_dists_local,
-    //     num_existing,
-    //     num_new,
-    //     dim,
-    //     search_k
-    // );
+    // // 输出一下local搜索的结果，第一行index第二行dis，保证对其
+    // for (int i = 0; i < std::min((size_t)5, num_new); ++i) {
+    //     std::vector<int64_t> h_indices_row(search_k);
+    //     std::vector<float> h_dists_row(search_k);
+    //     CUDA_CHECK(cudaMemcpyAsync(h_indices_row.data(), d_indices_local + i * search_k,
+    //                                search_k * sizeof(int64_t), cudaMemcpyDeviceToHost, stream_local));
+    //     CUDA_CHECK(cudaMemcpyAsync(h_dists_row.data(), d_dists_local + i * search_k,
+    //                                search_k * sizeof(float), cudaMemcpyDeviceToHost, stream_local));
+    //     CUDA_CHECK(cudaStreamSynchronize(stream_local));
 
-    // refine_cagra_candidates(
-    //     d_dataset,
-    //     d_queries,
-    //     d_indices_global,
-    //     d_dists_global,
-    //     num_existing,
-    //     num_new,
-    //     dim,
-    //     search_k
-    // );
+    //     std::cout << "target ts is " << target_ts << std::endl;
+    //     std::cout << "Local Search Result for Query " << i << ":\nIndices: ";
+    //     for (const auto& idx : h_indices_row) {
+    //         std::cout << idx << " ";
+    //     }
+    //     std::cout << "\nDists: ";
+    //     for (const auto& dist : h_dists_row) {
+    //         std::cout << dist << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+
+
+    // batch 间索引
+    if (1) {
+        rmm::mr::cuda_memory_resource cuda_mr;
+        rmm::mr::set_current_device_resource(&cuda_mr);
+        int64_t* d_indices_tmp;
+        float* d_dists_tmp;
+        uint32_t tmp_size = std::min((size_t)num_new, (size_t)search_k / 2);
+        CUDA_CHECK(cudaMalloc(&d_indices_tmp, num_new * tmp_size * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&d_dists_tmp, num_new * tmp_size * sizeof(float)));
+        
+        cudaStream_t stream_batch;
+        cudaStreamCreateWithFlags(&stream_batch, cudaStreamNonBlocking);
+        raft::device_resources batch_res(stream_batch);
+        rmm::cuda_stream_view stream_view(stream_batch);
+
+        auto dataset_view = raft::make_device_matrix_view<const float, int64_t>(d_queries, num_new, dim);
+        auto indices_view = raft::make_device_matrix_view<int64_t, int64_t>(d_indices_tmp, num_new, tmp_size);
+        auto dists_view = raft::make_device_matrix_view<float, int64_t>(d_dists_tmp, num_new, tmp_size);
+
+        cudaDeviceSynchronize();
+
+        auto index = raft::neighbors::brute_force::build(batch_res, dataset_view);
+        raft::neighbors::brute_force::search(
+            batch_res,
+            index,
+            dataset_view,
+            indices_view,
+            dists_view
+        );
+
+        size_t total_elements = num_new * tmp_size;
+        size_t block_size = 256;
+        size_t grid_size = (total_elements + block_size - 1) / block_size;
+        int64_t offset = static_cast<int64_t>(num_existing);
+
+        add_offset_kernel<<<grid_size, block_size, 0, stream_batch>>>(
+            d_indices_tmp,
+            total_elements,
+            offset
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        // 排序
+        launch_merge_topk_kernel(
+            d_indices_local,
+            d_dists_local,
+            search_k,
+            d_indices_tmp,
+            d_dists_tmp,
+            tmp_size,
+            (int)num_new,
+            stream_batch
+        );
+
+        // 释放资源
+        CUDA_CHECK(cudaFree(d_indices_tmp));
+        CUDA_CHECK(cudaFree(d_dists_tmp));
+    }
+
+    auto t3 = std::chrono::high_resolution_clock::now();
 
     // -----------------------------------------------------------
     // 4. Update Topology (更新图结构)
@@ -1538,6 +1904,8 @@ void insert(const float* d_dataset,
     // 并生成请求更新老节点
     cagra::update_topology_gpu_opt(
         d_graph,
+        d_dataset,
+        dim,
         d_ts,
         d_indices_local,  // d_search_indices (Local)
         d_indices_global, // d_search_global (Global)
@@ -1549,16 +1917,17 @@ void insert(const float* d_dataset,
         search_k
     );
 
-    auto t3 = std::chrono::high_resolution_clock::now();
+    auto t4 = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double> global_search_time = t11 - t1;
-    std::chrono::duration<double> local_search_time = t2 - t11;
-    std::chrono::duration<double> update_time = t3 - t2;
+    std::chrono::duration<double> search_time = t2 - t1;
+    std::chrono::duration<double> batch_time = t3 - t2;
+    std::chrono::duration<double> update_time = t4 - t3;
 
-    std::cout << ">> [CAGRA Insert Algo] Insert Timing: Global Search = " 
-              << global_search_time.count() << " s, Local Search = "
-              << local_search_time.count() << " s, Update Topology = " 
-              << update_time.count() << " s." << std::endl;
+    // std::cout << ">> [CAGRA Algo] Insert Summary: " 
+    //           << " Search Time: " << search_time.count() << " s, "
+    //           << " Batch Refine Time: " << batch_time.count() << " s, "
+    //           << " Update Time: " << update_time.count() << " s."
+    //           << std::endl;
 
     // 5. 清理
     CUDA_CHECK(cudaFree(d_indices_global));

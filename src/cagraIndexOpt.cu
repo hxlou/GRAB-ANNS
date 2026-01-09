@@ -13,7 +13,7 @@ namespace cagra {
 // 构造与析构
 // =============================================================================
 
-CagraIndexOpt::CagraIndexOpt(uint32_t dim, uint32_t graph_degree, size_t vmm_max_bytes)
+CagraIndexOpt::CagraIndexOpt(uint32_t dim, uint32_t graph_degree, uint32_t local_degree, size_t vmm_max_bytes)
     : dim_(dim), 
       graph_degree_(graph_degree), 
       current_size_(0),
@@ -37,7 +37,7 @@ CagraIndexOpt::CagraIndexOpt(uint32_t dim, uint32_t graph_degree, size_t vmm_max
     search_params_.hash_bitlen = 13;
 
     // local
-    local_degree_ = graph_degree_ - graph_degree_ * remote_edge_rate_;
+    local_degree_ = local_degree;
 }
 
 CagraIndexOpt::~CagraIndexOpt() {
@@ -552,11 +552,12 @@ void CagraIndexOpt::query_range(const float* host_queries,
 
 
 // =============================================================================
-// 核心：增量插入 (Insert) - 支持 Batch 处理
+// 核心：增量插入 (Insert) - 支持 Batch 处理 修改：限制数据都为同一个时间戳
 // =============================================================================
 void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, const uint64_t* insert_timestamps) {
     if (new_vectors == 0) return;
-
+    auto t1 = std::chrono::high_resolution_clock::now();
+    uint64_t target_ts = insert_timestamps[0];
     // -------------------------------------------------------
     // 1. Host 数据更新 & VMM 物理扩容
     // -------------------------------------------------------
@@ -590,57 +591,67 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     uint32_t num_seeds_per_query = std::max(32u, search_params_.itopk_size);
     const float* d_new = d_dataset + old_size * dim_;
 
-    std::cout << "[CagraIndexOpt] Inserting " << new_vectors << " vectors (Batch Size: " << batch_size << ")..." << std::endl;
+    // std::cout << "[CagraIndexOpt] Inserting " << new_vectors << " vectors (Batch Size: " << batch_size << ")..." << std::endl;
+
+    this->setQueryParams(
+        128,  // itopk
+        4,    // search_width
+        0,    // min_iter
+        100,   // max_iter
+        13    // hash_bitlen
+    );
 
     for (size_t offset = 0; offset < new_vectors; offset += batch_size) {
         size_t current_batch_size = std::min(batch_size, new_vectors - offset);
-        
+        // auto t1 = std::chrono::high_resolution_clock::now();
         // A. 准备当前 Batch 的指针
         const float* d_batch_queries = d_new + offset * dim_;
         
         // B. 生成随机种子 (Host -> Device)
         std::vector<uint32_t> batch_seeds_host(current_batch_size * num_seeds_per_query);
         
-        // 并行采样种子
-        #pragma omp parallel for
-        for (size_t i = 0; i < current_batch_size; ++i) {
-            uint64_t ts = insert_timestamps[offset + i];
-            
-            // 查表
-            // 注意：add() 已经把新 ID 加入了 map。
-            // 我们必须只采样 ID < old_size 的老节点作为入口！
-            // 否则新节点互指，图是不连通的。
-            
-            std::vector<uint32_t> candidates;
-            {
-                // 加读锁访问 map
-                auto it = ts_to_ids_.find(ts);
-                if (it != ts_to_ids_.end()) {
-                    const auto& ids = it->second;
-                    // 二分查找 old_size 的位置
-                    auto split_it = std::lower_bound(ids.begin(), ids.end(), (uint32_t)old_size);
-                    // 拷贝有效范围内的 ID [begin, split_it)
-                    candidates.assign(ids.begin(), split_it);
+        std::fill(batch_seeds_host.begin(), batch_seeds_host.end(), 0xFFFFFFFF);
+
+        {
+            // 采样 ts_to_ids_ 中 target_ts 对应的 ID 作为种子
+            auto it = ts_to_ids_.find(target_ts);
+            std::vector<uint32_t> candidate_ids;
+            if (it != ts_to_ids_.end() && !it->second.empty()) {
+                // 由于图更新的比较慢，所以不应该使用这个，应该用old size之前的数据
+                candidate_ids = it->second;
+                int idx = 0;
+                for (; idx < candidate_ids.size(); ++idx) {
+                    if (candidate_ids[idx] >= old_size) {
+                        break;
+                    }
                 }
+                candidate_ids.resize(idx);
+            }
+            // 为第一个新插入的节点采样种子
+            std::mt19937 rng(std::random_device{}());
+            if (candidate_ids.size() <= num_seeds_per_query) {
+                std::memcpy(batch_seeds_host.data(), 
+                            candidate_ids.data(), 
+                            candidate_ids.size() * sizeof(uint32_t));
+            } else {
+                std::sample(candidate_ids.begin(), candidate_ids.end(), 
+                            batch_seeds_host.data(), 
+                            num_seeds_per_query, rng);
             }
 
-            // 采样
-            uint32_t* seed_dst = batch_seeds_host.data() + i * num_seeds_per_query;
-            if (candidates.empty()) {
-                // 如果没有老数据 (全新桶)，只能填充无效值，依赖 Global Search
-                std::fill_n(seed_dst, num_seeds_per_query, 0xFFFFFFFF);
-            } else {
-                static thread_local std::mt19937 rng(1234 + i);
-                if (candidates.size() <= num_seeds_per_query) {
-                    std::copy(candidates.begin(), candidates.end(), seed_dst);
-                    // 不足补无效
-                    if (candidates.size() < num_seeds_per_query) {
-                        std::fill_n(seed_dst + candidates.size(), num_seeds_per_query - candidates.size(), 0xFFFFFFFF);
-                    }
-                } else {
-                    std::sample(candidates.begin(), candidates.end(), seed_dst, num_seeds_per_query, rng);
-                }
+            // 把第一个节点的种子广播给当前 Batch 的其他节点
+            for (size_t i = 1; i < current_batch_size; ++i) {
+                std::memcpy(batch_seeds_host.data() + i * num_seeds_per_query, 
+                            batch_seeds_host.data(), 
+                            num_seeds_per_query * sizeof(uint32_t));
             }
+
+            // // 输出一下所有种子在一行
+            // std::cout << "   [Insert Batch " << (offset / batch_size) << "] old size is " << old_size << " Seeds: ";
+            // for (size_t s = 0; s < num_seeds_per_query; ++s) {
+            //     std::cout << batch_seeds_host[s] << " ";
+            // }
+            // std::cout << std::endl;
         }
 
         // 拷贝种子到 GPU (临时显存)
@@ -652,14 +663,9 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
         // C. 调用无状态算法
         // 注意：num_existing 始终传 old_size。因为新插入的节点还未建立反向连接，不适合作为 Search Target。
         // 虽然物理上它们在 d_dataset 里，但 search_opt 内部会根据 num_existing 限制搜索范围。
+        // ！！！！！！！！这里手动设置了search参数！！！！！！！！
 
-        this->setQueryParams(
-            128,  // itopk
-            4,    // search_width
-            0,    // min_iter
-            50,   // max_iter
-            13    // hash_bitlen
-        );
+        // auto t2 = std::chrono::high_resolution_clock::now();
 
         cagra::insert(
             d_dataset,
@@ -668,6 +674,7 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
             d_batch_seeds,
             old_size,              // Search Space Limit (只搜老数据)
             current_batch_size,    // Batch Size
+            target_ts,            // 当前插入数据的时间戳
             d_batch_queries,       // Query Ptr
             dim_,
             graph_degree_,         // 32
@@ -681,17 +688,27 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
 
         // 清理临时种子
         CUDA_CHECK(cudaFree(d_batch_seeds));
+        auto t3 = std::chrono::high_resolution_clock::now();
+
+        // std::chrono::duration<double> prepare_elapsed = t2 - t1;
+        // std::chrono::duration<double> insert_elapsed = t3 - t2;
+        // std::cout << "   [Batch " << (offset / batch_size) << "] Prepare Time: " << prepare_elapsed.count() << " s, Insert Time: " << insert_elapsed.count() << " s." << std::endl;
         
         // 进度条
-        if ((offset / batch_size) % 100 == 0) std::cout << "now is at batch " << (offset / batch_size)  << " / " <<  (new_vectors + batch_size - 1) / batch_size << std::endl;
+        // if ((offset / batch_size) % 500 == 0) std::cout << "now is at batch " << (offset / batch_size)  << " / " <<  (new_vectors + batch_size - 1) / batch_size << std::endl;
     }
-    std::cout << " Done." << std::endl;
+    // std::cout << " Done." << std::endl;
 
     // 同步一下d_graph到h_graph_，保持一致性
     h_graph_.resize(new_total * graph_degree_);
     CUDA_CHECK(cudaMemcpy(h_graph_.data(), d_graph, 
                           new_total * graph_degree_ * sizeof(uint32_t), 
                           cudaMemcpyDeviceToHost));
+
+    auto t2 =  std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = t2 - t1;
+    auto IPS = new_vectors / elapsed.count();
+    std::cout << "[CagraIndexOpt] Inserted " << new_vectors << " vectors in " << elapsed.count() << " seconds. (IPS: " << IPS << ")" << std::endl;
 }
 
 } // namespace cagra
