@@ -446,8 +446,8 @@ void update_topology_gpu_v1(uint32_t* d_graph,
 __global__ void fill_new_nodes_kernel_opt(
     uint32_t* d_graph,              // [Total_N, 32] (写入目标)
     const uint64_t* d_ts,           // [Total_N] 时间戳 (用于验证)
-    const int64_t* d_local_knn,     // [num_new, search_k_local]
-    const int64_t* d_global_knn,    // [num_new, search_k_global]
+    int64_t* d_local_knn,     // [num_new, search_k_local]
+    int64_t* d_global_knn,    // [num_new, search_k_global]
     size_t num_existing,            // 老数据量 (即新数据的起始全局ID)
     size_t num_new,                 // 新数据量
     uint32_t total_degree,          // 32
@@ -469,7 +469,7 @@ __global__ void fill_new_nodes_kernel_opt(
     // Phase 1: 填充 Local Edges [0, local_degree-1]
     // -------------------------------------------------------------
     int filled_local = 0;
-    const int64_t* my_local_candidates = d_local_knn + tid * search_k_local;
+    int64_t* my_local_candidates = d_local_knn + tid * search_k_local;
 
     for (uint32_t k = 0; k < search_k_local; ++k) {
         if (filled_local >= local_degree) break;
@@ -501,13 +501,24 @@ __global__ void fill_new_nodes_kernel_opt(
         // 强制时间戳约束：必须同桶
         if (cand_ts == my_ts) {
             my_graph_row[filled_local++] = (uint32_t)cand_id;
+            my_local_candidates[k] = -1; // 标记为已使用
         }
     }
 
     // 补齐 Local
-    while (filled_local < local_degree) {
-        my_graph_row[filled_local++] = 0xFFFFFFFF;
-        printf("warning: unable to fill local edges for new node %d and filled edge %d\n", my_global_id, filled_local);
+    for (int i = 0; i < search_k_local && filled_local < local_degree; ++i) {
+        int64_t cand_id_64 = my_local_candidates[i];
+        uint32_t cand_id = (uint32_t)cand_id_64;
+
+        if (cand_id_64 < 0) continue; // 已使用或无效
+        if (cand_id == my_global_id) continue; // 不连自己
+
+        int64_t cand_ts = d_ts[cand_id];
+        if (cand_ts != my_ts) continue; // 必须同桶
+
+        // 补齐
+        my_graph_row[filled_local++] = (uint32_t)cand_id;
+        my_local_candidates[i] = -1; // 标记为已使用
     }
 
     // -------------------------------------------------------------
@@ -515,7 +526,7 @@ __global__ void fill_new_nodes_kernel_opt(
     // -------------------------------------------------------------
     int filled_remote = 0;
     int max_remote = total_degree - local_degree;
-    const int64_t* my_global_candidates = d_global_knn + tid * search_k_global;
+    int64_t* my_global_candidates = d_global_knn + tid * search_k_global;
 
     for (uint32_t k = 0; k < search_k_global; ++k) {
         if (filled_remote >= max_remote) break;
@@ -543,14 +554,23 @@ __global__ void fill_new_nodes_kernel_opt(
         if (d_ts[cand_id] != my_ts) {
             my_graph_row[local_degree + filled_remote] = (uint32_t)cand_id;
             filled_remote++;
+            // 标记为已使用
+            my_global_candidates[k] = -1;
         }
     }
 
     // 补齐 Remote
-    while (filled_remote < max_remote) {
-        printf("warning: unable to fill remote edges for new node %lu and lack for %d edges\n", my_global_id, max_remote - filled_remote);
-        my_graph_row[local_degree + filled_remote] = 0xFFFFFFFF;
+    for (int i = 0; i < search_k_global && filled_remote < max_remote; ++i) {
+        int64_t cand_id_64 = my_global_candidates[i];
+        uint32_t cand_id = (uint32_t)cand_id_64;
+
+        if (cand_id_64 < 0) continue; // 已使用或无效
+        if (cand_id == my_global_id) continue; // 不连自己
+
+        my_graph_row[local_degree + filled_remote] = (uint32_t)cand_id;
         filled_remote++;
+        // 标记为已使用
+        my_global_candidates[i] = -1;
     }
 }
 
@@ -567,6 +587,8 @@ __global__ void generate_update_requests_kernel_opt(
     
     size_t num_existing,             // 老节点数量 (Mailbox 的大小)
     size_t num_new,                  // 新节点数量
+    size_t target_ts,
+    const uint64_t* d_ts,                   // [Total_N] 时间戳 (用于验证)
     uint32_t total_degree,           // 32
     uint32_t local_degree,           // 28
     uint32_t local_max_requests,            // Mailbox 容量
@@ -605,6 +627,10 @@ __global__ void generate_update_requests_kernel_opt(
             }
         } else {
             // --- Remote Mailbox ---
+            // 如果dest id与我们当前插入的本桶的数据重合，说明完全没插入！此处需要过滤掉
+            if (d_ts[dest_id] == target_ts) {
+                continue;
+            }
             uint32_t pos = atomicAdd(&d_remote_req_counts[dest_id], 1);
             if (pos < remote_max_requests) {
                 d_remote_req_lists[(size_t)dest_id * remote_max_requests + pos] = src_id;
@@ -635,6 +661,7 @@ __global__ void apply_topology_updates_kernel_opt(
     const uint32_t* d_remote_req_lists,
     uint32_t max_requests_remote,
 
+    const uint64_t* d_ts,                // [Total_N] 时间戳 (用于验证)
     size_t num_existing,             
     uint32_t total_degree,           // 32
     uint32_t local_degree            // 28
@@ -709,12 +736,21 @@ __global__ void apply_topology_updates_kernel_opt(
             uint32_t candidate = my_requests[i];
 
             // 1. 掷骰子
-            rng_state = wang_hash_insert(rng_state);
-            bool attack_strong = (rng_state % 100) < PROB_THRESHOLD;
+            // rng_state = wang_hash_insert(rng_state);
+            // bool attack_strong = (rng_state % 100) < PROB_THRESHOLD;
 
-            // 2. 确定攻击范围
-            uint32_t target_start = attack_strong ? strong_start : weak_start;
-            uint32_t target_len   = attack_strong ? strong_len : weak_len;
+            // 2. 确定攻击范围 前 1/3 写入nearby节点，即与我的桶距离只有全量的20%的节点，后2/3写入远程节点
+            int64_t my_ts = (int64_t)d_ts[tid];
+            int64_t cand_ts = (int64_t)d_ts[candidate];
+            bool is_nearby = (cand_ts >= my_ts - 20) && (cand_ts <= my_ts + 20); // 与我的桶距离只有全量的20%的节点
+            // uint32_t target_start = attack_strong ? strong_start : weak_start;
+            // uint32_t target_len   = attack_strong ? strong_len : weak_len;
+            uint32_t nearby_start = local_degree;
+            uint32_t nearby_len = remote_degree / 3;
+            uint32_t far_start = local_degree + remote_degree / 3;
+            uint32_t far_len = remote_degree - nearby_len;
+            uint32_t target_start = is_nearby ? nearby_start : far_start;
+            uint32_t target_len   = is_nearby ? nearby_len   : far_len;
 
             // 3. 随机替换
             if (target_len > 0) {
@@ -872,6 +908,16 @@ __global__ void apply_topology_updates_heuristic_v2(
         const uint32_t* req_list_base = (pass == 0) ? d_local_req_lists : d_remote_req_lists;
         const uint32_t* req_list = req_list_base + (size_t)my_id * max_req;
 
+        // 保护现有邻居的strong区域
+        // 90% 的概率保护， 10% 的概率放开
+        uint32_t rng_state = wang_hash_insert(my_id + pass * 123456789);
+        rng_state = wang_hash_insert(rng_state);
+        bool protect_strong = (rng_state % 100) < 90 ? 1 : 0;
+
+        uint32_t weak_start = protect_strong ? max_degree / 2 : 0;
+        offset_start += weak_start;
+        max_degree -= weak_start;
+
         // -------------------------------------------------------
         // Step 1: 收集所有候选者 (Current Neighbors + Mailbox)
         // -------------------------------------------------------
@@ -888,6 +934,7 @@ __global__ void apply_topology_updates_heuristic_v2(
             // 计算 dist(My_SMEM, Neighbor_Global)
             const float* n_vec = d_dataset + (size_t)nid * dim;
             float d = calc_dist_smem_global(my_vec_s, n_vec, dim);
+            if (req_list[0] - nid < 10000) {d *= 0.8;}                     // trick: 如果当前邻居中的节点和mailbox请求中的节点ID接近，说明可能是同一批次插入的点，距离打8折，优化裁剪效果
 
             if (lane_id == 0) {
                 my_candidates[cand_count].id = nid;
@@ -909,7 +956,7 @@ __global__ void apply_topology_updates_heuristic_v2(
 
             if (lane_id == 0 && cand_count < MAX_CANDIDATES) {
                 my_candidates[cand_count].id = req_id;
-                my_candidates[cand_count].dist = d;
+                my_candidates[cand_count].dist = d * 0.2;       // trick: Mailbox中的点我们认为更重要，距离打6折，优化后续的裁剪效果
                 cand_count++;
             }
         }
@@ -924,8 +971,8 @@ __global__ void apply_topology_updates_heuristic_v2(
 
         cand_count = __shfl_sync(0xFFFFFFFF, cand_count, 0);
 
-        // // DEBUG 输出候选列表
-        // if (lane_id == 0) {
+        // DEBUG 输出候选列表
+        // if (lane_id == 0 && warp_global_id == 1909 && pass == 1) {
         //     printf("Debug: Warp %d Pass %d Candidate List (count=%d):\n", warp_global_id, pass, cand_count);
         //     for (int i = 0; i < cand_count; ++i) {
         //         printf("  Cand %d: ID=%u Dist=%.4f\n", i, my_candidates[i].id, my_candidates[i].dist);
@@ -980,7 +1027,7 @@ __global__ void apply_topology_updates_heuristic_v2(
 
                 if (dist_c_r < c_dist_n) {
                     is_occluded = true;
-                    // if (lane_id == 0 && pass == 0) {
+                    // if (lane_id == 0 && pass == 1 && warp_global_id == 1909) {
                     //     // Debug 输出遮挡信息
                     //     printf("Debug: Pass %d Y is %d Candidate c_id=%u dist=%.4f is occluded by r_id=%u dist=%.4f (dist_c_r=%.4f, and dist_c_n=%.4f)\n", 
                     //         pass, my_id, c_id, c_dist_n, r_id, my_results[r].dist, dist_c_r, c_dist_n);
@@ -996,7 +1043,7 @@ __global__ void apply_topology_updates_heuristic_v2(
                         my_results[result_count].id = c_id;
                         my_results[result_count].dist = c_dist_n; // 存下来备用虽然后面没用到
 
-                        // if (pass == 0) printf("Debug: Pass %d Y is %d Accepted c_id=%u dist=%.4f into results at pos %d\n", pass, my_id, c_id, c_dist_n, result_count);
+                        // if (pass == 1 && warp_global_id == 1909) printf("Debug: Pass %d Y is %d Accepted c_id=%u dist=%.4f into results at pos %d\n", pass, my_id, c_id, c_dist_n, result_count);
                         
                         my_candidates[i].dist = -1.0f; // 标记为已选
                     }
@@ -1011,14 +1058,24 @@ __global__ void apply_topology_updates_heuristic_v2(
         // -------------------------------------------------------
         // Step 3.5: 填充剩余的结果到result
         // ------------------------------------------------------
-        for (int tt = cand_count - 1; tt >= 0 && result_count < max_degree; --tt) {
+        for (int tt = 0; tt < cand_count && result_count < max_degree; ++tt) {
             if (my_candidates[tt].dist < 0.0f) continue; // 已选过的跳过
-            if (lane_id == 0) {
-                my_results[result_count].id = my_candidates[tt].id;
-                my_results[result_count].dist = my_candidates[tt].dist;
-                result_count++;
-            }
+            // if (lane_id == 0) {
+            //     if (pass == 1 && warp_global_id == 1909) printf("Padding result with candidate id=%u dist=%.4f\n", my_candidates[tt].id, my_candidates[tt].dist);
+            //     my_results[result_count].id = my_candidates[tt].id;
+            //     my_results[result_count].dist = my_candidates[tt].dist;
+            //     result_count++;
+            // }
         }
+
+        __syncwarp();
+        // 输出一下final的result列表
+        // if (lane_id == 0 && warp_global_id == 1909 && pass == 1) {
+        //     printf("Debug: Warp %d Pass %d Final Result List (count=%d):\n", warp_global_id, pass, result_count);
+        //     for (int i = 0; i < result_count; ++i) {
+        //         printf("  Res %d: ID=%u Dist=%.4f\n", i, my_results[i].id, my_results[i].dist);
+        //     }
+        // }
 
         // -------------------------------------------------------
         // Step 4: 写回 Global Memory
@@ -1029,55 +1086,6 @@ __global__ void apply_topology_updates_heuristic_v2(
                 my_row[offset_start + i] = my_results[i].id;
             }
         }
-
-        // -------------------------------------------------------
-        // DEBUG: 统计 Request 接纳情况 (仅 Lane 0)
-        // // -------------------------------------------------------
-        // if (lane_id == 0) {
-        //     // 1. 获取请求列表 (用于比对)
-        //     uint32_t req_count_total = (pass == 0) ? d_local_req_counts[my_id] : d_remote_req_counts[my_id];
-            
-        //     // 只有当真正收到请求时才统计，减少刷屏
-        //     if (req_count_total > 0) {
-        //         uint32_t accepted_count = 0;
-                
-        //         // 重新获取请求列表指针 (逻辑同 Step 1)
-        //         uint32_t max_req = (pass == 0) ? max_requests_local : max_requests_remote;
-        //         uint32_t valid_req_count = (req_count_total > max_req) ? max_req : req_count_total;
-        //         const uint32_t* req_list_base = (pass == 0) ? d_local_req_lists : d_remote_req_lists;
-        //         const uint32_t* my_reqs = req_list_base + (size_t)my_id * max_req;
-
-        //         // 2. 遍历最终结果 my_results，看有多少个出现在 my_reqs 里
-        //         // O(Degree * ReqCount)，很小，哪怕 64*32 也才 2000 次操作，CPU 都能秒杀
-        //         for (int r = 0; r < result_count; ++r) {
-        //             uint32_t res_id = my_results[r].id;
-                    
-        //             // 在请求列表中查找这个 ID
-        //             for (int q = 0; q < valid_req_count; ++q) {
-        //                 if (my_reqs[q] == res_id) {
-        //                     accepted_count++;
-        //                     printf("res_id=%u found in reqs.\n", res_id);
-        //                     break; // Found match
-        //                 }
-        //             }
-        //         }
-
-        //         // 3. 只有发生有效更新时才打印 (或者你想看所有情况)
-        //         // 这里我们设定：只要有 1 个请求被接纳，就打印
-        //         if (accepted_count > 0) {
-        //             printf("DEBUG [Node %u Pass %d (%s)]: Recv %u Reqs -> Accepted %u. (Heuristic Validated!)\n", 
-        //                 my_id, 
-        //                 pass, 
-        //                 (pass == 0 ? "Local" : "Remote"), 
-        //                 req_count_total, 
-        //                 accepted_count
-        //             );                    
-        //         } else {
-        //             // 可选：打印“无效更新”，说明请求都被启发式策略挡回去了（太远或被遮挡）
-        //             // printf("DEBUG [Node %u Pass %d]: Recv %u Reqs -> Accepted 0. (All Pruned)\n", my_id, pass, req_count_total);
-        //         }
-        //     }
-        // }
     
     }
 }
@@ -1133,19 +1141,274 @@ void launch_update_v2(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// -------------------------------------------------------------------------
+// V2: 基于 HNSW 启发式策略的新节点填充
+// -------------------------------------------------------------------------
+__global__ void fill_new_nodes_heuristic_v2(
+    uint32_t* d_graph,               // [Total_N, 32] (写入目标)
+    const float* d_dataset,          // 原始向量 (用于算 Cand-Result 距离)
+    size_t dim,
+    const uint64_t* d_ts,            // 时间戳
+    
+    // KNN 结果 (必须包含距离!)
+    int64_t* d_local_knn,      // [num_new, search_k_local]
+    const float* d_local_dists,      // [num_new, search_k_local] (新增)
+    
+    int64_t* d_global_knn,     // [num_new, search_k_global]
+    const float* d_global_dists,     // [num_new, search_k_global] (新增)
+
+    size_t num_existing,
+    size_t num_new,
+    uint32_t total_degree,
+    uint32_t local_degree,
+    uint32_t search_k_local,
+    uint32_t search_k_global
+) {
+    // 1. Warp ID 计算 (Warp-per-Node)
+    int warp_global_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_local_id  = threadIdx.x / WARP_SIZE;
+
+    if (warp_global_id >= num_new) return;
+
+    // 当前新节点的全局 ID
+    size_t my_global_id = num_existing + (size_t)warp_global_id;
+    uint64_t my_ts = d_ts[my_global_id];
+    uint32_t* my_graph_row = d_graph + my_global_id * total_degree;
+
+    // -----------------------------------------------------------
+    // SMEM 分配
+    // -----------------------------------------------------------
+    // 需要存: MyVector + Local Results(Temp) + Global Results(Temp)
+    // 这里我们直接复用 Update Kernel 的逻辑：
+    // 每次处理一个 Pass (Local/Remote)，处理完直接写入 Global Memory
+    
+    extern __shared__ char smem[];
+    char* warp_smem_base = smem + warp_local_id * (
+        dim * sizeof(float) + 
+        MAX_CANDIDATES * sizeof(Candidate) + // Candidates (来自 KNN)
+        64 * sizeof(Candidate)               // Results
+    );
+
+    float* my_vec_s = (float*)warp_smem_base;
+    Candidate* my_candidates = (Candidate*)(my_vec_s + dim);
+    Candidate* my_results    = my_candidates + MAX_CANDIDATES;
+
+    // 预加载我的向量 (Coalesced Load)
+    const float* g_my_vec = d_dataset + (size_t)my_global_id * dim;
+    for (int i = lane_id; i < dim; i += 32) {
+        my_vec_s[i] = g_my_vec[i];
+    }
+    // 注意：如果是同一个 warp 内，不需要 sync，指令流同步
+
+    // ===========================================================
+    // Two Passes: 0 -> Local, 1 -> Remote
+    // ===========================================================
+    
+    for (int pass = 0; pass < 2; ++pass) {
+        uint32_t max_degree = (pass == 0) ? local_degree : (total_degree - local_degree);
+        uint32_t search_k = (pass == 0) ? search_k_local : search_k_global;
+        int64_t* knn_indices = (pass == 0) ? d_local_knn : d_global_knn;
+        const float* knn_dists = (pass == 0) ? d_local_dists : d_global_dists;
+        uint32_t offset_start = (pass == 0) ? 0 : local_degree;
+
+        // 指针偏移
+        knn_indices += (size_t)warp_global_id * search_k;
+        knn_dists += (size_t)warp_global_id * search_k;
+
+        // -------------------------------------------------------
+        // Step 1: 收集候选者 (从 KNN 结果中读取)
+        // -------------------------------------------------------
+        int cand_count = 0; // Lane 0 Maintain
+
+        // 直接遍历 KNN 结果
+        // 因为 KNN 结果通常是有序的 (dist 小 -> 大)，我们直接按顺序读进来即可
+        // 但需要过滤无效点、自环、以及 Local Pass 的 TS 约束
+        
+        // 算了，直接在 Loop 里 Lane 0 读吧，search_k 也就 128，几十个 cycle 的事。
+        if (lane_id == 0) {
+            for (int k = 0; k < search_k; ++k) {
+                if (cand_count >= MAX_CANDIDATES) break;
+                
+                int64_t idx = knn_indices[k];
+                float d = knn_dists[k];
+                
+                if (idx < 0) continue;
+                uint32_t uid = (uint32_t)idx;
+                if (uid == my_global_id) continue;
+                
+                if (pass == 0) {
+                    knn_indices[k] = -1; // Mark as used
+                    my_candidates[cand_count].id = uid;
+                    my_candidates[cand_count].dist = d;
+                    cand_count++;
+                } else {
+                    int64_t cand_ts = d_ts[uid];
+                    if (cand_ts != my_ts) {
+                        knn_indices[k] = -1; // Mark as used
+                        my_candidates[cand_count].id = uid;
+                        my_candidates[cand_count].dist = d;
+                        cand_count++;
+                    }
+                }
+            }
+
+            for (int k = 0; k < search_k && cand_count < MAX_CANDIDATES; ++k) {
+                int64_t idx = knn_indices[k];
+                if (idx < 0) continue; // Already used
+                
+                uint32_t uid = (uint32_t)idx;
+                if (uid == my_global_id) continue;
+                
+                float d = knn_dists[k];
+                my_candidates[cand_count].id = uid;
+                my_candidates[cand_count].dist = d;
+                cand_count++;
+            }
+        }
+        
+        // // DEBUG 输出候选列表的前32个
+        // if (lane_id == 0 && warp_global_id == 0) {
+        //     for (int i = 0; i < cand_count; ++i) {
+        //         uint32_t c_id;
+        //         float c_dist;
+        //         c_id = my_candidates[i].id;
+        //         c_dist = my_candidates[i].dist;                
+        //         printf("Debug: Warp %d Pass %d Candidate %d: ID=%u Dist=%.4f\n", warp_global_id, pass, i, c_id, c_dist);
+        //     }
+        // }
+
+
+        // 【关键同步】
+        __syncwarp();
+        cand_count = __shfl_sync(0xFFFFFFFF, cand_count, 0);
+
+        // -------------------------------------------------------
+        // Step 2: 启发式裁减 (Heuristic Pruning)
+        // -------------------------------------------------------
+        // 代码完全复用 Update Kernel 的逻辑
+        int result_count = 0;
+
+        for (int i = 0; i < cand_count; ++i) {
+            // 检查已满
+            // if (i == 0 && lane_id == 0) {
+            //     printf("Debug: Warp %d Pass %d Starting Heuristic Pruning with cand_count=%d\n", warp_global_id, pass, cand_count);
+            // }
+            int current_res_count = __shfl_sync(0xFFFFFFFF, result_count, 0);
+            if (current_res_count >= max_degree) break;
+
+            uint32_t c_id;
+            float c_dist_n;
+            if (lane_id == 0) {
+                c_id = my_candidates[i].id;
+                c_dist_n = my_candidates[i].dist;
+            }
+            c_id = __shfl_sync(0xFFFFFFFF, c_id, 0);
+            c_dist_n = __shfl_sync(0xFFFFFFFF, c_dist_n, 0);
+
+            // 过滤无效
+            if (c_id == 0xFFFFFFFF) continue; // Should not happen
+
+            // 算距离需要的指针
+            const float* c_vec_g = d_dataset + (size_t)c_id * dim;
+            bool is_occluded = false;
+
+            for (int r = 0; r < current_res_count; ++r) {
+                uint32_t r_id;
+                if (lane_id == 0) r_id = my_results[r].id;
+                r_id = __shfl_sync(0xFFFFFFFF, r_id, 0);
+
+                const float* r_vec_g = d_dataset + (size_t)r_id * dim;
+                float dist_c_r = 0.0f;
+
+                // Call Dist Func
+                if (dim == 128) dist_c_r = cagra::device::calc_l2_dist_128(c_vec_g, r_vec_g);
+                else if (dim == 1024) dist_c_r = cagra::device::calc_l2_dist_1024(c_vec_g, r_vec_g);
+                else if (dim == 2048) dist_c_r = cagra::device::calc_l2_dist_2048(c_vec_g, r_vec_g);
+                else if (dim == 960) dist_c_r = cagra::device::calc_l2_dist_960(c_vec_g, r_vec_g);
+                else printf("Error: Unsupported dim %d for dist_c_r calculation.\n", dim);
+
+                if (dist_c_r < c_dist_n) {
+                    is_occluded = true;
+                    // if (lane_id == 0 && pass == 0 && warp_global_id == 0) {
+                    //     // Debug 输出遮挡信息
+                    //     printf("Debug: Pass %d Y is %lu Candidate c_id=%u dist=%.4f is occluded by r_id=%u dist=%.4f (dist_c_r=%.4f, and dist_c_n=%.4f)\n", 
+                    //         pass, my_global_id, c_id, c_dist_n, r_id, my_results[r].dist, dist_c_r, c_dist_n);
+                    // }
+                    break;
+                }
+            }
+            
+            int vote = __shfl_sync(0xFFFFFFFF, is_occluded?1:0, 0);
+            if (vote == 0) {
+                if (lane_id == 0) {
+                    my_results[result_count].id = c_id;
+                    my_results[result_count].dist = c_dist_n;
+                    result_count++;
+                    // if (pass == 0 && warp_global_id == 0) {
+                    //     printf("Debug: Pass %d Y is %lu Accepted c_id=%u dist=%.4f into results at pos %d\n", pass, my_global_id, c_id, c_dist_n, result_count);
+                    // }
+                }
+                result_count = __shfl_sync(0xFFFFFFFF, result_count, 0);
+            }
+        }
+
+        // -------------------------------------------------------
+        // Step 3: 回填备胎 (Backfilling)
+        // -------------------------------------------------------
+        // 如果没填满，从 my_candidates 里捞剩下的
+        int current_res_count = __shfl_sync(0xFFFFFFFF, result_count, 0);
+        
+        if (current_res_count < max_degree) {
+            if (lane_id == 0) {
+                for(int i=0; i<cand_count && result_count < max_degree; ++i) {
+                    uint32_t c_id = my_candidates[i].id;
+                    // Check existence
+                    bool exists = false;
+                    for(int r=0; r<result_count; ++r) {
+                        if (my_results[r].id == c_id) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        my_results[result_count].id = c_id;
+                        result_count++;
+                        // printf("Paddiing into result pos %d with candidate id=%u dist=%.4f\n", result_count-1, c_id, my_candidates[i].dist);
+                    }
+                }
+            }
+            result_count = __shfl_sync(0xFFFFFFFF, result_count, 0);
+        }
+
+        // -------------------------------------------------------
+        // Step 4: 写回 Global Memory
+        // -------------------------------------------------------
+        for (int i = lane_id; i < max_degree; i += WARP_SIZE) {
+            uint32_t val = 0xFFFFFFFF;
+            if (i < result_count) {
+                val = my_results[i].id;
+            }
+            my_graph_row[offset_start + i] = val;
+        }
+    }
+}
+
+
 void update_topology_gpu_opt(
     uint32_t* d_graph,              // [In/Out] 全量图
     const float* d_dataset,         // [In] 全量数据集 (用于距离计算)
     size_t dim,                     // 向量维度
+    size_t target_ts,               // 目标时间戳
     const uint64_t* d_ts,           // [In] 时间戳 (Fill阶段需要)
-    const int64_t* d_search_indices,// [In] 搜索结果
-    const int64_t* d_search_global,    // [In] 全局搜索结果 (优化版可共用)
+    int64_t* d_search_indices,// [In] 搜索结果
+    float* d_search_dists,    // [In] 搜索距离
+    int64_t* d_search_global,    // [In] 全局搜索结果 (优化版可共用)
+    float* d_search_global_dists, // [In] 全局搜索距离
     size_t num_existing,            // 老节点数量
     size_t num_new,                 // 新节点数量
     uint32_t total_degree,          // 32
     uint32_t local_degree,          // 28
     uint32_t search_k_local,               // 128
-    uint32_t search_k_global               // 128
+    uint32_t search_k_global,               // 128
+    bool use_heuristic
 ) {
     if (num_new == 0) return;
 
@@ -1153,22 +1416,58 @@ void update_topology_gpu_opt(
     // Step 1: 填充新节点的出边 (Fill Outbound)
     // -------------------------------------------------------------
     // Grid: 基于新节点数量
-    int block_size = 256;
-    int grid_size_new = (num_new + block_size - 1) / block_size;
+
 
     // 假设 d_global_knn 和 d_local_knn 共用 d_search_indices
-    fill_new_nodes_kernel_opt<<<grid_size_new, block_size>>>(
-        d_graph,
-        d_ts,
-        d_search_indices, // local knn
-        d_search_global, // global knn
-        num_existing,
-        num_new,
-        total_degree,
-        local_degree,
-        search_k_local,
-        search_k_global
-    );
+    bool use_v1 = true;
+    int block_size = 256;
+    int grid_size_new = (num_new + block_size - 1) / block_size;
+    if (use_v1) {    
+        fill_new_nodes_kernel_opt<<<grid_size_new, block_size>>>(
+            d_graph,
+            d_ts,
+            d_search_indices, // local knn
+            d_search_global, // global knn
+            num_existing,
+            num_new,
+            total_degree,
+            local_degree,
+            search_k_local,
+            search_k_global
+        );
+    } else {
+        // printf("Use fill_new_nodes_heuristic_v2 with dim=%zu\n", dim);
+        int block_size = 256;
+        if (dim > 1024) block_size = 128;    // 避免shared_memory爆炸
+        int total_threads = num_new * WARP_SIZE;
+        int grid_size_new = (total_threads + block_size - 1) / block_size;
+
+        size_t smem_per_warp =  dim * sizeof(float) +
+                            MAX_CANDIDATES * sizeof(Candidate) +        // 候选列表大小
+                            64 * sizeof(Candidate);                     // 结果列表大小（我们的local和remote都不会超过64）
+        smem_per_warp = (smem_per_warp + 15) & ~15;                     // 16字节对齐
+
+        int warps_per_block = block_size / WARP_SIZE;
+        size_t total_smem = warps_per_block * smem_per_warp;
+
+        fill_new_nodes_heuristic_v2<<<grid_size_new, block_size, total_smem>>>(
+            d_graph,
+            d_dataset,
+            dim,
+            d_ts,
+            d_search_indices, // local knn
+            d_search_dists,
+            d_search_global, // global knn
+            d_search_global_dists,
+            num_existing,
+            num_new,
+            total_degree,
+            local_degree,
+            search_k_local,
+            search_k_global
+        );
+    }
+
     CUDA_CHECK(cudaGetLastError());
     // 这里不需要 Sync，因为 Step 2 依赖 Step 1 的结果，同一个流内会自动串行
 
@@ -1210,6 +1509,8 @@ void update_topology_gpu_opt(
         d_remote_req_lists,
         num_existing,
         num_new,
+        target_ts,
+        d_ts,
         total_degree,
         local_degree,
         local_max_requests,
@@ -1221,7 +1522,7 @@ void update_topology_gpu_opt(
     // Step 4: 应用更新 (Apply Updates)
     // -------------------------------------------------------------
     // Grid: 基于老节点数量 (因为是老节点处理收件箱)
-    {    
+    if (use_v1) {    
         int grid_size_existing = (num_existing + block_size - 1) / block_size;
 
         apply_topology_updates_kernel_opt<<<grid_size_existing, block_size>>>(
@@ -1232,28 +1533,27 @@ void update_topology_gpu_opt(
             d_remote_req_counts, 
             d_remote_req_lists, 
             remote_max_requests, // remote max
+            d_ts,
             num_existing,
             total_degree,
             local_degree
         );
+    } else {
+        launch_update_v2(
+            d_graph,
+            d_dataset,
+            dim,
+            d_local_req_counts, 
+            d_local_req_lists, 
+            local_max_requests, // local max
+            d_remote_req_counts, 
+            d_remote_req_lists, 
+            remote_max_requests, // remote max
+            num_existing + num_new,
+            total_degree,
+            local_degree
+        );
     }
-
-    // {
-    //     launch_update_v2(
-    //         d_graph,
-    //         d_dataset,
-    //         dim,
-    //         d_local_req_counts, 
-    //         d_local_req_lists, 
-    //         local_max_requests, // local max
-    //         d_remote_req_counts, 
-    //         d_remote_req_lists, 
-    //         remote_max_requests, // remote max
-    //         num_existing + num_new,
-    //         total_degree,
-    //         local_degree
-    //     );
-    // }
 
     CUDA_CHECK(cudaGetLastError());
     

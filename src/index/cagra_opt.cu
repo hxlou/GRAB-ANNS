@@ -1044,27 +1044,27 @@ void build_time_partitioned_graph(const float* d_dataset,
                               total_num * dim * sizeof(float),
                               cudaMemcpyDeviceToHost));
 
-        // DEBUG 采样 初始 knn 图，第一行输出他的所有邻居，第二行输出他的对应的距离
-        for (size_t ii = 10; ii < total_num; ii += total_num / 50) {
-            std::cout << "Sample knn for point " << ii << ": ";
-            for (size_t j = 0; j < intermediate_degree; ++j) {
-                std::cout << h_local_knn[ii * intermediate_degree + j] << " ";
-            }
-            std::cout << std::endl;
-            std::cout << "dist with point " << ii << ": ";
-            for (size_t j = 0; j < intermediate_degree; ++j) {
-                float dist = 0.0f;
-                // 直接计算距离即可，获取两个点的坐标
-                const float* p1 = h_dataset.data() + ii * dim;
-                const float* p2 = h_dataset.data() + h_local_knn[ii * intermediate_degree + j] * dim;
-                for (size_t d = 0; d < dim; ++d) {
-                    float diff = p1[d] - p2[d];
-                    dist += diff * diff;
-                }
-                std::cout << dist << " ";
-            }
-            std::cout << std::endl << std::endl;
-        }
+        // // DEBUG 采样 初始 knn 图，第一行输出他的所有邻居，第二行输出他的对应的距离
+        // for (size_t ii = 10; ii < total_num; ii += total_num / 50) {
+        //     std::cout << "Sample knn for point " << ii << ": ";
+        //     for (size_t j = 0; j < intermediate_degree; ++j) {
+        //         std::cout << h_local_knn[ii * intermediate_degree + j] << " ";
+        //     }
+        //     std::cout << std::endl;
+        //     std::cout << "dist with point " << ii << ": ";
+        //     for (size_t j = 0; j < intermediate_degree; ++j) {
+        //         float dist = 0.0f;
+        //         // 直接计算距离即可，获取两个点的坐标
+        //         const float* p1 = h_dataset.data() + ii * dim;
+        //         const float* p2 = h_dataset.data() + h_local_knn[ii * intermediate_degree + j] * dim;
+        //         for (size_t d = 0; d < dim; ++d) {
+        //             float diff = p1[d] - p2[d];
+        //             dist += diff * diff;
+        //         }
+        //         std::cout << dist << " ";
+        //     }
+        //     std::cout << std::endl << std::endl;
+        // }
 
         // prune
         optimize_prune(h_local_knn.data(), h_global_graph.data(), 
@@ -1673,6 +1673,7 @@ void insert(const float* d_dataset,
                      const uint32_t* d_seeds,
                      size_t num_existing,
                      size_t num_new,
+                     bool use_heuristic,
                      int target_ts,
                      const float* d_queries,
                      uint32_t dim,
@@ -1713,22 +1714,50 @@ void insert(const float* d_dataset,
         // 注意：只在 num_existing (老数据) 范围内搜索
         #pragma omp section
         {
-            cagra::search_opt(
-                d_dataset, 
-                dim,
-                num_existing,   // Search Space: Old Data
-                d_graph, 
-                total_degree,   // 使用完整的 32 度进行跳跃
-                d_queries, 
-                (int64_t)num_new, 
-                (int64_t)search_k, 
-                params, 
-                d_indices_global, 
-                d_dists_global, 
-                nullptr,        // 无 Seed -> 随机初始化
-                0,
-                stream_global
-            );
+            bool use_cagra_opt = true;
+            if (use_cagra_opt) {
+                search_opt(
+                    d_dataset, 
+                    dim,
+                    num_existing,   // Search Space: Old Data
+                    d_graph, 
+                    total_degree,   // 使用完整的 32 度进行跳跃
+                    d_queries, 
+                    (int64_t)num_new, 
+                    (int64_t)search_k, 
+                    params, 
+                    d_indices_global, 
+                    d_dists_global, 
+                    nullptr,        // 无 Seed -> 随机初始化
+                    0,
+                    stream_global
+                );
+            } else {
+                // 使用暴力索引，看一下效果如何
+                rmm::mr::cuda_memory_resource cuda_mr;
+                rmm::mr::set_current_device_resource(&cuda_mr);
+
+                cudaStream_t stream;
+                cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+                raft::device_resources global_res(stream);
+                rmm::cuda_stream_view stream_view(stream);
+
+                auto dataset_view = raft::make_device_matrix_view<const float, int64_t>(d_dataset, num_existing, dim);
+                auto indices_view = raft::make_device_matrix_view<int64_t, int64_t>(d_indices_global, num_new, search_k);
+                auto dists_view = raft::make_device_matrix_view<float, int64_t>(d_dists_global, num_new, search_k);
+                auto queries_view = raft::make_device_matrix_view<const float, int64_t>(d_queries, num_new, dim);
+
+                cudaDeviceSynchronize();
+                auto index = raft::neighbors::brute_force::build(global_res, dataset_view);
+                raft::neighbors::brute_force::search(
+                    global_res,
+                    index,
+                    queries_view,
+                    indices_view,
+                    dists_view
+                );
+
+            }
         }
 
         // auto t11 = std::chrono::high_resolution_clock::now();
@@ -1906,15 +1935,19 @@ void insert(const float* d_dataset,
         d_graph,
         d_dataset,
         dim,
+        target_ts,
         d_ts,
         d_indices_local,  // d_search_indices (Local)
+        d_dists_local,    // d_search_dists (Local)
         d_indices_global, // d_search_global (Global)
+        d_dists_global,   // d_search_dists (Global)
         num_existing,
         num_new,
         total_degree,
         local_degree,
         search_k,
-        search_k
+        search_k,
+        use_heuristic
     );
 
     auto t4 = std::chrono::high_resolution_clock::now();

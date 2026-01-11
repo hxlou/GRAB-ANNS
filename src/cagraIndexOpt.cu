@@ -587,7 +587,7 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     // 2. Batch 处理图更新
     // -------------------------------------------------------
     // 设定 Batch Size (例如 1024 或由外部指定，这里先硬编码或作为成员变量)
-    size_t batch_size = 128;
+    size_t batch_size = 32;
     uint32_t num_seeds_per_query = std::max(32u, search_params_.itopk_size);
     const float* d_new = d_dataset + old_size * dim_;
 
@@ -605,6 +605,13 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
         size_t current_batch_size = std::min(batch_size, new_vectors - offset);
         // auto t1 = std::chrono::high_resolution_clock::now();
         // A. 准备当前 Batch 的指针
+        // 每 1/5 的 Batch 使用启发式种子采样
+        bool use_heruistic = false;
+        // if ((offset / batch_size) % ((new_vectors / batch_size) / 5 ) == 0 ) {
+        //     printf("Now is at insert batch %zu / %zu, use heuristic seed sampling.\n", offset / batch_size, (new_vectors + batch_size -1) / batch_size);
+        //     use_heruistic = true;
+        // }
+
         const float* d_batch_queries = d_new + offset * dim_;
         
         // B. 生成随机种子 (Host -> Device)
@@ -674,6 +681,7 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
             d_batch_seeds,
             old_size,              // Search Space Limit (只搜老数据)
             current_batch_size,    // Batch Size
+            use_heruistic,         // 是否使用启发式种子采样
             target_ts,            // 当前插入数据的时间戳
             d_batch_queries,       // Query Ptr
             dim_,

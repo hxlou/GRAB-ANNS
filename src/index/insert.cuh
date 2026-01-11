@@ -100,15 +100,19 @@ void update_topology_gpu_opt(
     uint32_t* d_graph,              // [In/Out] 全量图
     const float* d_dataset,         // [In] 全量数据集 (用于距离计算)
     size_t dim,                     // 向量维度
+    size_t target_ts,               // 目标时间戳
     const uint64_t* d_ts,           // [In] 时间戳 (Fill阶段需要)
-    const int64_t* d_search_indices,// [In] 搜索结果
-    const int64_t* d_search_global,    // [In] 全局搜索结果 (优化版可共用)
+    int64_t* d_search_indices,// [In] 搜索结果
+    float* d_search_dists,    // [In] 搜索距离
+    int64_t* d_search_global,    // [In] 全局搜索结果 (优化版可共用)
+    float* d_search_global_dists, // [In] 全局搜索距离
     size_t num_existing,            // 老节点数量
     size_t num_new,                 // 新节点数量
     uint32_t total_degree,          // 32
     uint32_t local_degree,          // 28
     uint32_t search_k_local,               // 128
-    uint32_t search_k_global               // 128
+    uint32_t search_k_global,               // 128
+    bool use_heuristic = false
 );
 
 void refine_cagra_candidates(const float* d_dataset,
