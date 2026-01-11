@@ -719,4 +719,182 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     std::cout << "[CagraIndexOpt] Inserted " << new_vectors << " vectors in " << elapsed.count() << " seconds. (IPS: " << IPS << ")" << std::endl;
 }
 
+// =============================================================================
+// 序列化: Save
+// =============================================================================
+void CagraIndexOpt::save(const std::string& filepath) {
+    std::cout << "[CagraIndexOpt] Saving index to " << filepath << "..." << std::endl;
+
+    std::ofstream ofs(filepath, std::ios::binary);
+    if (!ofs.is_open()) {
+        throw std::runtime_error("Failed to open file for writing: " + filepath);
+    }
+
+    // ============================================================
+    // 1. 写入文件头 (Header)
+    // ============================================================
+    // Magic Number (4 bytes): "MCAG" (Multi-bucket CAGRA)
+    const char magic[4] = {'M', 'C', 'A', 'G'};
+    ofs.write(magic, 4);
+
+    // Version (4 bytes): 版本号，用于后续格式升级
+    uint32_t version = 1;
+    ofs.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
+
+    // ============================================================
+    // 2. 写入元数据 (Metadata)
+    // ============================================================
+    ofs.write(reinterpret_cast<const char*>(&dim_), sizeof(uint32_t));
+    ofs.write(reinterpret_cast<const char*>(&graph_degree_), sizeof(uint32_t));
+    ofs.write(reinterpret_cast<const char*>(&local_degree_), sizeof(size_t));
+    ofs.write(reinterpret_cast<const char*>(&current_size_), sizeof(size_t));
+
+    // ============================================================
+    // 3. 写入时间戳数据 (Timestamps)
+    // ============================================================
+    // 3.1 正向索引: h_timestamps_ [N]
+    size_t ts_size = h_timestamps_.size();
+    ofs.write(reinterpret_cast<const char*>(&ts_size), sizeof(size_t));
+    ofs.write(reinterpret_cast<const char*>(h_timestamps_.data()), ts_size * sizeof(uint64_t));
+
+    // 3.2 倒排索引: ts_to_ids_ (map<uint64_t, vector<uint32_t>>)
+    size_t num_buckets = ts_to_ids_.size();
+    ofs.write(reinterpret_cast<const char*>(&num_buckets), sizeof(size_t));
+    for (const auto& entry : ts_to_ids_) {
+        uint64_t ts = entry.first;
+        const std::vector<uint32_t>& ids = entry.second;
+        size_t ids_size = ids.size();
+
+        ofs.write(reinterpret_cast<const char*>(&ts), sizeof(uint64_t));
+        ofs.write(reinterpret_cast<const char*>(&ids_size), sizeof(size_t));
+        ofs.write(reinterpret_cast<const char*>(ids.data()), ids_size * sizeof(uint32_t));
+    }
+
+    // ============================================================
+    // 4. 写入向量数据 (Dataset)
+    // ============================================================
+    size_t data_size = h_data_.size();
+    ofs.write(reinterpret_cast<const char*>(&data_size), sizeof(size_t));
+    ofs.write(reinterpret_cast<const char*>(h_data_.data()), data_size * sizeof(float));
+
+    // ============================================================
+    // 5. 写入图数据 (Graph)
+    // ============================================================
+    size_t graph_size = h_graph_.size();
+    ofs.write(reinterpret_cast<const char*>(&graph_size), sizeof(size_t));
+    ofs.write(reinterpret_cast<const char*>(h_graph_.data()), graph_size * sizeof(uint32_t));
+
+    ofs.close();
+
+    std::cout << "[CagraIndexOpt] Save complete. Saved " << current_size_
+              << " vectors with " << num_buckets << " buckets." << std::endl;
+}
+
+// =============================================================================
+// 反序列化: Load
+// =============================================================================
+void CagraIndexOpt::load(const std::string& filepath) {
+    std::cout << "[CagraIndexOpt] Loading index from " << filepath << "..." << std::endl;
+
+    std::ifstream ifs(filepath, std::ios::binary);
+    if (!ifs.is_open()) {
+        throw std::runtime_error("Failed to open file for reading: " + filepath);
+    }
+
+    // ============================================================
+    // 1. 读取并验证文件头
+    // ============================================================
+    char magic[4];
+    ifs.read(magic, 4);
+    if (magic[0] != 'M' || magic[1] != 'C' || magic[2] != 'A' || magic[3] != 'G') {
+        throw std::runtime_error("Invalid file format: Magic number mismatch");
+    }
+
+    uint32_t version;
+    ifs.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+    if (version != 1) {
+        throw std::runtime_error("Unsupported version: " + std::to_string(version));
+    }
+
+    // ============================================================
+    // 2. 读取元数据
+    // ============================================================
+    ifs.read(reinterpret_cast<char*>(&dim_), sizeof(uint32_t));
+    ifs.read(reinterpret_cast<char*>(&graph_degree_), sizeof(uint32_t));
+    ifs.read(reinterpret_cast<char*>(&local_degree_), sizeof(size_t));
+    ifs.read(reinterpret_cast<char*>(&current_size_), sizeof(size_t));
+
+    std::cout << "[CagraIndexOpt] Loading metadata: dim=" << dim_
+              << ", graph_degree=" << graph_degree_
+              << ", local_degree=" << local_degree_
+              << ", size=" << current_size_ << std::endl;
+
+    // ============================================================
+    // 3. 读取时间戳数据
+    // ============================================================
+    // 3.1 正向索引
+    size_t ts_size;
+    ifs.read(reinterpret_cast<char*>(&ts_size), sizeof(size_t));
+    h_timestamps_.resize(ts_size);
+    ifs.read(reinterpret_cast<char*>(h_timestamps_.data()), ts_size * sizeof(uint64_t));
+
+    // 3.2 倒排索引
+    size_t num_buckets;
+    ifs.read(reinterpret_cast<char*>(&num_buckets), sizeof(size_t));
+    ts_to_ids_.clear();
+    for (size_t i = 0; i < num_buckets; ++i) {
+        uint64_t ts;
+        size_t ids_size;
+        ifs.read(reinterpret_cast<char*>(&ts), sizeof(uint64_t));
+        ifs.read(reinterpret_cast<char*>(&ids_size), sizeof(size_t));
+
+        std::vector<uint32_t> ids(ids_size);
+        ifs.read(reinterpret_cast<char*>(ids.data()), ids_size * sizeof(uint32_t));
+        ts_to_ids_[ts] = std::move(ids);
+    }
+
+    // ============================================================
+    // 4. 读取向量数据
+    // ============================================================
+    size_t data_size;
+    ifs.read(reinterpret_cast<char*>(&data_size), sizeof(size_t));
+    h_data_.resize(data_size);
+    ifs.read(reinterpret_cast<char*>(h_data_.data()), data_size * sizeof(float));
+
+    // ============================================================
+    // 5. 读取图数据
+    // ============================================================
+    size_t graph_size;
+    ifs.read(reinterpret_cast<char*>(&graph_size), sizeof(size_t));
+    h_graph_.resize(graph_size);
+    ifs.read(reinterpret_cast<char*>(h_graph_.data()), graph_size * sizeof(uint32_t));
+
+    ifs.close();
+
+    // ============================================================
+    // 6. 同步数据到 GPU VMM
+    // ============================================================
+    // 恢复 VMM 中的数据
+    d_data_vmm_->resize(current_size_ * dim_ * sizeof(float));
+    float* d_dataset = (float*)d_data_vmm_->data();
+    CUDA_CHECK(cudaMemcpy(d_dataset, h_data_.data(),
+                          current_size_ * dim_ * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    d_ts_vmm_->resize(current_size_ * sizeof(uint64_t));
+    uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
+    CUDA_CHECK(cudaMemcpy(d_timestamps, h_timestamps_.data(),
+                          current_size_ * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice));
+
+    d_graph_vmm_->resize(current_size_ * graph_degree_ * sizeof(uint32_t));
+    uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
+    CUDA_CHECK(cudaMemcpy(d_graph, h_graph_.data(),
+                          current_size_ * graph_degree_ * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+
+    std::cout << "[CagraIndexOpt] Load complete. Loaded " << current_size_
+              << " vectors with " << num_buckets << " buckets." << std::endl;
+}
+
 } // namespace cagra

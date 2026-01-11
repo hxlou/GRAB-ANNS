@@ -129,6 +129,7 @@ __global__ void refine_and_sort_kernel(
             else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, candidate_vec);
             else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, candidate_vec);
             else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, candidate_vec);
+            else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_vec, candidate_vec);
             else {
                 // 对于非特殊维度，调用通用版本
                 printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);

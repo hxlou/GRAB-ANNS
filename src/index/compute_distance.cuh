@@ -96,6 +96,27 @@ __device__ __forceinline__ float calc_l2_dist_256(const float* vec_a, const floa
     return sum_sq;
 }
 
+__device__ __forceinline__ float calc_l2_dist_96(const float* vec_a, const float* vec_b) {
+    const int lane_id = threadIdx.x % 32;
+    float sum_sq = 0.0f;
+
+    // 96 维: 每个线程处理 3 个元素 (32 * 3 = 96)
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        int idx = i * 32 + lane_id;
+        float diff = vec_a[idx] - vec_b[idx];
+        sum_sq += diff * diff;
+    }
+
+    // Warp 归约求和
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+
+    return sum_sq;
+}
+
 __device__ __forceinline__ float calc_l2_dist_128(const float* vec_a, const float* vec_b) {
     const int lane_id = threadIdx.x % 32;
     float sum_sq = 0.0f;
@@ -113,7 +134,7 @@ __device__ __forceinline__ float calc_l2_dist_128(const float* vec_a, const floa
     for (int offset = 16; offset > 0; offset /= 2) {
         sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
     }
-    
+
     return sum_sq;
 }
 
@@ -162,6 +183,7 @@ __device__ inline void compute_distance_to_random_nodes(
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+        else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
         else {
             // 对于非特殊维度，调用通用版本
             printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
@@ -228,6 +250,7 @@ __device__ inline void compute_distance_to_init_nodes(
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+        else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
         else {
             // 对于非特殊维度，调用通用版本
             printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
@@ -319,6 +342,7 @@ __device__ inline void compute_distance_to_child_nodes(
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
                     else {
                         // 对于非特殊维度，调用通用版本
                         printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
@@ -443,6 +467,7 @@ __device__ inline void compute_distance_to_child_nodes_strided(
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
                     else {
                         // 对于非特殊维度，调用通用版本
                         printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
@@ -567,6 +592,7 @@ __device__ inline void compute_distance_to_child_nodes_range(
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
                     else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
                     else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+                    else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
                     else {
                         // 对于非特殊维度，调用通用版本
                         printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);

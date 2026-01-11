@@ -487,7 +487,7 @@ __global__ void search_kernel_bucket(
             else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
             else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
             else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
-            // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
+            else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store(result_dists, result_indices, 2048);
             // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
             // else if (queue_capacity == 32 * 256) cagra::radix::load_sort_store<256>(result_dists, result_indices, 8192);
             else {
@@ -558,7 +558,7 @@ __global__ void search_kernel_bucket(
         else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
         else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
         else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
-        // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
+        else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store(result_dists, result_indices, 2048);
         // else if (queue_capacity == 32 * 128) cagra::radix::load_sort_store<128>(result_dists, result_indices, 4096);
         // else if (queue_capacity == 32 * 256) cagra::radix::load_sort_store<256>(result_dists, result_indices, 8192);
         else {

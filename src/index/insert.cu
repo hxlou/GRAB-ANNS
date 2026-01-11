@@ -58,6 +58,7 @@ __global__ void insert_refine_kernel_warp(const float* d_queries,       // [batc
         else if (dim == 960) dist = cagra::device::calc_l2_dist_960(vec_q, vec_n);
         else if (dim == 256) dist = cagra::device::calc_l2_dist_256(vec_q, vec_n);
         else if (dim == 128) dist = cagra::device::calc_l2_dist_128(vec_q, vec_n);
+        else if (dim == 96) dist = cagra::device::calc_l2_dist_96(vec_q, vec_n);
         else {
             // 对于非特殊维度，调用通用版本
             printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
@@ -1023,6 +1024,7 @@ __global__ void apply_topology_updates_heuristic_v2(
                 else if (dim == 2048) dist_c_r = cagra::device::calc_l2_dist_2048(c_vec_g, r_vec_g);
                 else if (dim == 128)  dist_c_r = cagra::device::calc_l2_dist_128(c_vec_g, r_vec_g);
                 else if (dim == 960)  dist_c_r = cagra::device::calc_l2_dist_960(c_vec_g, r_vec_g);
+                else if (dim == 96)  dist_c_r = cagra::device::calc_l2_dist_96(c_vec_g, r_vec_g);
                 else printf("Error: Unsupported dim %d for dist_c_r calculation.\n", dim);
 
                 if (dist_c_r < c_dist_n) {
@@ -1625,7 +1627,7 @@ __global__ void refine_cagra_candidates_kernel(
         if (idx_64 >= 0 && idx_64 < num_existing) {
             uint32_t idx_32 = (uint32_t)idx_64;
             const float* cand_vec = d_dataset + (size_t)idx_32 * dim;
-            
+
             // Warp 协作计算精确 L2
             float dist = 0.0f;
             if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_vec, cand_vec);
@@ -1633,6 +1635,7 @@ __global__ void refine_cagra_candidates_kernel(
             else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_vec, cand_vec);
             else if (dim == 256) dist = cagra::device::calc_l2_dist_256(query_vec, cand_vec);
             else if (dim == 128) dist = cagra::device::calc_l2_dist_128(query_vec, cand_vec);
+            else if (dim == 96) dist = cagra::device::calc_l2_dist_96(query_vec, cand_vec);
             else {
                 // 对于非特殊维度，调用通用版本
                 printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);

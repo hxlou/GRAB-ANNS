@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cagra.cuh"          // 包含底层算法 (build, search...)
+#include "index/cagra.cuh"          // 包含底层算法 (build, search...)
 #include "vmm_allocator.cuh"  // 包含 VMM 显存管理
 #include <string>
 #include <vector>

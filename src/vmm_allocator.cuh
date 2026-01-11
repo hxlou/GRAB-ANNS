@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <vector>
-#include "common.cuh"
+#include "index/common.cuh"
 
 #define DRIVER_CHECK(call) \
     do { \
