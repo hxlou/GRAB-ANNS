@@ -843,6 +843,7 @@ void build(const float* d_dataset,
 // 2. Search (执行搜索)
 void search(const float* d_dataset,
             size_t num_dataset,
+            uint32_t dim,
             const uint32_t* d_graph,    // [Input] 构建好的图
             uint32_t graph_degree,      // 图度数
             const float* d_queries,
@@ -903,7 +904,7 @@ void search(const float* d_dataset,
         // Params
         (uint32_t)num_queries,
         num_dataset,
-        cagra::config::DIM, // 1024
+        dim, // 1024
         graph_degree,
         topk,
         itopk_size,

@@ -163,6 +163,7 @@ void find_near_nodes(const float* d_dataset,
         cagra::search(
             d_dataset,
             num_existing,
+            dim,
             d_graph,
             graph_degree,
             curr_queries_ptr,

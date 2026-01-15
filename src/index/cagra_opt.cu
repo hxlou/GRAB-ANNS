@@ -1660,7 +1660,7 @@ __global__ void add_offset_kernel(
         // 但 brute_force search 只要 k <= N 通常不会有 -1
         int64_t val = d_indices[idx];
 
-        if (val > total_elements) printf("Something wrong here!\n");
+        // if (val > total_elements) printf("Something wrong here! val is %ld\n", val);
 
         if (val >= 0) {
             d_indices[idx] = val + offset;
@@ -1705,6 +1705,8 @@ void insert(const float* d_dataset,
     cudaStream_t stream_global, stream_local;
     CUDA_CHECK(cudaStreamCreate(&stream_global));
     CUDA_CHECK(cudaStreamCreate(&stream_local));
+
+    printf("starting parallel search...\n");
 
     #pragma omp parallel sections       // 开启多线程优化
     {
@@ -1842,6 +1844,8 @@ void insert(const float* d_dataset,
     }
     auto t2 = std::chrono::high_resolution_clock::now();
 
+    printf("finished parallel search.\n");
+
     // // 输出一下local搜索的结果，第一行index第二行dis，保证对其
     // for (int i = 0; i < std::min((size_t)5, num_new); ++i) {
     //     std::vector<int64_t> h_indices_row(search_k);
@@ -1866,6 +1870,7 @@ void insert(const float* d_dataset,
 
 
     // batch 间索引
+    // printf("start batch refine...\n");
     if (1) {
         rmm::mr::cuda_memory_resource cuda_mr;
         rmm::mr::set_current_device_resource(&cuda_mr);

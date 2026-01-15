@@ -598,7 +598,7 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
         4,    // search_width
         0,    // min_iter
         100,   // max_iter
-        13    // hash_bitlen
+        14    // hash_bitlen
     );
 
     for (size_t offset = 0; offset < new_vectors; offset += batch_size) {

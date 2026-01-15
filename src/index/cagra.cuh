@@ -123,6 +123,7 @@ __global__ void cast_u32_to_i64_kernel(const uint32_t* src, int64_t* dst, size_t
 // 2. Search (执行搜索)
 void search(const float* d_dataset,
             size_t num_dataset,
+            uint32_t dim,
             const uint32_t* d_graph,    // [Input] 构建好的图
             uint32_t graph_degree,      // 图度数
             const float* d_queries,

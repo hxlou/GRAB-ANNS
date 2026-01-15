@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <map>
 
 namespace cagra {
 
@@ -27,7 +28,7 @@ public:
      * 仅将数据追加到内部 Host 缓存中，不触发 GPU 操作。
      * 通常用于初始化阶段的数据加载。
      */
-    void add(size_t num_vectors, const float* add_vectors);
+    void add(size_t num_vectors, const float* add_vectors, const uint64_t* add_timestamps = nullptr);
 
     /**
      * @brief [阶段2] 全量构建
@@ -46,7 +47,7 @@ public:
      * @param new_vectors 新增数量
      * @param insert_vectors 新数据指针
      */
-    void insert(size_t new_vectors, const float* insert_vectors);
+    void insert(size_t new_vectors, const float* insert_vectors, const uint64_t* insert_timestamps = nullptr);
 
     /**
      * @brief 向量查询
@@ -58,6 +59,17 @@ public:
                float* host_dists,
                uint32_t* seeds = nullptr,
                size_t num_seeds_per_query = 0);
+
+    void query_range(const float* host_queries,
+                     size_t num_queries,
+                     int k,
+                     float range_radius,
+                     uint64_t start_ts,
+                     uint64_t end_ts,
+                     int64_t* host_indices,
+                     float* host_dists,
+                     uint32_t* seeds = nullptr,
+                     size_t num_seeds_per_query = 0);
 
     void setBuildParams(uint32_t inter_degree, uint32_t graph_degree) {
         build_params_.intermediate_degree = inter_degree;
@@ -91,6 +103,10 @@ private:
     // Host 数据 (Source of Truth)
     std::vector<float> h_data_;
     std::vector<uint32_t> h_graph_;
+
+    std::map<uint64_t, std::vector<uint32_t>> ts_to_ids_;
+    std::vector<uint64_t> h_timestamps_;
+    std::unique_ptr<DeviceBufferVMM> d_ts_vmm_;
 
     // Device VMM 内存管理器
     std::unique_ptr<DeviceBufferVMM> d_data_vmm_;

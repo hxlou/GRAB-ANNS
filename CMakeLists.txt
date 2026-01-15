@@ -205,7 +205,7 @@ add_cagra_test(test_cagra_opt_insert tests/test_cagra_opt_insert.cu)
 add_cagra_test(test_cagra_opt_build_auto tests/test_cagra_opt_build_auto.cu)
 add_cagra_test(test_cagra_opt_insert_auto tests/test_cagra_opt_insert_auto.cu)
 add_cagra_test(test_cagra_opt_local tests/test_cagra_opt_local.cu)
-
+add_cagra_test(test_cagra_auto tests/test_cagra_auto.cu)
 
 # add_cagra_test(test_faiss_cagra tests/test_faiss_cagra.cu)
 
