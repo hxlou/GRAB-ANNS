@@ -266,11 +266,11 @@ int main() {
     search_params.max_iterations = 50;  // 多跳：最多 50 步
 
     // Warmup
-    cagra::search(d_dataset, vector_total, d_cagra_graph, GRAPH_K, 
+    cagra::search(d_dataset, vector_total, 111, d_cagra_graph, GRAPH_K, 
                   d_queries, num_queries, k, search_params, d_out_indices, d_out_dists);
 
     timer.reset();
-    cagra::search(d_dataset, vector_total, d_cagra_graph, GRAPH_K, 
+    cagra::search(d_dataset, vector_total, 111, d_cagra_graph, GRAPH_K, 
                   d_queries, num_queries, k, search_params, d_out_indices, d_out_dists);
     double search_time = timer.elapsed_ms();
 

@@ -252,7 +252,7 @@ int main() {
     CHECK_CUDA(cudaMalloc(&d_out_dists, num_queries * k * sizeof(float)));
 
     // 注意：Search 时使用 TOTAL_SIZE
-    cagra::search(d_dataset, TOTAL_SIZE, d_graph, GRAPH_K, 
+    cagra::search(d_dataset, TOTAL_SIZE, 111, d_graph, GRAPH_K, 
                   d_queries, num_queries, k, search_params, d_out_indices, d_out_dists);
 
     std::vector<int64_t> h_out_indices(num_queries * k);
