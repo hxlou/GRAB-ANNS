@@ -807,6 +807,7 @@ void build_global_remote_edges(const float* d_dataset,
     // 搜索足够多的候选以应对去重 (Top-64)
     uint32_t global_k = (total_degree - local_degree ) * 4;
     global_k = std::max(64u, (global_k + 32) - (global_k % 32)); // 向上取整到32的倍数，至少64
+    global_k = std::min(256u, global_k); // 最大256
     
     // IVF-PQ 参数
     int nlist = static_cast<int>(4 * std::sqrt(static_cast<double>(num_dataset)));
