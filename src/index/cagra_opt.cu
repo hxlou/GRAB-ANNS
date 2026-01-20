@@ -1022,6 +1022,8 @@ void build_time_partitioned_graph(const float* d_dataset,
             d_global_knn
         );
 
+        CUDA_CHECK(cudaFree(d_global_knn));
+
         // 拷贝回主机
         CUDA_CHECK(cudaMemcpy(h_local_knn.data(), d_global_knn,
                               total_num * intermediate_degree * sizeof(uint32_t),
@@ -1707,7 +1709,7 @@ void insert(const float* d_dataset,
     CUDA_CHECK(cudaStreamCreate(&stream_global));
     CUDA_CHECK(cudaStreamCreate(&stream_local));
 
-    printf("starting parallel search...\n");
+    // printf("starting parallel search...\n");
 
     #pragma omp parallel sections       // 开启多线程优化
     {
@@ -1845,7 +1847,7 @@ void insert(const float* d_dataset,
     }
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    printf("finished parallel search.\n");
+    // printf("finished parallel search.\n");
 
     // // 输出一下local搜索的结果，第一行index第二行dis，保证对其
     // for (int i = 0; i < std::min((size_t)5, num_new); ++i) {
