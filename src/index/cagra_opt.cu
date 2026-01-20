@@ -1022,12 +1022,12 @@ void build_time_partitioned_graph(const float* d_dataset,
             d_global_knn
         );
 
-        CUDA_CHECK(cudaFree(d_global_knn));
-
         // 拷贝回主机
         CUDA_CHECK(cudaMemcpy(h_local_knn.data(), d_global_knn,
                               total_num * intermediate_degree * sizeof(uint32_t),
                               cudaMemcpyDeviceToHost));
+
+        CUDA_CHECK(cudaFree(d_global_knn));
         
         // 主机测更新local index 到 global index
         std::vector<uint32_t> bucket_offsets(bucket_sizes.size() + 1, 0);
