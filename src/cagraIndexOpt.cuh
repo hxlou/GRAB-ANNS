@@ -7,6 +7,8 @@
 #include <map>                      // 用于倒排索引
 #include <memory>
 #include <shared_mutex>             // 用于线程安全
+#include <iostream>
+#include <fstream>
 
 namespace cagra {
 
@@ -75,6 +77,41 @@ public:
                const uint32_t* seeds = nullptr,
                size_t num_seeds_per_query = 0);
 
+    void query_multi_cta(const float* host_queries,
+                         size_t num_queries,
+                         int k,
+                         int64_t* host_indices,
+                         float* host_dists,
+                         uint32_t num_cta_per_query = 0,
+                         const uint32_t* seeds = nullptr,
+                         size_t num_seeds_per_query = 0);
+
+    void query_multi_cta_many_single(const float* host_queries,
+                                     size_t num_queries,
+                                     int k,
+                                     int64_t* host_indices,
+                                     float* host_dists,
+                                     uint32_t num_cta_per_query = 0,
+                                     bool profile = false);
+
+    void query_multi_cta_range(const float* host_queries,
+                               size_t num_queries,
+                               int k,
+                               uint64_t start_bucket,
+                               uint64_t end_bucket,
+                               int64_t* host_indices,
+                               float* host_dists,
+                               uint32_t num_cta_per_query = 0);
+
+    void query_multi_cta_range_many_single(const float* host_queries,
+                                           size_t num_queries,
+                                           int k,
+                                           uint64_t start_bucket,
+                                           uint64_t end_bucket,
+                                           int64_t* host_indices,
+                                           float* host_dists,
+                                           uint32_t num_cta_per_query = 0);
+
     void query_local(const float* host_queries, 
                         size_t num_queries, 
                         int k, 
@@ -129,6 +166,19 @@ public:
     // --- 序列化 ---
     void save(const std::string& filepath);
     void load(const std::string& filepath);
+    void save_graph_to_bin(const std::string& filename) {
+        std::ofstream out_file(filename, std::ios::binary);
+        if (!out_file) {
+            std::cerr << "Error opening file for writing." << std::endl;
+            return;
+        }
+        // 直接将 vector 的内存块写入文件
+        // h_graph.data() 返回数组首地址
+        // size * sizeof(uint32_t) 是总字节数
+        out_file.write(reinterpret_cast<const char*>(h_graph_.data()), h_graph_.size() * sizeof(uint32_t));
+        out_file.close();
+        std::cout << "Graph saved to " << filename << std::endl;
+    }
 
 private:
     uint32_t dim_;
