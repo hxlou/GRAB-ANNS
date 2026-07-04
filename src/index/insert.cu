@@ -495,8 +495,8 @@ __global__ void fill_new_nodes_kernel_opt(
         } // 过滤异常大 ID
 
         if (cand_ts != my_ts) {
-            printf("1145114 local candidate %u for new node %lu at local rank %u is from different bucket (ts %ld vs %lu)\n", cand_id, my_global_id, k, cand_ts, my_ts);
-            printf("num existing: %lu, num_new: %lu\n", num_existing, num_new);
+            // printf("1145114 local candidate %u for new node %lu at local rank %u is from different bucket (ts %ld vs %lu)\n", cand_id, my_global_id, k, cand_ts, my_ts);
+            // printf("num existing: %lu, num_new: %lu\n", num_existing, num_new);
             continue;
         }
 
@@ -956,9 +956,10 @@ __global__ void apply_topology_updates_heuristic_v2(
             const float* req_vec = d_dataset + (size_t)req_id * dim;
             float d = calc_dist_smem_global(my_vec_s, req_vec, dim);
 
+            float TRICK_RATIO = 0.4f;
             if (lane_id == 0 && cand_count < MAX_CANDIDATES) {
                 my_candidates[cand_count].id = req_id;
-                my_candidates[cand_count].dist = d * 0.2;       // trick: Mailbox中的点我们认为更重要，距离打6折，优化后续的裁剪效果
+                my_candidates[cand_count].dist = d * TRICK_RATIO;       // trick: Mailbox中的点我们认为更重要，距离打6折，优化后续的裁剪效果
                 cand_count++;
             }
         }
@@ -1329,6 +1330,7 @@ __global__ void fill_new_nodes_heuristic_v2(
                 else if (dim == 1024) dist_c_r = cagra::device::calc_l2_dist_1024(c_vec_g, r_vec_g);
                 else if (dim == 2048) dist_c_r = cagra::device::calc_l2_dist_2048(c_vec_g, r_vec_g);
                 else if (dim == 960) dist_c_r = cagra::device::calc_l2_dist_960(c_vec_g, r_vec_g);
+                else if (dim == 96)  dist_c_r = cagra::device::calc_l2_dist_96(c_vec_g, r_vec_g);
                 else printf("Error: Unsupported dim %d for dist_c_r calculation.\n", dim);
 
                 if (dist_c_r < c_dist_n) {

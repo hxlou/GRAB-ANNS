@@ -48,6 +48,8 @@ size_t multi_cta_intermediate_count(int64_t num_queries, uint32_t num_cta_per_qu
 
 size_t multi_cta_hash_count(int64_t num_queries, uint32_t num_cta_per_query, uint32_t hash_bitlen);
 
+size_t multi_cta_traversed_hash_count(int64_t num_queries, uint32_t hash_bitlen);
+
 void search_multi_cta_opt_preallocated(const float* d_dataset,
                                        uint32_t dim,
                                        size_t num_dataset,
@@ -62,6 +64,7 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
                                        uint32_t* d_intermediate_indices,
                                        float* d_intermediate_dists,
                                        uint32_t* d_pre_hashmap,
+                                       uint32_t* d_traversed_hashmap,
                                        const uint32_t* d_seeds,
                                        uint32_t num_seeds_per_query,
                                        uint32_t num_cta_per_query = 0,

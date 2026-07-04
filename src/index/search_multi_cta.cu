@@ -56,6 +56,179 @@ __device__ __forceinline__ void pickup_next_parents(uint32_t* terminate_flag,
     }
 }
 
+__device__ __forceinline__ void pickup_next_parent_multi_cta(uint32_t* terminate_flag,
+                                                             uint32_t* next_parent_indices,
+                                                             uint32_t* internal_topk_indices,
+                                                             float* internal_topk_dists,
+                                                             uint32_t internal_topk_size,
+                                                             uint32_t* traversed_hash,
+                                                             uint32_t traversed_hash_bitlen)
+{
+    constexpr uint32_t MSB_MASK = 0x80000000;
+    constexpr uint32_t INVALID_IDX = 0xFFFFFFFF;
+
+    if (threadIdx.x == 0) {
+        next_parent_indices[0] = INVALID_IDX;
+        *terminate_flag = 1;
+        for (uint32_t i = 0; i < internal_topk_size; ++i) {
+            uint32_t node_id = internal_topk_indices[i];
+            if (node_id == INVALID_IDX || (node_id & MSB_MASK)) continue;
+
+            uint32_t clean_id = node_id & ~MSB_MASK;
+            bool usable = traversed_hash == nullptr ||
+                          cagra::hashmap::insert(traversed_hash, traversed_hash_bitlen, clean_id);
+            if (usable) {
+                next_parent_indices[0] = clean_id;
+                internal_topk_indices[i] = clean_id | MSB_MASK;
+                *terminate_flag = 0;
+                break;
+            }
+
+            internal_topk_indices[i] = INVALID_IDX;
+            internal_topk_dists[i] = FLT_MAX;
+        }
+    }
+}
+
+__device__ inline float compute_l2_for_dim(const float* query_buffer,
+                                           const float* node_ptr,
+                                           uint32_t dim)
+{
+    if (dim == 1024) return cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
+    if (dim == 2048) return cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
+    if (dim == 960) return cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
+    if (dim == 256) return cagra::device::calc_l2_dist_256(query_buffer, node_ptr);
+    if (dim == 128) return cagra::device::calc_l2_dist_128(query_buffer, node_ptr);
+    if (dim == 96) return cagra::device::calc_l2_dist_96(query_buffer, node_ptr);
+    if (threadIdx.x == 0) printf("[multi_cta] unsupported dimension %u\n", dim);
+    return FLT_MAX;
+}
+
+__device__ inline void init_multi_cta_nodes(uint32_t* result_indices,
+                                           float* result_dists,
+                                           const float* query_buffer,
+                                           const float* dataset_ptr,
+                                           size_t num_dataset,
+                                           uint32_t dim,
+                                           uint32_t queue_capacity,
+                                           uint32_t num_pickup,
+                                           const uint32_t* seed_ptr,
+                                           uint32_t num_seeds_per_query,
+                                           uint64_t rand_xor_mask,
+                                           uint32_t* visited_hash,
+                                           uint32_t visited_hash_bitlen,
+                                           uint32_t* traversed_hash,
+                                           uint32_t traversed_hash_bitlen,
+                                           uint32_t block_id,
+                                           uint32_t num_blocks)
+{
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane_id = tid % 32;
+    const uint32_t warp_id = tid / 32;
+    const uint32_t num_warps = blockDim.x / 32;
+
+    for (uint32_t i = tid; i < queue_capacity; i += blockDim.x) {
+        result_indices[i] = 0xFFFFFFFF;
+        result_dists[i] = FLT_MAX;
+    }
+    __syncthreads();
+
+    for (uint32_t i = warp_id; i < num_pickup; i += num_warps) {
+        uint32_t gid = block_id + num_blocks * i;
+        uint32_t node_id = 0xFFFFFFFF;
+        if (seed_ptr != nullptr && gid < num_seeds_per_query) {
+            node_id = seed_ptr[gid];
+        }
+        if (node_id >= num_dataset) {
+            node_id = (rand_xor_mask * static_cast<uint64_t>(gid + 1)) % num_dataset;
+        }
+
+        bool usable = true;
+        if (lane_id == 0) {
+            usable = cagra::hashmap::insert(visited_hash, visited_hash_bitlen, node_id);
+            if (usable && traversed_hash != nullptr) {
+                usable = !cagra::hashmap::search(traversed_hash, traversed_hash_bitlen, node_id);
+            }
+        }
+        usable = __shfl_sync(0xffffffff, usable, 0);
+
+        float dist = FLT_MAX;
+        if (usable) {
+            const float* node_ptr = dataset_ptr + static_cast<size_t>(node_id) * dim;
+            dist = compute_l2_for_dim(query_buffer, node_ptr, dim);
+        }
+
+        if (lane_id == 0) {
+            result_indices[i] = usable ? node_id : 0xFFFFFFFF;
+            result_dists[i] = usable ? dist : FLT_MAX;
+        }
+    }
+    __syncthreads();
+}
+
+__device__ inline void compute_distance_to_child_nodes_multi_cta(
+    uint32_t* candidate_indices,
+    float* candidate_dists,
+    const float* query_buffer,
+    const float* dataset_ptr,
+    const uint32_t* knn_graph,
+    const uint64_t* timestamps_ptr,
+    uint32_t graph_degree,
+    uint32_t dim,
+    uint32_t* visited_hash,
+    uint32_t visited_hash_bitlen,
+    uint32_t* traversed_hash,
+    uint32_t traversed_hash_bitlen,
+    const uint32_t* parent_list,
+    uint32_t search_width,
+    uint64_t start_bucket,
+    uint64_t end_bucket)
+{
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane_id = tid % 32;
+    const uint32_t warp_id = tid / 32;
+    const uint32_t num_warps = blockDim.x / 32;
+    const uint32_t total_tasks = search_width * graph_degree;
+
+    for (uint32_t task_id = warp_id; task_id < total_tasks; task_id += num_warps) {
+        uint32_t parent_idx = task_id / graph_degree;
+        uint32_t neighbor_offset = task_id % graph_degree;
+        uint32_t neighbor_id = 0xFFFFFFFF;
+        bool usable = false;
+
+        uint32_t parent_id = parent_list[parent_idx];
+        if (parent_id != 0xFFFFFFFF) {
+            neighbor_id = knn_graph[static_cast<size_t>(parent_id) * graph_degree + neighbor_offset];
+            usable = neighbor_id != 0xFFFFFFFF;
+        }
+
+        if (usable && timestamps_ptr != nullptr) {
+            uint64_t bucket_id = __ldg(&timestamps_ptr[neighbor_id]);
+            usable = bucket_id >= start_bucket && bucket_id < end_bucket;
+        }
+
+        if (lane_id == 0 && usable) {
+            usable = cagra::hashmap::insert(visited_hash, visited_hash_bitlen, neighbor_id);
+            if (usable && traversed_hash != nullptr) {
+                usable = !cagra::hashmap::search(traversed_hash, traversed_hash_bitlen, neighbor_id);
+            }
+        }
+        usable = __shfl_sync(0xffffffff, usable, 0);
+
+        float dist = FLT_MAX;
+        if (usable) {
+            const float* node_ptr = dataset_ptr + static_cast<size_t>(neighbor_id) * dim;
+            dist = compute_l2_for_dim(query_buffer, node_ptr, dim);
+        }
+
+        if (lane_id == 0) {
+            candidate_indices[task_id] = usable ? neighbor_id : 0xFFFFFFFF;
+            candidate_dists[task_id] = usable ? dist : FLT_MAX;
+        }
+    }
+    __syncthreads();
+}
+
 __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
     uint32_t* intermediate_indices,       // [num_queries, num_cta, local_topk]
     float* intermediate_dists,            // [num_queries, num_cta, local_topk]
@@ -78,6 +251,8 @@ __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
     uint64_t start_bucket,
     uint64_t end_bucket,
     uint32_t* pre_hashmap,
+    uint32_t* traversed_hashmap,
+    uint32_t traversed_hash_bitlen,
     uint32_t queue_capacity)
 {
     extern __shared__ uint8_t smem[];
@@ -122,24 +297,19 @@ __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
     cagra::hashmap::init(visited_hash, hash_bitlen);
     __syncthreads();
 
-    const uint32_t* local_seed_ptr = nullptr;
-    uint32_t local_num_seeds = 0;
-    if (seed_ptr != nullptr && num_seeds_per_query > 0) {
-        uint32_t seed_stride = max(1u, num_seeds_per_query / max(1u, num_cta));
-        uint32_t seed_offset = min(num_seeds_per_query - 1, cta_id * seed_stride);
-        local_seed_ptr = seed_ptr + static_cast<size_t>(query_id) * num_seeds_per_query + seed_offset;
-        local_num_seeds = min(seed_stride, num_seeds_per_query - seed_offset);
-    }
+    uint32_t* query_traversed_hash = traversed_hashmap == nullptr
+        ? nullptr
+        : traversed_hashmap + static_cast<size_t>(query_id) * (1u << traversed_hash_bitlen);
 
     uint64_t local_rand_mask =
         rand_xor_mask ^ (0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(cta_id + 1));
 
-    uint32_t target_num_seeds = num_seeds;
-    if (timestamps_ptr != nullptr && local_seed_ptr != nullptr) {
-        target_num_seeds = min(num_seeds, local_num_seeds);
-    }
-
-    cagra::device::compute_distance_to_init_nodes(
+    const uint32_t* local_seed_ptr = seed_ptr == nullptr
+        ? nullptr
+        : seed_ptr + static_cast<size_t>(query_id) * num_seeds_per_query;
+    uint32_t block_id = cta_id + num_cta * query_id;
+    uint32_t num_blocks = num_cta * num_queries;
+    init_multi_cta_nodes(
         result_indices,
         result_dists,
         query_buffer,
@@ -147,12 +317,16 @@ __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
         num_dataset,
         dim,
         queue_capacity,
-        target_num_seeds,
+        num_seeds,
         local_seed_ptr,
-        local_num_seeds,
+        num_seeds_per_query,
         local_rand_mask,
         visited_hash,
-        hash_bitlen);
+        hash_bitlen,
+        query_traversed_hash,
+        traversed_hash_bitlen,
+        block_id,
+        num_blocks);
     __syncthreads();
 
     for (uint32_t iter = 0; iter < max_iterations; ++iter) {
@@ -170,48 +344,45 @@ __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
         __syncthreads();
 
         if (tid < 32) {
-            cagra::device::pickup_next_parents(
+            cagra::device::pickup_next_parent_multi_cta(
                 const_cast<uint32_t*>(terminate_flag),
                 parent_list,
                 result_indices,
+                result_dists,
                 local_topk,
-                search_width);
+                query_traversed_hash,
+                traversed_hash_bitlen);
         }
         __syncthreads();
 
         if (*terminate_flag == 1) break;
 
-        if (timestamps_ptr != nullptr) {
-            cagra::device::compute_distance_to_child_nodes_range(
-                result_indices + local_topk,
-                result_dists + local_topk,
-                query_buffer,
-                dataset_ptr,
-                knn_graph,
-                graph_degree,
-                graph_degree,
-                dim,
-                visited_hash,
-                hash_bitlen,
-                parent_list,
-                search_width,
-                start_bucket,
-                end_bucket,
-                const_cast<uint64_t*>(timestamps_ptr));
-        } else {
-            cagra::device::compute_distance_to_child_nodes(
-                result_indices + local_topk,
-                result_dists + local_topk,
-                query_buffer,
-                dataset_ptr,
-                knn_graph,
-                graph_degree,
-                dim,
-                visited_hash,
-                hash_bitlen,
-                parent_list,
-                search_width);
+        cagra::hashmap::init(visited_hash, hash_bitlen);
+        __syncthreads();
+        for (uint32_t i = tid; i < queue_capacity; i += blockDim.x) {
+            uint32_t idx = result_indices[i];
+            if (idx == 0xFFFFFFFF) continue;
+            cagra::hashmap::insert(visited_hash, hash_bitlen, idx & 0x7FFFFFFF);
         }
+        __syncthreads();
+
+        cagra::device::compute_distance_to_child_nodes_multi_cta(
+            result_indices + local_topk,
+            result_dists + local_topk,
+            query_buffer,
+            dataset_ptr,
+            knn_graph,
+            timestamps_ptr,
+            graph_degree,
+            dim,
+            visited_hash,
+            hash_bitlen,
+            query_traversed_hash,
+            traversed_hash_bitlen,
+            parent_list,
+            search_width,
+            start_bucket,
+            end_bucket);
         __syncthreads();
     }
 
@@ -229,8 +400,14 @@ __global__ __launch_bounds__(1024, 1) void search_multi_cta_kernel(
     size_t out_base =
         (static_cast<size_t>(query_id) * num_cta + cta_id) * static_cast<size_t>(local_topk);
     for (uint32_t i = tid; i < local_topk; i += blockDim.x) {
-        intermediate_indices[out_base + i] = result_indices[i] & 0x7FFFFFFF;
-        intermediate_dists[out_base + i] = result_dists[i];
+        uint32_t idx = result_indices[i];
+        bool valid = idx != 0xFFFFFFFF;
+        idx &= 0x7FFFFFFF;
+        if (valid && query_traversed_hash != nullptr && (result_indices[i] & 0x80000000) == 0) {
+            valid = cagra::hashmap::insert(query_traversed_hash, traversed_hash_bitlen, idx);
+        }
+        intermediate_indices[out_base + i] = valid ? idx : 0xFFFFFFFF;
+        intermediate_dists[out_base + i] = valid ? result_dists[i] : FLT_MAX;
     }
 }
 
@@ -309,6 +486,11 @@ size_t multi_cta_hash_count(int64_t num_queries, uint32_t num_cta_per_query, uin
     return static_cast<size_t>(num_queries) * num_cta_per_query * (size_t{1} << hash_bitlen);
 }
 
+size_t multi_cta_traversed_hash_count(int64_t num_queries, uint32_t hash_bitlen)
+{
+    return static_cast<size_t>(num_queries) * (size_t{1} << hash_bitlen);
+}
+
 void search_multi_cta_opt(const float* d_dataset,
                           uint32_t dim,
                           size_t num_dataset,
@@ -342,6 +524,9 @@ void search_multi_cta_opt(const float* d_dataset,
     if (hash_count > 0) {
         CUDA_CHECK(cudaMalloc(&d_pre_hashmap, hash_count * sizeof(uint32_t)));
     }
+    uint32_t* d_traversed_hashmap = nullptr;
+    size_t traversed_hash_count = multi_cta_traversed_hash_count(num_queries, params.hash_bitlen);
+    CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
 
     std::random_device rd;
     uint64_t rand_xor_mask = (static_cast<uint64_t>(rd()) << 32) ^ rd();
@@ -360,6 +545,7 @@ void search_multi_cta_opt(const float* d_dataset,
                                       d_intermediate_indices,
                                       d_intermediate_dists,
                                       d_pre_hashmap,
+                                      d_traversed_hashmap,
                                       d_seeds,
                                       num_seeds_per_query,
                                       num_cta_per_query,
@@ -376,6 +562,7 @@ void search_multi_cta_opt(const float* d_dataset,
     CUDA_CHECK(cudaFree(d_intermediate_indices));
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    CUDA_CHECK(cudaFree(d_traversed_hashmap));
 }
 
 void search_multi_cta_range_opt(const float* d_dataset,
@@ -414,6 +601,9 @@ void search_multi_cta_range_opt(const float* d_dataset,
     if (hash_count > 0) {
         CUDA_CHECK(cudaMalloc(&d_pre_hashmap, hash_count * sizeof(uint32_t)));
     }
+    uint32_t* d_traversed_hashmap = nullptr;
+    size_t traversed_hash_count = multi_cta_traversed_hash_count(num_queries, params.hash_bitlen);
+    CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
 
     constexpr uint64_t rand_xor_mask = 0x9e3779b97f4a7c15ULL;
     search_multi_cta_opt_preallocated(d_dataset,
@@ -430,6 +620,7 @@ void search_multi_cta_range_opt(const float* d_dataset,
                                       d_intermediate_indices,
                                       d_intermediate_dists,
                                       d_pre_hashmap,
+                                      d_traversed_hashmap,
                                       d_seeds,
                                       num_seeds_per_query,
                                       num_cta_per_query,
@@ -445,6 +636,7 @@ void search_multi_cta_range_opt(const float* d_dataset,
     CUDA_CHECK(cudaFree(d_intermediate_indices));
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    CUDA_CHECK(cudaFree(d_traversed_hashmap));
 }
 
 void search_multi_cta_opt_preallocated(const float* d_dataset,
@@ -461,6 +653,7 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
                                        uint32_t* d_intermediate_indices,
                                        float* d_intermediate_dists,
                                        uint32_t* d_pre_hashmap,
+                                       uint32_t* d_traversed_hashmap,
                                        const uint32_t* d_seeds,
                                        uint32_t num_seeds_per_query,
                                        uint32_t num_cta_per_query,
@@ -497,6 +690,7 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
     smem_size += 16;
 
     size_t hash_count = multi_cta_hash_count(num_queries, num_cta_per_query, params.hash_bitlen);
+    size_t traversed_hash_count = multi_cta_traversed_hash_count(num_queries, params.hash_bitlen);
     cudaEvent_t ev_start = nullptr;
     cudaEvent_t ev_stop = nullptr;
     if (profile_ms != nullptr) {
@@ -515,8 +709,11 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
             profile_ms[0] += ms;
         }
     }
+    CUDA_CHECK(cudaMemsetAsync(d_traversed_hashmap, 0xFF,
+                               traversed_hash_count * sizeof(uint32_t),
+                               stream));
 
-    uint32_t num_seeds = std::min(local_topk, std::max(32u, num_seeds_per_query));
+    uint32_t num_seeds = std::min(queue_capacity, std::max(graph_degree, num_seeds_per_query));
 
     uint32_t block_size = 1024;
     if (const char* block_env = std::getenv("CAGRA_MULTI_CTA_BLOCK_SIZE")) {
@@ -552,6 +749,8 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
         start_bucket,
         end_bucket,
         d_pre_hashmap,
+        d_traversed_hashmap,
+        params.hash_bitlen,
         queue_capacity);
     CUDA_CHECK(cudaGetLastError());
     if (profile_ms != nullptr) {

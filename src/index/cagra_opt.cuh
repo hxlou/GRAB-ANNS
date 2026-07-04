@@ -26,7 +26,10 @@ void build_time_partitioned_graph(const float* d_dataset,
                                   uint64_t* h_ts,
                                   const std::vector<size_t>& bucket_sizes,
                                   uint32_t total_degree,
-                                  uint32_t local_degree);
+                                  uint32_t local_degree,
+                                  uint32_t intermediate_degree,
+                                  uint32_t remote_pq_m = 32,
+                                  uint32_t remote_nprobe = 200);
 
 void search_opt(const float* d_dataset,
             uint32_t dim,

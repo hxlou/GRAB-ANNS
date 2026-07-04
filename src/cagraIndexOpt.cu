@@ -207,7 +207,10 @@ void CagraIndexOpt::build() {
         h_timestamps_.data(),
         bucket_sizes,
         graph_degree_, // total (e.g. 32)
-        local_degree   // local (e.g. 28)
+        local_degree,  // local (e.g. 28)
+        build_params_.intermediate_degree,
+        build_params_.remote_pq_m,
+        build_params_.remote_nprobe
     );
 
     // -----------------------------------------------------------
@@ -386,6 +389,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     uint32_t* d_intermediate_indices = nullptr;
     float* d_intermediate_dists = nullptr;
     uint32_t* d_pre_hashmap = nullptr;
+    uint32_t* d_traversed_hashmap = nullptr;
 
     auto t0 = now();
     CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
@@ -413,6 +417,8 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     if (hash_count > 0) {
         CUDA_CHECK(cudaMalloc(&d_pre_hashmap, hash_count * sizeof(uint32_t)));
     }
+    size_t traversed_hash_count = cagra::multi_cta_traversed_hash_count(1, search_params_.hash_bitlen);
+    CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
     t1 = now();
     alloc_ms += ms_since(t0, t1);
 
@@ -437,6 +443,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
             d_intermediate_indices + cagra::multi_cta_intermediate_count(1, num_cta_per_query) * q,
             d_intermediate_dists + cagra::multi_cta_intermediate_count(1, num_cta_per_query) * q,
             d_pre_hashmap,
+            d_traversed_hashmap,
             nullptr,
             0,
             num_cta_per_query,
@@ -483,6 +490,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     CUDA_CHECK(cudaFree(d_intermediate_indices));
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    CUDA_CHECK(cudaFree(d_traversed_hashmap));
     t1 = now();
     free_ms = ms_since(t0, t1);
 
@@ -677,6 +685,7 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     uint32_t* d_intermediate_indices = nullptr;
     float* d_intermediate_dists = nullptr;
     uint32_t* d_pre_hashmap = nullptr;
+    uint32_t* d_traversed_hashmap = nullptr;
 
     CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
@@ -701,6 +710,8 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     if (hash_count > 0) {
         CUDA_CHECK(cudaMalloc(&d_pre_hashmap, hash_count * sizeof(uint32_t)));
     }
+    size_t traversed_hash_count = cagra::multi_cta_traversed_hash_count(1, search_params_.hash_bitlen);
+    CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
 
     const float* d_dataset = (float*)d_data_vmm_->data();
     const uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
@@ -723,6 +734,7 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
             d_intermediate_indices + per_query_intermediate * q,
             d_intermediate_dists + per_query_intermediate * q,
             d_pre_hashmap,
+            d_traversed_hashmap,
             d_seeds,
             actual_seeds_count,
             num_cta_per_query,
@@ -760,6 +772,7 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     CUDA_CHECK(cudaFree(d_intermediate_indices));
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
+    CUDA_CHECK(cudaFree(d_traversed_hashmap));
 }
 
 // ...

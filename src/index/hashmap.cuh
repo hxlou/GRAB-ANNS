@@ -90,6 +90,24 @@ __device__ __forceinline__ bool insert(uint32_t* table, const uint32_t bitlen, c
     return false; 
 }
 
+__device__ __forceinline__ bool search(const uint32_t* table, const uint32_t bitlen, const uint32_t key) {
+    const uint32_t size = compute_size(bitlen);
+    const uint32_t mask = size - 1;
+    uint32_t index = hash_func(key, bitlen) & mask;
+
+    for (uint32_t i = 0; i < size; i++) {
+        uint32_t old = table[index];
+        if (old == key) {
+            return true;
+        }
+        if (old == INVALID_KEY) {
+            return false;
+        }
+        index = (index + 1) & mask;
+    }
+    return false;
+}
+
 /**
  * @brief 重置后恢复 Hash 表 (Restore)
  * 

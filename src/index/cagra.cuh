@@ -30,6 +30,8 @@ constexpr int MAX_DEGREE = 512;              // KNN 图最大度数
 struct BuildParams {
     uint32_t intermediate_degree = 128;
     uint32_t graph_degree = 64;
+    uint32_t remote_pq_m = 32;
+    uint32_t remote_nprobe = 200;
 };
 
 struct SearchParams {

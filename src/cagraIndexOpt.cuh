@@ -134,6 +134,10 @@ public:
         build_params_.intermediate_degree = inter_degree;
         build_params_.graph_degree = graph_degree;
     }
+    void setRemoteBuildParams(uint32_t remote_pq_m, uint32_t remote_nprobe) {
+        build_params_.remote_pq_m = remote_pq_m;
+        build_params_.remote_nprobe = remote_nprobe;
+    }
 
     void setQueryParams(uint32_t itopk_size, uint32_t search_width, 
                         uint32_t min_iterations, uint32_t max_iterations,

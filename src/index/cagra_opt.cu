@@ -17,6 +17,7 @@
 #include <omp.h> // 使用 OpenMP 加速 CPU 排序
 #include <random>
 #include <chrono>
+#include <fstream>
 // FAISS 头文件
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/GpuIndexIVFPQ.h>
@@ -224,7 +225,7 @@ __global__ void update_remote_edges_kernel(
     uint64_t my_timestamps = d_ts[tid];
 
     uint64_t total_buckets = d_ts[num_dataset - 1] + 1;
-    uint64_t fanwei = std::max(1ull, (unsigned long long)total_buckets / 5); // 20% 范围
+    uint64_t fanwei = std::max(1ull, (unsigned long long)total_buckets / 5); // 20% 范围              TODO 调整比例到10%会不会表现更好一些？
     uint64_t min_ts = my_timestamps >= fanwei ? my_timestamps - fanwei : 0;
     uint64_t max_ts = my_timestamps + fanwei >= total_buckets ? total_buckets - 1 : my_timestamps + fanwei;
 
@@ -799,7 +800,9 @@ void build_global_remote_edges(const float* d_dataset,
                                uint32_t* d_graph,
                                uint64_t* d_ts,
                                uint32_t total_degree,
-                               uint32_t local_degree)
+                               uint32_t local_degree,
+                               uint32_t remote_pq_m,
+                               uint32_t remote_nprobe)
 {
     // std::cout << ">> [CAGRA Global] Building Remote Edges (Direct GPU FAISS)..." << std::endl;
 
@@ -814,7 +817,14 @@ void build_global_remote_edges(const float* d_dataset,
     nlist = std::max(1, std::min((int)num_dataset, nlist));
     
     // PQ 配置
-    int M = 32; // 子量化器数量 (1024 / 32 = 32维一个子段)
+    if (remote_pq_m == 0) remote_pq_m = 32;
+    if (dim % remote_pq_m != 0) {
+        std::cout << "   [Warn] remote_pq_m=" << remote_pq_m
+                  << " does not divide dim=" << dim
+                  << ", falling back to 32." << std::endl;
+        remote_pq_m = 32;
+    }
+    int M = static_cast<int>(remote_pq_m); // 子量化器数量
     int nbits = 8;
 
     // 2. 初始化 FAISS 资源
@@ -823,41 +833,92 @@ void build_global_remote_edges(const float* d_dataset,
 
     faiss::gpu::GpuIndexIVFPQConfig config;
     config.device = CUDA_DEVICE_ID; // 确保与当前上下文一致
+    config.useFloat16LookupTables = (remote_pq_m >= 64);
 
     // 3. 构建并训练索引
     // 注意：faiss::METRIC_L2
     faiss::gpu::GpuIndexIVFPQ index(&res, dim, nlist, M, nbits, faiss::METRIC_L2, config);
     
     // d_dataset 已经在 GPU 上，直接传
+    printf("Training IVF-PQ index with nlist %d, M %d, nbits %d on %zu vectors...\n", nlist, M, nbits, num_dataset);
     index.train(num_dataset, d_dataset);
     index.add(num_dataset, d_dataset);
 
     // 设置探测桶数，平衡速度和精度
-    index.nprobe = (std::min(nlist, 100));
+    constexpr int kMaxGpuIvfNprobe = 2048;
+    int requested_nprobe = remote_nprobe == 0 ? kMaxGpuIvfNprobe : static_cast<int>(remote_nprobe);
+    index.nprobe = std::max(1, std::min(nlist, requested_nprobe));
+    std::cout << "Remote IVF-PQ params: nlist=" << nlist
+              << ", nprobe=" << index.nprobe
+              << ", M=" << M
+              << ", nbits=" << nbits << std::endl;
 
-    // 4. 执行全量搜索 (Self-Search)
-    // 申请输出显存
-    int64_t* d_global_indices;
-    float* d_global_dists;
-    CUDA_CHECK(cudaSetDevice(CUDA_DEVICE_ID));
-    CUDA_CHECK(cudaMalloc(&d_global_indices, num_dataset * global_k * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_global_dists, num_dataset * global_k * sizeof(float)));
+    // // 4. 执行全量搜索 (Self-Search)
+    // // 申请输出显存
+    // int64_t* d_global_indices;
+    // float* d_global_dists;
+    // CUDA_CHECK(cudaSetDevice(CUDA_DEVICE_ID));
+    // CUDA_CHECK(cudaMalloc(&d_global_indices, num_dataset * global_k * sizeof(int64_t)));
+    // CUDA_CHECK(cudaMalloc(&d_global_dists, num_dataset * global_k * sizeof(float)));
 
-    // d_dataset 既是库也是查询
-    index.search(num_dataset, d_dataset, global_k, d_global_dists, d_global_indices);
+    // // d_dataset 既是库也是查询
+    // printf("starting global search with global_k %u\n", global_k);
 
-    // 申请精排后的缓冲区 (uint32 类型，直接适配后续 Kernel)
+    // uint32_t faiss_batch_size = 100000; // 分批处理，防止显存爆炸
+    // for (size_t offset = 0; offset < num_dataset; offset += faiss_batch_size) {
+    //     size_t current_batch_size = std::min(faiss_batch_size, (uint32_t)(num_dataset - offset));
+    //     printf("  searching batch offset %zu, size %zu\n", offset, current_batch_size);
+    //     index.search(current_batch_size,
+    //                  d_dataset + offset * dim,
+    //                  global_k,
+    //                  d_global_dists + offset * global_k,
+    //                  d_global_indices + offset * global_k);
+    // }
+
+    // // index.search(num_dataset, d_dataset, global_k, d_global_dists, d_global_indices);
+
+    // // 申请精排后的缓冲区 (uint32 类型，直接适配后续 Kernel)
+    // uint32_t* d_refined_indices;
+    // float* d_refined_dists;
+    // CUDA_CHECK(cudaMalloc(&d_refined_indices, num_dataset * global_k * sizeof(uint32_t)));
+    // CUDA_CHECK(cudaMalloc(&d_refined_dists, num_dataset * global_k * sizeof(float)));
+
+    // // 调用精排函数
+    // refine_search_results(d_dataset, num_dataset, dim, 
+    //                       d_global_indices, // 输入 (int64)
+    //                       d_refined_indices,    // 输出 (uint32)
+    //                       d_refined_dists,      // 输出 (Exact L2)
+    //                       global_k);
+
+    // 按找batch来进行search，只对精排后的结果提前分配空间
     uint32_t* d_refined_indices;
     float* d_refined_dists;
     CUDA_CHECK(cudaMalloc(&d_refined_indices, num_dataset * global_k * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_refined_dists, num_dataset * global_k * sizeof(float)));
 
-    // 调用精排函数
-    refine_search_results(d_dataset, num_dataset, dim, 
-                          d_global_indices, // 输入 (int64)
-                          d_refined_indices,    // 输出 (uint32)
-                          d_refined_dists,      // 输出 (Exact L2)
-                          global_k);
+    size_t faiss_batch_size = 500000; // 分批处理，防止显存爆炸
+    int64_t* d_global_indices;
+    float* d_global_dists;
+    CUDA_CHECK(cudaSetDevice(CUDA_DEVICE_ID));
+    CUDA_CHECK(cudaMalloc(&d_global_indices, faiss_batch_size * global_k * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_global_dists, faiss_batch_size * global_k * sizeof(float)));
+
+    for (size_t offset = 0; offset < num_dataset; offset += faiss_batch_size) {
+        size_t current_batch_size = std::min((uint32_t)faiss_batch_size, (uint32_t)(num_dataset - offset));
+        printf("  searching batch offset %zu, size %zu, nprobe is %d\n", offset, current_batch_size, index.nprobe);
+        index.search(current_batch_size,
+                     d_dataset + offset * dim,
+                     global_k,
+                     d_global_dists,
+                     d_global_indices);
+
+        // 精排当前批次结果
+        refine_search_results(d_dataset + offset * dim, current_batch_size, dim,
+                              d_global_indices,
+                              d_refined_indices + offset * global_k,
+                              d_refined_dists + offset * global_k,
+                              global_k);
+    }
 
     // 释放原始 FAISS 结果，省点显存
     CUDA_CHECK(cudaFree(d_global_indices));
@@ -932,8 +993,11 @@ void build_time_partitioned_graph(const float* d_dataset,
                                   uint64_t* d_ts,
                                   uint64_t* h_ts,
                                   const std::vector<size_t>& bucket_sizes,
-                                  uint32_t total_degree,   // 32
-                                  uint32_t local_degree)   // 28
+                                  uint32_t total_degree,   // 
+                                  uint32_t local_degree,    // 
+                                  uint32_t intermediate_degree,
+                                  uint32_t remote_pq_m,
+                                  uint32_t remote_nprobe)
 {
     std::cout << ">> [CAGRA Build] Starting Time-Partitioned Build (Overwrite Strategy) with dim " << dim << " ..." << std::endl;
     std::cout << "local_degree: " << local_degree << ", total_degree: " << total_degree << std::endl;
@@ -943,7 +1007,15 @@ void build_time_partitioned_graph(const float* d_dataset,
     size_t current_offset = 0;
     
     // KNN 搜索的 K 值，通常比图度数大，用于剪枝
-    uint32_t intermediate_degree = total_degree * 2; 
+    if (intermediate_degree < total_degree) {
+        intermediate_degree = total_degree;
+    }
+    if (intermediate_degree > 512) {
+        std::cout << "   [Warn] intermediate_degree=" << intermediate_degree
+                  << " exceeds prune kernel limit 512, capping to 512." << std::endl;
+        intermediate_degree = 512;
+    }
+    std::cout << "intermediate_degree: " << intermediate_degree << std::endl;
 
 
     // TODO 重构，添加并行度优化
@@ -1028,7 +1100,7 @@ void build_time_partitioned_graph(const float* d_dataset,
                               cudaMemcpyDeviceToHost));
 
         CUDA_CHECK(cudaFree(d_global_knn));
-        
+
         // 主机测更新local index 到 global index
         std::vector<uint32_t> bucket_offsets(bucket_sizes.size() + 1, 0);
         for (size_t i = 1; i <= bucket_sizes.size(); ++i) {
@@ -1089,6 +1161,21 @@ void build_time_partitioned_graph(const float* d_dataset,
                               cudaMemcpyHostToDevice));
     }
 
+    // 在此处，我们临时保存一下当前构建的图，用于 Debug
+    std::string save_path = "bucket_graph.bin";
+    // 同步d_graph到主机
+    std::vector<uint32_t> h_temp_graph(total_num * total_degree);
+    CUDA_CHECK(cudaMemcpy(h_temp_graph.data(), d_graph,
+                          total_num * total_degree * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    std::ofstream out_file(save_path, std::ios::binary);
+    if (!out_file) {
+        std::cerr << "Error opening file for writing." << std::endl;
+    } else {
+        out_file.write(reinterpret_cast<const char*>(h_temp_graph.data()), total_num * total_degree * sizeof(uint32_t));
+        out_file.close();
+        std::cout << "Graph saved to " << save_path << std::endl;
+    }
 
     // 2. [Global Phase] 覆盖 Remote Edges
     // 这一步会找到全局最近邻，并从第 local_degree (28) 列开始写入
@@ -1100,7 +1187,9 @@ void build_time_partitioned_graph(const float* d_dataset,
                               d_graph,
                               d_ts,
                               total_degree, 
-                              local_degree); // 传入 28，表示前 28 个受保护
+                              local_degree, // 
+                              remote_pq_m,
+                              remote_nprobe);
 
     std::cout << ">> [CAGRA Build] Construction Complete." << std::endl;
 }
@@ -1720,7 +1809,7 @@ void insert(const float* d_dataset,
         // 注意：只在 num_existing (老数据) 范围内搜索
         #pragma omp section
         {
-            bool use_cagra_opt = true;
+            bool use_cagra_opt = false;
             if (use_cagra_opt) {
                 search_opt(
                     d_dataset, 
