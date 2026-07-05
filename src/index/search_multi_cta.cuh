@@ -44,6 +44,8 @@ void search_multi_cta_range_opt(const float* d_dataset,
 
 uint32_t resolve_multi_cta_count(int64_t k, SearchParams params, uint32_t num_cta_per_query = 0);
 
+uint32_t resolve_multi_cta_local_topk();
+
 size_t multi_cta_intermediate_count(int64_t num_queries, uint32_t num_cta_per_query);
 
 size_t multi_cta_hash_count(int64_t num_queries, uint32_t num_cta_per_query, uint32_t hash_bitlen);
@@ -74,7 +76,8 @@ void search_multi_cta_opt_preallocated(const float* d_dataset,
                                        uint64_t end_bucket = 0,
                                        cudaStream_t stream = 0,
                                        float* profile_ms = nullptr,
-                                       bool run_merge = true);
+                                       bool run_merge = true,
+                                       uint64_t* d_stage_profile = nullptr);
 
 void merge_multi_cta_results(uint32_t* d_intermediate_indices,
                              const float* d_intermediate_dists,
@@ -83,6 +86,7 @@ void merge_multi_cta_results(uint32_t* d_intermediate_indices,
                              int64_t num_queries,
                              int64_t k,
                              uint32_t num_cta_per_query,
+                             uint32_t local_topk,
                              cudaStream_t stream = 0,
                              float* profile_ms = nullptr);
 

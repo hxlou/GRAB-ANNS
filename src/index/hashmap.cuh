@@ -108,6 +108,76 @@ __device__ __forceinline__ bool search(const uint32_t* table, const uint32_t bit
     return false;
 }
 
+__device__ __forceinline__ bool insert_support_remove(uint32_t* table,
+                                                       const uint32_t bitlen,
+                                                       const uint32_t key) {
+    const uint32_t size = compute_size(bitlen);
+    const uint32_t mask = size - 1;
+    const uint32_t removed_key = key | 0x80000000u;
+    uint32_t index = hash_func(key, bitlen) & mask;
+
+    for (uint32_t i = 0; i < size; i++) {
+        uint32_t old = atomicCAS(&table[index], INVALID_KEY, key);
+        if (old == INVALID_KEY) {
+            return true;
+        }
+        if (old == key) {
+            return false;
+        }
+        old = atomicCAS(&table[index], removed_key, key);
+        if (old == removed_key) {
+            return true;
+        }
+        if (old == key) {
+            return false;
+        }
+        index = (index + 1) & mask;
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool search_support_remove(const uint32_t* table,
+                                                       const uint32_t bitlen,
+                                                       const uint32_t key) {
+    const uint32_t size = compute_size(bitlen);
+    const uint32_t mask = size - 1;
+    const uint32_t removed_key = key | 0x80000000u;
+    uint32_t index = hash_func(key, bitlen) & mask;
+
+    for (uint32_t i = 0; i < size; i++) {
+        uint32_t old = table[index];
+        if (old == key) {
+            return true;
+        }
+        if (old == INVALID_KEY || old == removed_key) {
+            return false;
+        }
+        index = (index + 1) & mask;
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool remove(uint32_t* table,
+                                        const uint32_t bitlen,
+                                        const uint32_t key) {
+    const uint32_t size = compute_size(bitlen);
+    const uint32_t mask = size - 1;
+    const uint32_t removed_key = key | 0x80000000u;
+    uint32_t index = hash_func(key, bitlen) & mask;
+
+    for (uint32_t i = 0; i < size; i++) {
+        uint32_t old = atomicCAS(&table[index], key, removed_key);
+        if (old == key) {
+            return true;
+        }
+        if (old == INVALID_KEY) {
+            return false;
+        }
+        index = (index + 1) & mask;
+    }
+    return false;
+}
+
 /**
  * @brief 重置后恢复 Hash 表 (Restore)
  * 

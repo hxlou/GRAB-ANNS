@@ -12,6 +12,20 @@
 
 namespace cagra {
 
+namespace {
+size_t align_up_size(size_t value, size_t alignment = 256) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+template <typename T>
+T* carve_device_buffer(char*& cursor, size_t count) {
+    cursor = reinterpret_cast<char*>(align_up_size(reinterpret_cast<uintptr_t>(cursor)));
+    T* ptr = reinterpret_cast<T*>(cursor);
+    cursor += align_up_size(count * sizeof(T));
+    return ptr;
+}
+} // namespace
+
 // =============================================================================
 // 构造与析构
 // =============================================================================
@@ -46,7 +60,19 @@ CagraIndexOpt::CagraIndexOpt(uint32_t dim, uint32_t graph_degree, uint32_t local
 CagraIndexOpt::~CagraIndexOpt() {
     // 智能指针会自动释放 VMM 资源 (cuMemAddressFree 等)
     // vector 和 map 也会自动析构
-    // 无需手动操作
+    if (single_cta_scratch_ != nullptr) {
+        CUDA_CHECK(cudaFree(single_cta_scratch_));
+    }
+}
+
+void CagraIndexOpt::reserveSingleCtaScratch(size_t bytes) {
+    bytes = align_up_size(bytes);
+    if (bytes <= single_cta_scratch_bytes_) return;
+    if (single_cta_scratch_ != nullptr) {
+        CUDA_CHECK(cudaFree(single_cta_scratch_));
+    }
+    CUDA_CHECK(cudaMalloc(&single_cta_scratch_, bytes));
+    single_cta_scratch_bytes_ = bytes;
 }
 
 // =============================================================================
@@ -238,16 +264,31 @@ void CagraIndexOpt::query(const float* host_queries,
 {
     if (current_size_ == 0) return;
 
-    // 1. 准备 Device 内存
-    float* d_queries;
-    int64_t* d_indices;
-    float* d_dists;
-    uint32_t* d_seeds = nullptr;
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = (seeds != nullptr && num_seeds_per_query > 0)
+                                ? num_queries * num_seeds_per_query
+                                : 0;
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
 
-    // 申请显存
-    CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_dists, num_queries * k * sizeof(float)));
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(int64_t));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    int64_t* d_indices = carve_device_buffer<int64_t>(scratch, result_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = seed_count > 0 ? carve_device_buffer<uint32_t>(scratch, seed_count) : nullptr;
+    uint32_t* d_out_indices_u32 = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
 
     // 拷贝查询向量
     CUDA_CHECK(cudaMemcpy(d_queries, host_queries, 
@@ -257,7 +298,6 @@ void CagraIndexOpt::query(const float* host_queries,
     // 处理种子 (如果有)
     if (seeds != nullptr && num_seeds_per_query > 0) {
         size_t seeds_bytes = num_queries * num_seeds_per_query * sizeof(uint32_t);
-        CUDA_CHECK(cudaMalloc(&d_seeds, seeds_bytes));
         CUDA_CHECK(cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice));
     }
 
@@ -267,7 +307,7 @@ void CagraIndexOpt::query(const float* host_queries,
 
     // 3. 调用底层无状态算法 (search_opt)
     // 这里我们只进行全量搜索，不传 timestamp 相关的参数
-    cagra::search_opt(
+    cagra::search_opt_preallocated(
         d_dataset,
         dim_,
         current_size_, 
@@ -276,7 +316,9 @@ void CagraIndexOpt::query(const float* host_queries,
         d_queries, 
         (int64_t)num_queries, 
         (int64_t)k, 
-        search_params_, 
+        search_params_,
+        d_out_indices_u32,
+        d_pre_hashmap,
         d_indices, 
         d_dists,
         d_seeds,            // 传入 GPU 上的种子指针
@@ -291,11 +333,79 @@ void CagraIndexOpt::query(const float* host_queries,
                           num_queries * k * sizeof(float), 
                           cudaMemcpyDeviceToHost));
 
-    // 5. 清理
-    CUDA_CHECK(cudaFree(d_queries));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_dists));
-    if (d_seeds) CUDA_CHECK(cudaFree(d_seeds));
+    // scratch buffer is owned by the index and reused by later single-CTA queries.
+}
+
+void CagraIndexOpt::query_u32(const float* host_queries,
+                              size_t num_queries,
+                              int k,
+                              uint32_t* host_indices,
+                              float* host_dists,
+                              const uint32_t* seeds,
+                              size_t num_seeds_per_query)
+{
+    if (current_size_ == 0) return;
+
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = (seeds != nullptr && num_seeds_per_query > 0)
+                                ? num_queries * num_seeds_per_query
+                                : 0;
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
+
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = seed_count > 0 ? carve_device_buffer<uint32_t>(scratch, seed_count) : nullptr;
+    uint32_t* d_indices = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
+
+    CUDA_CHECK(cudaMemcpy(d_queries, host_queries,
+                          query_count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    if (seeds != nullptr && num_seeds_per_query > 0) {
+        CUDA_CHECK(cudaMemcpy(d_seeds, seeds,
+                              seed_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice));
+    }
+
+    float* d_dataset = (float*)d_data_vmm_->data();
+    uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
+
+    cagra::search_opt_preallocated_u32(
+        d_dataset,
+        dim_,
+        current_size_,
+        d_graph,
+        graph_degree_,
+        d_queries,
+        (int64_t)num_queries,
+        (int64_t)k,
+        search_params_,
+        d_indices,
+        d_pre_hashmap,
+        d_dists,
+        d_seeds,
+        num_seeds_per_query
+    );
+
+    CUDA_CHECK(cudaMemcpy(host_indices, d_indices,
+                          result_count * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_dists, d_dists,
+                          result_count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
 }
 
 void CagraIndexOpt::query_multi_cta(const float* host_queries,
@@ -379,9 +489,12 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     double d2h_ms = 0.0;
     double free_ms = 0.0;
     float kernel_profile_ms[3] = {0.0f, 0.0f, 0.0f}; // hashmap, search, merge
+    bool stage_profile_enabled = std::getenv("CAGRA_MULTI_CTA_STAGE_PROFILE") != nullptr;
+    std::vector<uint64_t> stage_profile_total(10, 0);
 
     num_cta_per_query = cagra::resolve_multi_cta_count(
         static_cast<int64_t>(k), search_params_, num_cta_per_query);
+    uint32_t local_topk = cagra::resolve_multi_cta_local_topk();
 
     float* d_queries = nullptr;
     int64_t* d_indices = nullptr;
@@ -390,6 +503,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     float* d_intermediate_dists = nullptr;
     uint32_t* d_pre_hashmap = nullptr;
     uint32_t* d_traversed_hashmap = nullptr;
+    uint64_t* d_stage_profile = nullptr;
 
     auto t0 = now();
     CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
@@ -408,8 +522,8 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     h2d_ms += ms_since(t0, t1);
 
     t0 = now();
-    size_t intermediate_count = cagra::multi_cta_intermediate_count(
-        static_cast<int64_t>(num_queries), num_cta_per_query);
+    size_t per_query_intermediate = cagra::multi_cta_intermediate_count(1, num_cta_per_query);
+    size_t intermediate_count = per_query_intermediate * num_queries;
     CUDA_CHECK(cudaMalloc(&d_intermediate_indices, intermediate_count * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_intermediate_dists, intermediate_count * sizeof(float)));
 
@@ -419,6 +533,10 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     }
     size_t traversed_hash_count = cagra::multi_cta_traversed_hash_count(1, search_params_.hash_bitlen);
     CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
+    if (stage_profile_enabled) {
+        CUDA_CHECK(cudaMalloc(&d_stage_profile,
+                              static_cast<size_t>(num_cta_per_query) * 10 * sizeof(uint64_t)));
+    }
     t1 = now();
     alloc_ms += ms_since(t0, t1);
 
@@ -440,8 +558,8 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
             search_params_,
             d_indices + q * k,
             d_dists + q * k,
-            d_intermediate_indices + cagra::multi_cta_intermediate_count(1, num_cta_per_query) * q,
-            d_intermediate_dists + cagra::multi_cta_intermediate_count(1, num_cta_per_query) * q,
+            d_intermediate_indices + per_query_intermediate * q,
+            d_intermediate_dists + per_query_intermediate * q,
             d_pre_hashmap,
             d_traversed_hashmap,
             nullptr,
@@ -453,7 +571,20 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
             0,
             0,
             profile ? kernel_profile_ms : nullptr,
-            false);
+            false,
+            d_stage_profile);
+        if (stage_profile_enabled) {
+            std::vector<uint64_t> stage_one(static_cast<size_t>(num_cta_per_query) * 10);
+            CUDA_CHECK(cudaMemcpy(stage_one.data(),
+                                  d_stage_profile,
+                                  stage_one.size() * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost));
+            for (uint32_t cta = 0; cta < num_cta_per_query; ++cta) {
+                for (uint32_t s = 0; s < 10; ++s) {
+                    stage_profile_total[s] += stage_one[static_cast<size_t>(cta) * 10 + s];
+                }
+            }
+        }
     }
 
     cagra::merge_multi_cta_results(d_intermediate_indices,
@@ -463,6 +594,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
                                    static_cast<int64_t>(num_queries),
                                    static_cast<int64_t>(k),
                                    num_cta_per_query,
+                                   local_topk,
                                    0,
                                    profile ? kernel_profile_ms : nullptr);
 
@@ -491,6 +623,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
     CUDA_CHECK(cudaFree(d_traversed_hashmap));
+    if (d_stage_profile) CUDA_CHECK(cudaFree(d_stage_profile));
     t1 = now();
     free_ms = ms_since(t0, t1);
 
@@ -504,7 +637,7 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
                   << " iter=" << search_params_.max_iterations
                   << " hash_bitlen=" << search_params_.hash_bitlen
                   << " cta_per_query=" << num_cta_per_query
-                  << " block_size=" << (block_env ? block_env : "256")
+                  << " block_size=" << (block_env ? block_env : "1024")
                   << " alloc_ms=" << alloc_ms
                   << " h2d_ms=" << h2d_ms
                   << " kernel_wall_ms=" << search_wall_ms
@@ -514,6 +647,21 @@ void CagraIndexOpt::query_multi_cta_many_single(const float* host_queries,
                   << " d2h_ms=" << d2h_ms
                   << " free_ms=" << free_ms
                   << std::endl;
+        if (stage_profile_enabled) {
+            double denom = static_cast<double>(num_queries) * num_cta_per_query;
+            std::cout << "[multi_cta_stage_profile]"
+                      << " avg_cta_cycles_sort=" << stage_profile_total[0] / denom
+                      << " avg_cta_cycles_pickup=" << stage_profile_total[1] / denom
+                      << " avg_cta_cycles_restore=" << stage_profile_total[2] / denom
+                      << " avg_cta_cycles_child=" << stage_profile_total[3] / denom
+                      << " avg_cta_cycles_cleanup=" << stage_profile_total[4] / denom
+                      << " avg_cta_cycles_final_sort=" << stage_profile_total[5] / denom
+                      << " avg_cta_cycles_child_graph=" << stage_profile_total[6] / denom
+                      << " avg_cta_cycles_child_hash=" << stage_profile_total[7] / denom
+                      << " avg_cta_cycles_child_dist=" << stage_profile_total[8] / denom
+                      << " avg_cta_cycles_child_write=" << stage_profile_total[9] / denom
+                      << std::endl;
+        }
     }
 }
 
@@ -530,6 +678,7 @@ void CagraIndexOpt::query_multi_cta_range(const float* host_queries,
 
     num_cta_per_query = cagra::resolve_multi_cta_count(
         static_cast<int64_t>(k), search_params_, num_cta_per_query);
+    uint32_t local_topk = cagra::resolve_multi_cta_local_topk();
 
     uint32_t seeds_per_query = std::max(32u, num_cta_per_query * 32u);
     std::vector<uint32_t> candidates;
@@ -634,12 +783,27 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
                                                       uint64_t end_bucket,
                                                       int64_t* host_indices,
                                                       float* host_dists,
-                                                      uint32_t num_cta_per_query)
+                                                      uint32_t num_cta_per_query,
+                                                      bool profile)
 {
     if (current_size_ == 0 || num_queries == 0) return;
 
+    auto now = []() { return std::chrono::high_resolution_clock::now(); };
+    auto ms_since = [](const auto& start, const auto& end) {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    };
+    double alloc_ms = 0.0;
+    double h2d_ms = 0.0;
+    double search_wall_ms = 0.0;
+    double d2h_ms = 0.0;
+    double free_ms = 0.0;
+    float kernel_profile_ms[3] = {0.0f, 0.0f, 0.0f};
+    bool stage_profile_enabled = std::getenv("CAGRA_MULTI_CTA_STAGE_PROFILE") != nullptr;
+    std::vector<uint64_t> stage_profile_total(10, 0);
+
     num_cta_per_query = cagra::resolve_multi_cta_count(
         static_cast<int64_t>(k), search_params_, num_cta_per_query);
+    uint32_t local_topk = cagra::resolve_multi_cta_local_topk();
 
     uint32_t seeds_per_query = std::max(32u, num_cta_per_query * 32u);
     std::vector<uint32_t> candidates;
@@ -686,15 +850,25 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     float* d_intermediate_dists = nullptr;
     uint32_t* d_pre_hashmap = nullptr;
     uint32_t* d_traversed_hashmap = nullptr;
+    uint64_t* d_stage_profile = nullptr;
 
+    auto t0 = now();
     CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&d_dists, num_queries * k * sizeof(float)));
+    auto t1 = now();
+    alloc_ms += ms_since(t0, t1);
+
+    t0 = now();
     CUDA_CHECK(cudaMemcpy(d_queries,
                           host_queries,
                           num_queries * dim_ * sizeof(float),
                           cudaMemcpyHostToDevice));
+    if (profile) CUDA_CHECK(cudaDeviceSynchronize());
+    t1 = now();
+    h2d_ms += ms_since(t0, t1);
 
+    t0 = now();
     CUDA_CHECK(cudaMalloc(&d_seeds, sampled_seeds.size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_seeds,
                           sampled_seeds.data(),
@@ -712,12 +886,19 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     }
     size_t traversed_hash_count = cagra::multi_cta_traversed_hash_count(1, search_params_.hash_bitlen);
     CUDA_CHECK(cudaMalloc(&d_traversed_hashmap, traversed_hash_count * sizeof(uint32_t)));
+    if (stage_profile_enabled) {
+        CUDA_CHECK(cudaMalloc(&d_stage_profile,
+                              static_cast<size_t>(num_cta_per_query) * 10 * sizeof(uint64_t)));
+    }
+    t1 = now();
+    alloc_ms += ms_since(t0, t1);
 
     const float* d_dataset = (float*)d_data_vmm_->data();
     const uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
     const uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
     constexpr uint64_t base_mask = 0x9e3779b97f4a7c15ULL;
 
+    t0 = now();
     for (size_t q = 0; q < num_queries; ++q) {
         cagra::search_multi_cta_opt_preallocated(
             d_dataset,
@@ -743,8 +924,21 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
             start_bucket,
             end_bucket,
             0,
-            nullptr,
-            false);
+            profile ? kernel_profile_ms : nullptr,
+            false,
+            d_stage_profile);
+        if (stage_profile_enabled) {
+            std::vector<uint64_t> stage_one(static_cast<size_t>(num_cta_per_query) * 10);
+            CUDA_CHECK(cudaMemcpy(stage_one.data(),
+                                  d_stage_profile,
+                                  stage_one.size() * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost));
+            for (uint32_t cta = 0; cta < num_cta_per_query; ++cta) {
+                for (uint32_t s = 0; s < 10; ++s) {
+                    stage_profile_total[s] += stage_one[static_cast<size_t>(cta) * 10 + s];
+                }
+            }
+        }
     }
 
     cagra::merge_multi_cta_results(d_intermediate_indices,
@@ -753,9 +947,16 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
                                    d_dists,
                                    static_cast<int64_t>(num_queries),
                                    static_cast<int64_t>(k),
-                                   num_cta_per_query);
+                                   num_cta_per_query,
+                                   local_topk,
+                                   0,
+                                   profile ? kernel_profile_ms : nullptr);
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    t1 = now();
+    search_wall_ms = ms_since(t0, t1);
+
+    t0 = now();
     CUDA_CHECK(cudaMemcpy(host_indices,
                           d_indices,
                           num_queries * k * sizeof(int64_t),
@@ -764,7 +965,11 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
                           d_dists,
                           num_queries * k * sizeof(float),
                           cudaMemcpyDeviceToHost));
+    if (profile) CUDA_CHECK(cudaDeviceSynchronize());
+    t1 = now();
+    d2h_ms = ms_since(t0, t1);
 
+    t0 = now();
     CUDA_CHECK(cudaFree(d_queries));
     CUDA_CHECK(cudaFree(d_indices));
     CUDA_CHECK(cudaFree(d_dists));
@@ -773,6 +978,48 @@ void CagraIndexOpt::query_multi_cta_range_many_single(const float* host_queries,
     CUDA_CHECK(cudaFree(d_intermediate_dists));
     if (d_pre_hashmap) CUDA_CHECK(cudaFree(d_pre_hashmap));
     CUDA_CHECK(cudaFree(d_traversed_hashmap));
+    if (d_stage_profile) CUDA_CHECK(cudaFree(d_stage_profile));
+    t1 = now();
+    free_ms = ms_since(t0, t1);
+
+    if (profile) {
+        const char* block_env = std::getenv("CAGRA_MULTI_CTA_BLOCK_SIZE");
+        std::cout << "[multi_cta_range_profile]"
+                  << " queries=" << num_queries
+                  << " k=" << k
+                  << " range=[" << start_bucket << "," << end_bucket << ")"
+                  << " seeds=" << actual_seeds_count
+                  << " itopk=" << search_params_.itopk_size
+                  << " width=" << search_params_.search_width
+                  << " iter=" << search_params_.max_iterations
+                  << " hash_bitlen=" << search_params_.hash_bitlen
+                  << " cta_per_query=" << num_cta_per_query
+                  << " block_size=" << (block_env ? block_env : "1024")
+                  << " alloc_ms=" << alloc_ms
+                  << " h2d_ms=" << h2d_ms
+                  << " kernel_wall_ms=" << search_wall_ms
+                  << " hashmap_ms=" << kernel_profile_ms[0]
+                  << " search_kernel_ms=" << kernel_profile_ms[1]
+                  << " merge_kernel_ms=" << kernel_profile_ms[2]
+                  << " d2h_ms=" << d2h_ms
+                  << " free_ms=" << free_ms
+                  << std::endl;
+        if (stage_profile_enabled) {
+            double denom = static_cast<double>(num_queries) * num_cta_per_query;
+            std::cout << "[multi_cta_stage_profile]"
+                      << " avg_cta_cycles_sort=" << stage_profile_total[0] / denom
+                      << " avg_cta_cycles_pickup=" << stage_profile_total[1] / denom
+                      << " avg_cta_cycles_restore=" << stage_profile_total[2] / denom
+                      << " avg_cta_cycles_child=" << stage_profile_total[3] / denom
+                      << " avg_cta_cycles_cleanup=" << stage_profile_total[4] / denom
+                      << " avg_cta_cycles_final_sort=" << stage_profile_total[5] / denom
+                      << " avg_cta_cycles_child_graph=" << stage_profile_total[6] / denom
+                      << " avg_cta_cycles_child_hash=" << stage_profile_total[7] / denom
+                      << " avg_cta_cycles_child_dist=" << stage_profile_total[8] / denom
+                      << " avg_cta_cycles_child_write=" << stage_profile_total[9] / denom
+                      << std::endl;
+        }
+    }
 }
 
 // ...
@@ -830,16 +1077,29 @@ void CagraIndexOpt::query_local(const float* host_queries,
         return;
     }
 
-    // 2. 准备 Device 内存
-    // -----------------------------------------------------
-    float* d_queries;
-    int64_t* d_indices;
-    float* d_dists;
-    uint32_t* d_seeds;
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = num_queries * static_cast<size_t>(actual_seeds_count);
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
 
-    CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_dists, num_queries * k * sizeof(float)));
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(int64_t));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    int64_t* d_indices = carve_device_buffer<int64_t>(scratch, result_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = carve_device_buffer<uint32_t>(scratch, seed_count);
+    uint32_t* d_out_indices_u32 = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
 
     // 拷贝查询
     CUDA_CHECK(cudaMemcpy(d_queries, host_queries, 
@@ -861,8 +1121,10 @@ void CagraIndexOpt::query_local(const float* host_queries,
     }
 
     size_t seeds_bytes = batch_seeds.size() * sizeof(uint32_t);
-    CUDA_CHECK(cudaMalloc(&d_seeds, seeds_bytes));
     CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(), seeds_bytes, cudaMemcpyHostToDevice));
+    if (d_pre_hashmap != nullptr) {
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
+    }
 
     // 3. 获取 VMM 指针
     float* d_dataset = (float*)d_data_vmm_->data();
@@ -870,7 +1132,7 @@ void CagraIndexOpt::query_local(const float* host_queries,
 
     // 4. 调用底层 search_bucket_opt
     // -----------------------------------------------------
-    cagra::search_bucket_opt(
+    cagra::search_bucket_opt_preallocated(
         d_dataset, 
         dim_,
         current_size_, 
@@ -880,7 +1142,9 @@ void CagraIndexOpt::query_local(const float* host_queries,
         d_queries, 
         (int64_t)num_queries, 
         (int64_t)k, 
-        search_params_, 
+        search_params_,
+        d_out_indices_u32,
+        d_pre_hashmap,
         d_indices, 
         d_dists,
         d_seeds, 
@@ -895,11 +1159,112 @@ void CagraIndexOpt::query_local(const float* host_queries,
                           num_queries * k * sizeof(float), 
                           cudaMemcpyDeviceToHost));
 
-    // 6. 清理
-    CUDA_CHECK(cudaFree(d_queries));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_dists));
-    CUDA_CHECK(cudaFree(d_seeds));
+    // scratch buffer is owned by the index and reused by later single-CTA queries.
+}
+
+void CagraIndexOpt::query_local_u32(const float* host_queries,
+                                    size_t num_queries,
+                                    int k,
+                                    uint64_t target_timestamp,
+                                    uint32_t* host_indices,
+                                    float* host_dists,
+                                    uint32_t local_degree)
+{
+    if (current_size_ == 0) return;
+    local_degree = local_degree_;
+
+    std::vector<uint32_t> sampled_seeds;
+    uint32_t seeds_per_query = std::max(32u, search_params_.itopk_size);
+
+    {
+        auto it = ts_to_ids_.find(target_timestamp);
+        if (it != ts_to_ids_.end() && !it->second.empty()) {
+            const auto& bucket_ids = it->second;
+            if (bucket_ids.size() <= seeds_per_query) {
+                sampled_seeds = bucket_ids;
+            } else {
+                sampled_seeds.reserve(seeds_per_query);
+                std::mt19937 rng(std::random_device{}());
+                std::sample(bucket_ids.begin(), bucket_ids.end(),
+                            std::back_inserter(sampled_seeds),
+                            seeds_per_query, rng);
+            }
+        }
+    }
+
+    uint32_t actual_seeds_count = sampled_seeds.size();
+    if (actual_seeds_count == 0) {
+        std::fill(host_indices, host_indices + num_queries * static_cast<size_t>(k), UINT32_MAX);
+        std::fill(host_dists, host_dists + num_queries * static_cast<size_t>(k), -1.0f);
+        return;
+    }
+
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = num_queries * static_cast<size_t>(actual_seeds_count);
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
+
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = carve_device_buffer<uint32_t>(scratch, seed_count);
+    uint32_t* d_indices = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
+
+    CUDA_CHECK(cudaMemcpy(d_queries, host_queries,
+                          query_count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    std::vector<uint32_t> batch_seeds(seed_count);
+    for (size_t i = 0; i < num_queries; ++i) {
+        std::memcpy(batch_seeds.data() + i * actual_seeds_count,
+                    sampled_seeds.data(),
+                    actual_seeds_count * sizeof(uint32_t));
+    }
+    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(),
+                          seed_count * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+    if (d_pre_hashmap != nullptr) {
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
+    }
+
+    float* d_dataset = (float*)d_data_vmm_->data();
+    uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
+
+    cagra::search_bucket_opt_preallocated_u32(
+        d_dataset,
+        dim_,
+        current_size_,
+        d_graph,
+        graph_degree_,
+        local_degree,
+        d_queries,
+        (int64_t)num_queries,
+        (int64_t)k,
+        search_params_,
+        d_indices,
+        d_pre_hashmap,
+        d_dists,
+        d_seeds,
+        actual_seeds_count
+    );
+
+    CUDA_CHECK(cudaMemcpy(host_indices, d_indices,
+                          result_count * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_dists, d_dists,
+                          result_count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
 }
 
 // =============================================================================
@@ -970,14 +1335,29 @@ void CagraIndexOpt::query_range(const float* host_queries,
     // =========================================================
     // 2. 准备显存 (Queries & Seeds)
     // =========================================================
-    float* d_queries;
-    int64_t* d_indices;
-    float* d_dists;
-    uint32_t* d_seeds;
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = num_queries * static_cast<size_t>(actual_seeds_count);
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
 
-    CUDA_CHECK(cudaMalloc(&d_queries, num_queries * dim_ * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_indices, num_queries * k * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_dists, num_queries * k * sizeof(float)));
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(int64_t));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    int64_t* d_indices = carve_device_buffer<int64_t>(scratch, result_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = carve_device_buffer<uint32_t>(scratch, seed_count);
+    uint32_t* d_out_indices_u32 = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
     
     CUDA_CHECK(cudaMemcpy(d_queries, host_queries, 
                           num_queries * dim_ * sizeof(float), 
@@ -990,8 +1370,10 @@ void CagraIndexOpt::query_range(const float* host_queries,
                     sampled_seeds.data(), 
                     actual_seeds_count * sizeof(uint32_t));
     }
-    CUDA_CHECK(cudaMalloc(&d_seeds, batch_seeds.size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(), batch_seeds.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    if (d_pre_hashmap != nullptr) {
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
+    }
 
     // =========================================================
     // 3. 调用底层 Wrapper
@@ -1001,7 +1383,7 @@ void CagraIndexOpt::query_range(const float* host_queries,
     uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
 
     // 调用 cagra_opt.cu 中的 search_bucket_range
-    cagra::search_bucket_range(
+    cagra::search_bucket_range_preallocated(
         d_dataset,
         dim_,
         current_size_,
@@ -1015,6 +1397,8 @@ void CagraIndexOpt::query_range(const float* host_queries,
         start_bucket,
         end_bucket,
         search_params_,
+        d_out_indices_u32,
+        d_pre_hashmap,
         d_indices,
         d_dists,
         d_seeds,
@@ -1026,11 +1410,128 @@ void CagraIndexOpt::query_range(const float* host_queries,
     // =========================================================
     CUDA_CHECK(cudaMemcpy(host_indices, d_indices, num_queries * k * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(host_dists, d_dists, num_queries * k * sizeof(float), cudaMemcpyDeviceToHost));
+    // scratch buffer is owned by the index and reused by later single-CTA queries.
+}
 
-    CUDA_CHECK(cudaFree(d_queries));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_dists));
-    CUDA_CHECK(cudaFree(d_seeds));
+void CagraIndexOpt::query_range_u32(const float* host_queries,
+                                    size_t num_queries,
+                                    int k,
+                                    uint64_t start_bucket,
+                                    uint64_t end_bucket,
+                                    uint32_t* host_indices,
+                                    float* host_dists,
+                                    uint32_t local_degree)
+{
+    if (current_size_ == 0) return;
+    local_degree = local_degree_;
+
+    std::vector<uint32_t> sampled_seeds;
+    uint32_t seeds_per_query = std::max(32u, search_params_.itopk_size / 4);
+
+    {
+        auto it_start = ts_to_ids_.lower_bound(start_bucket);
+        auto it_end = ts_to_ids_.lower_bound(end_bucket);
+
+        uint32_t candidate_per_bucket = 500;
+        std::vector<uint32_t> candidates;
+        candidates.reserve((end_bucket - start_bucket) * candidate_per_bucket);
+
+        for (auto it = it_start; it != it_end; ++it) {
+            const auto& ids = it->second;
+            size_t take = std::min(ids.size(), (size_t)candidate_per_bucket);
+            candidates.insert(candidates.end(), ids.begin(), ids.begin() + take);
+        }
+
+        if (!candidates.empty()) {
+            std::mt19937 rng(std::random_device{}());
+            if (candidates.size() <= seeds_per_query) {
+                sampled_seeds = candidates;
+            } else {
+                sampled_seeds.reserve(seeds_per_query);
+                std::sample(candidates.begin(), candidates.end(),
+                            std::back_inserter(sampled_seeds),
+                            seeds_per_query, rng);
+            }
+        }
+    }
+
+    uint32_t actual_seeds_count = sampled_seeds.size();
+    if (actual_seeds_count == 0) {
+        std::fill(host_indices, host_indices + num_queries * static_cast<size_t>(k), UINT32_MAX);
+        std::fill(host_dists, host_dists + num_queries * static_cast<size_t>(k), -1.0f);
+        return;
+    }
+
+    const size_t query_count = num_queries * dim_;
+    const size_t result_count = num_queries * static_cast<size_t>(k);
+    const size_t seed_count = num_queries * static_cast<size_t>(actual_seeds_count);
+    const size_t hash_count = (search_params_.hash_bitlen > 13)
+                                ? num_queries * (1ull << search_params_.hash_bitlen)
+                                : 0;
+
+    size_t scratch_bytes = 0;
+    scratch_bytes += align_up_size(query_count * sizeof(float));
+    scratch_bytes += align_up_size(result_count * sizeof(float));
+    scratch_bytes += align_up_size(seed_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(result_count * sizeof(uint32_t));
+    scratch_bytes += align_up_size(hash_count * sizeof(uint32_t));
+    reserveSingleCtaScratch(scratch_bytes);
+
+    char* scratch = reinterpret_cast<char*>(single_cta_scratch_);
+    float* d_queries = carve_device_buffer<float>(scratch, query_count);
+    float* d_dists = carve_device_buffer<float>(scratch, result_count);
+    uint32_t* d_seeds = carve_device_buffer<uint32_t>(scratch, seed_count);
+    uint32_t* d_indices = carve_device_buffer<uint32_t>(scratch, result_count);
+    uint32_t* d_pre_hashmap = hash_count > 0 ? carve_device_buffer<uint32_t>(scratch, hash_count) : nullptr;
+
+    CUDA_CHECK(cudaMemcpy(d_queries, host_queries,
+                          query_count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    std::vector<uint32_t> batch_seeds(seed_count);
+    for (size_t i = 0; i < num_queries; ++i) {
+        std::memcpy(batch_seeds.data() + i * actual_seeds_count,
+                    sampled_seeds.data(),
+                    actual_seeds_count * sizeof(uint32_t));
+    }
+    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(),
+                          seed_count * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+    if (d_pre_hashmap != nullptr) {
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
+    }
+
+    float* d_dataset = (float*)d_data_vmm_->data();
+    uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
+    uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
+
+    cagra::search_bucket_range_preallocated_u32(
+        d_dataset,
+        dim_,
+        current_size_,
+        d_graph,
+        d_timestamps,
+        graph_degree_,
+        local_degree,
+        d_queries,
+        (int64_t)num_queries,
+        (int64_t)k,
+        start_bucket,
+        end_bucket,
+        search_params_,
+        d_indices,
+        d_pre_hashmap,
+        d_dists,
+        d_seeds,
+        actual_seeds_count
+    );
+
+    CUDA_CHECK(cudaMemcpy(host_indices, d_indices,
+                          result_count * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_dists, d_dists,
+                          result_count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
 }
 
 

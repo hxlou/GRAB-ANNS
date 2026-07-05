@@ -77,6 +77,14 @@ public:
                const uint32_t* seeds = nullptr,
                size_t num_seeds_per_query = 0);
 
+    void query_u32(const float* host_queries,
+                   size_t num_queries,
+                   int k,
+                   uint32_t* host_indices,
+                   float* host_dists,
+                   const uint32_t* seeds = nullptr,
+                   size_t num_seeds_per_query = 0);
+
     void query_multi_cta(const float* host_queries,
                          size_t num_queries,
                          int k,
@@ -110,7 +118,8 @@ public:
                                            uint64_t end_bucket,
                                            int64_t* host_indices,
                                            float* host_dists,
-                                           uint32_t num_cta_per_query = 0);
+                                           uint32_t num_cta_per_query = 0,
+                                           bool profile = false);
 
     void query_local(const float* host_queries, 
                         size_t num_queries, 
@@ -120,6 +129,14 @@ public:
                         float* host_dists,
                         uint32_t local_degree);
 
+    void query_local_u32(const float* host_queries,
+                         size_t num_queries,
+                         int k,
+                         uint64_t target_timestamp,
+                         uint32_t* host_indices,
+                         float* host_dists,
+                         uint32_t local_degree);
+
     void query_range(const float* host_queries, 
                         size_t num_queries, 
                         int k, 
@@ -128,6 +145,15 @@ public:
                         int64_t* host_indices, 
                         float* host_dists,
                         uint32_t local_degree);
+
+    void query_range_u32(const float* host_queries,
+                         size_t num_queries,
+                         int k,
+                         uint64_t start_bucket,
+                         uint64_t end_bucket,
+                         uint32_t* host_indices,
+                         float* host_dists,
+                         uint32_t local_degree);
 
     // --- 参数设置 ---
     void setBuildParams(uint32_t inter_degree, uint32_t graph_degree) {
@@ -206,6 +232,10 @@ private:
     SearchParams search_params_;
     double remote_edge_rate_;                                   // 
     size_t local_degree_;
+
+    void* single_cta_scratch_ = nullptr;
+    size_t single_cta_scratch_bytes_ = 0;
+    void reserveSingleCtaScratch(size_t bytes);
 };
 
 } // namespace cagra

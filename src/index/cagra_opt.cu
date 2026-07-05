@@ -1209,6 +1209,79 @@ void search_opt(const float* d_dataset,
             const uint32_t num_seeds_per_query,
             cudaStream_t stream
 ){
+    uint32_t topk = static_cast<uint32_t>(k);
+    uint32_t* d_out_indices_u32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+    uint32_t* d_pre_hashmap = nullptr;
+    if (params.hash_bitlen > 13) {
+        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
+        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
+    }
+
+    search_opt_preallocated(d_dataset, dim, num_dataset, d_graph, graph_degree,
+                            d_queries, num_queries, k, params,
+                            d_out_indices_u32, d_pre_hashmap,
+                            d_out_indices, d_out_dists,
+                            d_seeds, num_seeds_per_query, stream);
+
+    CUDA_CHECK(cudaFree(d_out_indices_u32));
+    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
+}
+
+void search_opt_preallocated(const float* d_dataset,
+            uint32_t dim,
+            size_t num_dataset,
+            const uint32_t* d_graph,
+            uint32_t graph_degree,
+            const float* d_queries,
+            int64_t num_queries,
+            int64_t k,
+            SearchParams params,
+            uint32_t* d_out_indices_u32,
+            uint32_t* d_pre_hashmap,
+            int64_t* d_out_indices,
+            float* d_out_dists,
+            const uint32_t* d_seeds,
+            const uint32_t num_seeds_per_query,
+            cudaStream_t stream
+){
+    search_opt_preallocated_u32(d_dataset, dim, num_dataset, d_graph, graph_degree,
+                                d_queries, num_queries, k, params,
+                                d_out_indices_u32, d_pre_hashmap,
+                                d_out_dists, d_seeds, num_seeds_per_query, stream);
+
+    uint32_t topk = static_cast<uint32_t>(k);
+    size_t total_elements = num_queries * topk;
+    size_t convert_block = 256;
+    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
+
+    cast_u32_to_i64_kernel<<<convert_grid, convert_block, 0, stream>>>(
+        d_out_indices_u32,
+        d_out_indices,
+        total_elements
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void search_opt_preallocated_u32(const float* d_dataset,
+            uint32_t dim,
+            size_t num_dataset,
+            const uint32_t* d_graph,
+            uint32_t graph_degree,
+            const float* d_queries,
+            int64_t num_queries,
+            int64_t k,
+            SearchParams params,
+            uint32_t* d_out_indices_u32,
+            uint32_t* d_pre_hashmap,
+            float* d_out_dists,
+            const uint32_t* d_seeds,
+            const uint32_t num_seeds_per_query,
+            cudaStream_t stream
+){
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
     }
@@ -1227,17 +1300,6 @@ void search_opt(const float* d_dataset,
     uint32_t raw_needed = itopk_size + params.search_width * graph_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
-
-    // C. 临时内存 (uint32)
-    uint32_t* d_out_indices_u32 = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
-    uint32_t* d_pre_hashmap = nullptr;
-    if (params.hash_bitlen > 13) {
-        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
-        // printf("num query is %ld\n", num_queries);
-        // printf("total_hash_size is %lu MB\n", total_hash_size / (1024u * 1024u));
-        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
-    }
 
     // D. 随机种子
     std::random_device rd;
@@ -1278,24 +1340,6 @@ void search_opt(const float* d_dataset,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
-    
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // F. 类型转换
-    size_t total_elements = num_queries * topk;
-    size_t convert_block = 256;
-    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
-    
-    cast_u32_to_i64_kernel<<<convert_grid, convert_block>>>(
-        d_out_indices_u32, 
-        d_out_indices, 
-        total_elements
-    );
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaFree(d_out_indices_u32));
-    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
 }
 
 void search_bucket_opt(const float* d_dataset,
@@ -1309,6 +1353,82 @@ void search_bucket_opt(const float* d_dataset,
                        int64_t k,
                        SearchParams params,
                        int64_t* d_out_indices, 
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream)
+{
+    uint32_t topk = static_cast<uint32_t>(k);
+    uint32_t* d_out_indices_u32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+    uint32_t* d_pre_hashmap = nullptr;
+    if (params.hash_bitlen > 13) {
+        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
+        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, total_hash_size));
+    }
+
+    search_bucket_opt_preallocated(d_dataset, dim, num_dataset, d_graph,
+                                   total_degree, local_degree, d_queries,
+                                   num_queries, k, params,
+                                   d_out_indices_u32, d_pre_hashmap,
+                                   d_out_indices, d_out_dists,
+                                   d_seeds, num_seeds_per_query, stream);
+
+    CUDA_CHECK(cudaFree(d_out_indices_u32));
+    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
+}
+
+void search_bucket_opt_preallocated(const float* d_dataset,
+                        uint32_t dim,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint32_t total_degree,
+                       uint32_t local_degree,
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       SearchParams params,
+                       uint32_t* d_out_indices_u32,
+                       uint32_t* d_pre_hashmap,
+                       int64_t* d_out_indices,
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream)
+{
+    search_bucket_opt_preallocated_u32(d_dataset, dim, num_dataset, d_graph,
+                                       total_degree, local_degree, d_queries,
+                                       num_queries, k, params,
+                                       d_out_indices_u32, d_pre_hashmap,
+                                       d_out_dists, d_seeds, num_seeds_per_query, stream);
+
+    uint32_t topk = static_cast<uint32_t>(k);
+    size_t total_elements = num_queries * topk;
+    size_t convert_block = 256;
+    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
+
+    cast_u32_to_i64_kernel<<<convert_grid, convert_block, 0, stream>>>(
+        d_out_indices_u32,
+        d_out_indices,
+        total_elements
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void search_bucket_opt_preallocated_u32(const float* d_dataset,
+                        uint32_t dim,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint32_t total_degree,
+                       uint32_t local_degree,
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       SearchParams params,
+                       uint32_t* d_out_indices_u32,
+                       uint32_t* d_pre_hashmap,
                        float* d_out_dists,
                        const uint32_t* d_seeds,
                        const uint32_t num_seeds_per_query,
@@ -1342,20 +1462,6 @@ void search_bucket_opt(const float* d_dataset,
     uint32_t raw_needed = itopk_size + params.search_width * total_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
-
-    // C. 临时内存 (uint32 输出 & Global Hashmap)
-    uint32_t* d_out_indices_u32 = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
-
-
-    uint32_t* d_pre_hashmap = nullptr;
-    if (params.hash_bitlen > 13) {
-        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
-        // printf("[Bucket Search] Allocating Global Hashmap: %.2f MB\n", total_hash_size / (1024.0 * 1024.0));
-        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
-        // 【关键】必须初始化，否则 Kernel 内读取全是垃圾数据
-        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, total_hash_size));
-    }
 
     // D. 随机种子
     std::random_device rd;
@@ -1397,23 +1503,6 @@ void search_bucket_opt(const float* d_dataset,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
-    
-    // F. 类型转换 (uint32 -> int64)
-    size_t total_elements = num_queries * topk;
-    size_t convert_block = 256;
-    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
-    
-    cast_u32_to_i64_kernel<<<convert_grid, convert_block>>>(
-        d_out_indices_u32, 
-        d_out_indices, 
-        total_elements
-    );
-    CUDA_CHECK(cudaGetLastError());
-
-    // G. 清理
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaFree(d_out_indices_u32));
-    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
 }
 
 void search_bucket_range(const float* d_dataset,
@@ -1433,6 +1522,90 @@ void search_bucket_range(const float* d_dataset,
                        float* d_out_dists,
                        const uint32_t* d_seeds,
                        const uint32_t num_seeds_per_query)
+{
+    uint32_t topk = static_cast<uint32_t>(k);
+    uint32_t* d_out_indices_u32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
+
+    uint32_t* d_pre_hashmap = nullptr;
+    if (params.hash_bitlen > 13) {
+        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
+        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
+        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, total_hash_size));
+    }
+
+    search_bucket_range_preallocated(d_dataset, dim, num_dataset, d_graph, d_ts,
+                                     total_degree, local_degree, d_queries,
+                                     num_queries, k, start_bucket, end_bucket,
+                                     params, d_out_indices_u32, d_pre_hashmap,
+                                     d_out_indices, d_out_dists,
+                                     d_seeds, num_seeds_per_query);
+
+    CUDA_CHECK(cudaFree(d_out_indices_u32));
+    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
+}
+
+void search_bucket_range_preallocated(const float* d_dataset,
+                        uint32_t dim,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint64_t* d_ts,
+                       uint32_t total_degree,
+                       uint32_t local_degree,
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       uint64_t start_bucket,
+                       uint64_t end_bucket,
+                       SearchParams params,
+                       uint32_t* d_out_indices_u32,
+                       uint32_t* d_pre_hashmap,
+                       int64_t* d_out_indices,
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream)
+{
+    search_bucket_range_preallocated_u32(d_dataset, dim, num_dataset, d_graph, d_ts,
+                                         total_degree, local_degree, d_queries,
+                                         num_queries, k, start_bucket, end_bucket,
+                                         params, d_out_indices_u32, d_pre_hashmap,
+                                         d_out_dists, d_seeds, num_seeds_per_query, stream);
+
+    uint32_t topk = static_cast<uint32_t>(k);
+    size_t total_elements = num_queries * topk;
+    size_t convert_block = 256;
+    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
+
+    cast_u32_to_i64_kernel<<<convert_grid, convert_block, 0, stream>>>(
+        d_out_indices_u32,
+        d_out_indices,
+        total_elements
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void search_bucket_range_preallocated_u32(const float* d_dataset,
+                        uint32_t dim,
+                       size_t num_dataset,
+                       const uint32_t* d_graph,
+                       uint64_t* d_ts,
+                       uint32_t total_degree,
+                       uint32_t local_degree,
+                       const float* d_queries,
+                       int64_t num_queries,
+                       int64_t k,
+                       uint64_t start_bucket,
+                       uint64_t end_bucket,
+                       SearchParams params,
+                       uint32_t* d_out_indices_u32,
+                       uint32_t* d_pre_hashmap,
+                       float* d_out_dists,
+                       const uint32_t* d_seeds,
+                       const uint32_t num_seeds_per_query,
+                       cudaStream_t stream)
 {
     if (d_graph == nullptr) {
         throw std::runtime_error("Graph is null!");
@@ -1454,20 +1627,6 @@ void search_bucket_range(const float* d_dataset,
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
 
-    // C. 临时内存 (uint32 输出 & Global Hashmap)
-    uint32_t* d_out_indices_u32 = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out_indices_u32, num_queries * topk * sizeof(uint32_t)));
-
-
-    uint32_t* d_pre_hashmap = nullptr;
-    if (params.hash_bitlen > 13) {
-        size_t total_hash_size = (1u << params.hash_bitlen) * sizeof(uint32_t) * num_queries;
-        // printf("[Bucket Search] Allocating Global Hashmap: %.2f MB\n", total_hash_size / (1024.0 * 1024.0));
-        CUDA_CHECK(cudaMalloc(&d_pre_hashmap, total_hash_size));
-        // 【关键】必须初始化，否则 Kernel 内读取全是垃圾数据
-        CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, total_hash_size));
-    }
-
     // D. 随机种子
     std::random_device rd;
     uint64_t rand_xor_mask = rd(); 
@@ -1480,7 +1639,7 @@ void search_bucket_range(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    cagra::device::search_kernel_range<<<grid, block, smem_size>>>(
+    cagra::device::search_kernel_range<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
         d_queries,
@@ -1511,23 +1670,8 @@ void search_bucket_range(const float* d_dataset,
         queue_capacity
     );
     CUDA_CHECK(cudaGetLastError());
-    
-    // F. 类型转换 (uint32 -> int64)
-    size_t total_elements = num_queries * topk;
-    size_t convert_block = 256;
-    size_t convert_grid = (total_elements + convert_block - 1) / convert_block;
-    
-    cast_u32_to_i64_kernel<<<convert_grid, convert_block>>>(
-        d_out_indices_u32, 
-        d_out_indices, 
-        total_elements
-    );
-    CUDA_CHECK(cudaGetLastError());
 
-    // G. 清理
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaFree(d_out_indices_u32));
-    if (d_pre_hashmap != nullptr) CUDA_CHECK(cudaFree(d_pre_hashmap));
 }
 
 
