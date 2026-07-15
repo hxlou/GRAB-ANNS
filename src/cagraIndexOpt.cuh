@@ -54,6 +54,12 @@ public:
      */
     void insert(size_t new_vectors, const float* insert_vectors, const uint64_t* insert_timestamps);
 
+    // Experimental bulk-ingestion path: defer the expensive full graph snapshot
+    // until the caller explicitly invokes get_graph() or completes the workload.
+    void insert_deferred(size_t new_vectors,
+                         const float* insert_vectors,
+                         const uint64_t* insert_timestamps);
+
     /**
      * @brief 向量查询 (支持时间过滤 + Seed 导航)
      * 
@@ -236,6 +242,10 @@ private:
     void* single_cta_scratch_ = nullptr;
     size_t single_cta_scratch_bytes_ = 0;
     void reserveSingleCtaScratch(size_t bytes);
+    void insert_impl(size_t new_vectors,
+                     const float* insert_vectors,
+                     const uint64_t* insert_timestamps,
+                     bool sync_graph_to_host);
 };
 
 } // namespace cagra

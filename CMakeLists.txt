@@ -141,6 +141,7 @@ find_library(FAISS_LIB faiss REQUIRED HINTS "${CONDA_ROOT}/lib")
 add_library(light_cagra SHARED
     src/index/cagra.cu
     src/index/cagra_opt.cu
+    src/index/search_multi_cta.cu
     src/index/insert.cu
     src/index/search.cu
     src/index/search_multi_cta.cu
@@ -216,7 +217,10 @@ add_cagra_test(grab_exp2_ablation eval/exp2_ablation/grab.cu)
 add_cagra_test(grab_exp3_scalability eval/exp3_scalability/grab.cu)
 add_cagra_test(grab_exp4_build eval/exp4_ingestion/grab.cu)
 add_cagra_test(grab_exp4_insert eval/exp4_ingestion/grab_insert.cu)
-
+add_cagra_test(test_cagra_opt_insert_stability tests/test_cagra_opt_insert_stability.cu)
+add_cagra_test(test_cagra_opt_small_batch_auto tests/test_cagra_opt_small_batch_auto.cu)
+add_cagra_test(build_sift_profile_indexes tests/build_sift_profile_indexes.cu)
+add_cagra_test(build_sift_round_robin_insert_profile tests/build_sift_round_robin_insert_profile.cu)
 # add_cagra_test(test_faiss_cagra tests/test_faiss_cagra.cu)
 
 # FAISS HNSW 对比测试 (如果有的话)

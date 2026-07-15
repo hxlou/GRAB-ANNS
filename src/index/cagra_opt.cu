@@ -18,6 +18,7 @@
 #include <random>
 #include <chrono>
 #include <fstream>
+#include <cstdlib>
 // FAISS 头文件
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/GpuIndexIVFPQ.h>
@@ -1639,6 +1640,13 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
+    unsigned long long* d_stage_profile = nullptr;
+    bool range_profile = std::getenv("CAGRA_RANGE_PROFILE") != nullptr;
+    if (range_profile) {
+        CUDA_CHECK(cudaMalloc(&d_stage_profile, 12 * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemsetAsync(d_stage_profile, 0, 12 * sizeof(unsigned long long), stream));
+    }
+
     cagra::device::search_kernel_range<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
@@ -1667,11 +1675,45 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
         rand_xor_mask,
         params.hash_bitlen,
         d_pre_hashmap,
-        queue_capacity
+        queue_capacity,
+        d_stage_profile
     );
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    if (range_profile) {
+        unsigned long long h_stage_profile[12] = {0};
+        CUDA_CHECK(cudaMemcpy(h_stage_profile,
+                              d_stage_profile,
+                              sizeof(h_stage_profile),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(d_stage_profile));
+        double denom = static_cast<double>(std::max<int64_t>(num_queries, 1));
+        std::cout << "[single_cta_range_profile]"
+                  << " queries=" << num_queries
+                  << " dim=" << dim
+                  << " topk=" << topk
+                  << " itopk=" << itopk_size
+                  << " width=" << params.search_width
+                  << " iter_limit=" << params.max_iterations
+                  << " range=[" << start_bucket << "," << end_bucket << ")"
+                  << " degree=" << total_degree
+                  << " local_degree=" << local_degree
+                  << " queue_capacity=" << queue_capacity
+                  << " avg_iter=" << h_stage_profile[3] / denom
+                  << " avg_cycles_sort=" << h_stage_profile[0] / denom
+                  << " avg_cycles_pickup=" << h_stage_profile[1] / denom
+                  << " avg_cycles_child=" << h_stage_profile[2] / denom
+                  << " avg_cycles_total=" << h_stage_profile[4] / denom
+                  << " avg_child_graph=" << h_stage_profile[5] / denom
+                  << " avg_child_hash=" << h_stage_profile[6] / denom
+                  << " avg_child_filter=" << h_stage_profile[7] / denom
+                  << " avg_child_dist=" << h_stage_profile[8] / denom
+                  << " avg_child_write=" << h_stage_profile[9] / denom
+                  << " avg_in_range=" << h_stage_profile[10] / denom
+                  << " avg_dist_count=" << h_stage_profile[11] / denom
+                  << std::endl;
+    }
 }
 
 

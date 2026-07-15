@@ -106,6 +106,25 @@ __device__ __forceinline__ void pickup_next_parents(uint32_t* terminate_flag,
     }
 }
 
+__device__ __forceinline__ void maybe_reset_visited_hash(uint32_t* visited_hash,
+                                                         uint32_t hash_bitlen,
+                                                         uint32_t* result_indices,
+                                                         uint32_t itopk_size,
+                                                         uint32_t* visited_count,
+                                                         uint32_t reset_threshold)
+{
+    if (*visited_count < reset_threshold) return;
+
+    cagra::hashmap::init(visited_hash, hash_bitlen);
+    __syncthreads();
+    cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *visited_count = itopk_size;
+    }
+    __syncthreads();
+}
+
 
 template <int N> // N = Capacity / 32
 __device__ __forceinline__ void load_sort_store(float* smem_dists, uint32_t* smem_indices, uint32_t capacity) {
@@ -206,6 +225,8 @@ __global__ void search_kernel(
 
     // E. Flags
     volatile uint32_t* terminate_flag = (uint32_t*)(smem + offset);
+    offset += 16;
+    uint32_t* visited_count = (uint32_t*)(smem + offset);
 
     // -------------------------------------------------------------
     // 2. 线程与任务分配
@@ -221,7 +242,10 @@ __global__ void search_kernel(
         query_buffer[i] = global_query[i];
     }
     
-    if (tid == 0) *terminate_flag = 0;
+    if (tid == 0) {
+        *terminate_flag = 0;
+        *visited_count = 0;
+    }
     cagra::hashmap::init(visited_hash, hash_bitlen);
 
     __syncthreads(); 
@@ -246,14 +270,15 @@ __global__ void search_kernel(
             num_seeds_per_query, // 外部提供了多少个
             rand_xor_mask,
             visited_hash,
-            hash_bitlen
+            hash_bitlen,
+            visited_count
         );
     } else {
         // 如果没有提供 seed ，直接随机初始化即可
         cagra::device::compute_distance_to_random_nodes(
             result_indices, result_dists, query_buffer, dataset_ptr,
             num_dataset, dim, queue_capacity, num_seeds, rand_xor_mask,
-            visited_hash, hash_bitlen
+            visited_hash, hash_bitlen, visited_count
         );
     }
     __syncthreads();
@@ -262,25 +287,18 @@ __global__ void search_kernel(
     // 4. 搜索主循环
     // -------------------------------------------------------------
     uint32_t iter = 0;
-    uint32_t hash_reset_iter = 30; // 每隔这么多轮重置 Hashmap
+    uint32_t hash_size = 1u << hash_bitlen;
+    uint32_t hash_reset_threshold = min(hash_size - 1,
+                                        max(itopk_size + search_width * graph_degree,
+                                            (hash_size * 7) / 10));
 
     uint64_t step1 = 0;
     uint64_t step2 = 0;
     uint64_t step3 = 0;
 
     for (; iter < max_iterations; ++iter) {
-        // 更新哈希表，清空并加入topk中的数据到哈希表中
-        if (iter > 0 && (iter % hash_reset_iter == 0)) {
-            // 1. 清空
-            cagra::hashmap::init(visited_hash, hash_bitlen);
-            __syncthreads();
-            
-            // 2. 恢复 (把 itopk 里的节点重新加回去)
-            // 为什么只恢复 itopk？因为只有这些节点是“当前最优”，
-            // 我们不希望重新计算它们的距离，也不希望重新扩展它们（如果已标记为 Parent）。
-            cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
-            __syncthreads();
-        }
+        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                 itopk_size, visited_count, hash_reset_threshold);
 
         // --- Step A: 排序 (仅 Warp 0 工作) ---  
         auto t1 = clock64();      
@@ -318,7 +336,7 @@ __global__ void search_kernel(
             result_indices + itopk_size,
             result_dists + itopk_size,
             query_buffer, dataset_ptr, knn_graph, graph_degree, dim,
-            visited_hash, hash_bitlen, parent_list, search_width
+            visited_hash, hash_bitlen, parent_list, search_width, visited_count
         );
         __syncthreads();
         auto t6 = clock64();
@@ -397,7 +415,8 @@ __global__ void search_kernel_bucket(
     uint64_t rand_xor_mask,     
     uint32_t hash_bitlen,
     uint32_t* pre_hashmap,   
-    uint32_t queue_capacity     
+    uint32_t queue_capacity,
+    unsigned long long* stage_profile
 ) {
     // 1. Shared Memory Init (完全复用，代码一样)
     extern __shared__ uint8_t smem[]; 
@@ -424,6 +443,8 @@ __global__ void search_kernel_bucket(
     offset += (search_width * sizeof(uint32_t) + 15) & ~15;
 
     volatile uint32_t* terminate_flag = (uint32_t*)(smem + offset);
+    offset += 16;
+    uint32_t* visited_count = (uint32_t*)(smem + offset);
 
     // 2. Thread Init
     const uint32_t query_id = blockIdx.x;
@@ -435,7 +456,10 @@ __global__ void search_kernel_bucket(
         query_buffer[i] = global_query[i];
     }
     
-    if (tid == 0) *terminate_flag = 0;
+    if (tid == 0) {
+        *terminate_flag = 0;
+        *visited_count = 0;
+    }
     cagra::hashmap::init(visited_hash, hash_bitlen);
     __syncthreads(); 
 
@@ -458,13 +482,16 @@ __global__ void search_kernel_bucket(
         num_seeds,          
         local_seed_ptr,     
         num_provided_seeds, 
-        rand_xor_mask, visited_hash, hash_bitlen
+        rand_xor_mask, visited_hash, hash_bitlen, visited_count
     );
     __syncthreads();
 
     // 4. 主循环
     uint32_t iter = 0;
-    uint32_t hash_reset_iter = 30;
+    uint32_t hash_size = 1u << hash_bitlen;
+    uint32_t hash_reset_threshold = min(hash_size - 1,
+                                        max(itopk_size + search_width * active_degree,
+                                            (hash_size * 7) / 10));
 
     // auto step1 = 0;
     // auto step2 = 0;
@@ -472,12 +499,8 @@ __global__ void search_kernel_bucket(
 
 
     for (; iter < max_iterations; ++iter) {
-        if (iter > 0 && (iter % hash_reset_iter == 0)) {
-            cagra::hashmap::init(visited_hash, hash_bitlen);
-            __syncthreads();
-            cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
-            __syncthreads();
-        }
+        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                 itopk_size, visited_count, hash_reset_threshold);
 
         // auto t1 = clock64();
         // A. Sort (完全复用)
@@ -545,7 +568,8 @@ __global__ void search_kernel_bucket(
             parent_list, 
             search_width,
             result_indices,
-            queue_capacity
+            queue_capacity,
+            visited_count
         );
         __syncthreads();
 
@@ -614,9 +638,12 @@ __global__ void search_kernel_range(
     uint64_t rand_xor_mask,     
     uint32_t hash_bitlen,
     uint32_t* pre_hashmap,   
-    uint32_t queue_capacity     
+    uint32_t queue_capacity,
+    unsigned long long* stage_profile
 ) {
-    auto t_start = clock64();
+    const bool profile_enabled = (stage_profile != nullptr);
+    unsigned long long t_start = 0;
+    if (profile_enabled) t_start = clock64();
     // 1. Shared Memory Init (完全复用，代码一样)
     extern __shared__ uint8_t smem[]; 
     size_t offset = 0;
@@ -642,6 +669,8 @@ __global__ void search_kernel_range(
     offset += (search_width * sizeof(uint32_t) + 15) & ~15;
 
     volatile uint32_t* terminate_flag = (uint32_t*)(smem + offset);
+    offset += 16;
+    uint32_t* visited_count = (uint32_t*)(smem + offset);
 
     // 2. Thread Init
     const uint32_t query_id = blockIdx.x;
@@ -653,7 +682,10 @@ __global__ void search_kernel_range(
         query_buffer[i] = global_query[i];
     }
     
-    if (tid == 0) *terminate_flag = 0;
+    if (tid == 0) {
+        *terminate_flag = 0;
+        *visited_count = 0;
+    }
     cagra::hashmap::init(visited_hash, hash_bitlen);
     __syncthreads(); 
 
@@ -676,28 +708,28 @@ __global__ void search_kernel_range(
         num_seeds,          
         local_seed_ptr,     
         num_provided_seeds, 
-        rand_xor_mask, visited_hash, hash_bitlen
+        rand_xor_mask, visited_hash, hash_bitlen, visited_count
     );
     __syncthreads();
 
     // 4. 主循环
     uint32_t iter = 0;
-    uint32_t hash_reset_iter = 30;
+    uint32_t hash_size = 1u << hash_bitlen;
+    uint32_t hash_reset_threshold = min(hash_size - 1,
+                                        max(itopk_size + search_width * graph_stride,
+                                            (hash_size * 7) / 10));
 
-    uint64_t step1_cost = 0;
-    uint64_t step2_cost = 0;
-    uint64_t step3_cost = 0;
+    unsigned long long step1_cost = 0;
+    unsigned long long step2_cost = 0;
+    unsigned long long step3_cost = 0;
 
     for (; iter < max_iterations; ++iter) {
-        if (iter > 0 && (iter % hash_reset_iter == 0)) {
-            cagra::hashmap::init(visited_hash, hash_bitlen);
-            __syncthreads();
-            cagra::hashmap::restore(visited_hash, hash_bitlen, result_indices, itopk_size);
-            __syncthreads();
-        }
+        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                 itopk_size, visited_count, hash_reset_threshold);
 
         // A. Sort (完全复用)
-        auto t1 = clock64();
+        unsigned long long t1 = 0;
+        if (profile_enabled) t1 = clock64();
         // if (tid < 32) {
             if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
@@ -716,10 +748,12 @@ __global__ void search_kernel_range(
             
         // }
         __syncthreads();
-        auto t2 = clock64();
+        unsigned long long t2 = 0;
+        if (profile_enabled) t2 = clock64();
 
         // B. Pickup Parents (完全复用)
-        auto t3 = clock64();
+        unsigned long long t3 = 0;
+        if (profile_enabled) t3 = clock64();
         if (tid < 32) {
             cagra::device::pickup_next_parents(
                 (uint32_t*)terminate_flag, parent_list, result_indices,
@@ -727,14 +761,16 @@ __global__ void search_kernel_range(
             );
         }
         __syncthreads();
-        auto t4 = clock64();
+        unsigned long long t4 = 0;
+        if (profile_enabled) t4 = clock64();
 
         // C. Check
         if (*terminate_flag == 1) break;
 
         // D. Expand (使用 STRIDED 版本)
         // 【核心差异】使用 compute_distance_to_child_nodes_strided
-        auto t5 = clock64();
+        unsigned long long t5 = 0;
+        if (profile_enabled) t5 = clock64();
         cagra::device::compute_distance_to_child_nodes_range(
             result_indices + itopk_size,
             result_dists + itopk_size,
@@ -750,14 +786,19 @@ __global__ void search_kernel_range(
             search_width,
             start_bucket,
             end_bucket,
-            d_ts
+            d_ts,
+            visited_count,
+            stage_profile == nullptr ? nullptr : stage_profile + 5
         );
         __syncthreads();
-        auto t6 = clock64();
+        unsigned long long t6 = 0;
+        if (profile_enabled) t6 = clock64();
 
-        step1_cost += (t2 - t1);
-        step2_cost += (t4 - t3);
-        step3_cost += (t6 - t5);
+        if (profile_enabled) {
+            step1_cost += (t2 - t1);
+            step2_cost += (t4 - t3);
+            step3_cost += (t6 - t5);
+        }
     }
 
     // 5. 写回 (完全复用)
@@ -782,7 +823,16 @@ __global__ void search_kernel_range(
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
     }
 
-    auto t_end = clock64();
+    unsigned long long t_end = 0;
+    if (profile_enabled) t_end = clock64();
+
+    if (profile_enabled && tid == 0) {
+        atomicAdd(stage_profile + 0, step1_cost);
+        atomicAdd(stage_profile + 1, step2_cost);
+        atomicAdd(stage_profile + 2, step3_cost);
+        atomicAdd(stage_profile + 3, static_cast<unsigned long long>(iter));
+        atomicAdd(stage_profile + 4, t_end - t_start);
+    }
 
     // if (tid == 0 && query_id <= 5) {
     //     // printf("query %u finished in %u iterations, and queue capacity is %u, and total time cost is %llu.\n", query_id, iter, queue_capacity, step1_cost + step2_cost + step3_cost);

@@ -73,7 +73,8 @@ __global__ void search_kernel_bucket(
     uint64_t rand_xor_mask,     
     uint32_t hash_bitlen,
     uint32_t* pre_hashmap,   
-    uint32_t queue_capacity     
+    uint32_t queue_capacity,
+    unsigned long long* stage_profile = nullptr
 );
 
 __global__ void search_kernel_range(
@@ -104,7 +105,8 @@ __global__ void search_kernel_range(
     uint64_t rand_xor_mask,     
     uint32_t hash_bitlen,
     uint32_t* pre_hashmap,   
-    uint32_t queue_capacity     
+    uint32_t queue_capacity,
+    unsigned long long* stage_profile = nullptr
 );
 
 

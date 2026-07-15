@@ -1539,6 +1539,19 @@ void CagraIndexOpt::query_range_u32(const float* host_queries,
 // 核心：增量插入 (Insert) - 支持 Batch 处理 修改：限制数据都为同一个时间戳
 // =============================================================================
 void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, const uint64_t* insert_timestamps) {
+    insert_impl(new_vectors, insert_vectors, insert_timestamps, true);
+}
+
+void CagraIndexOpt::insert_deferred(size_t new_vectors,
+                                    const float* insert_vectors,
+                                    const uint64_t* insert_timestamps) {
+    insert_impl(new_vectors, insert_vectors, insert_timestamps, false);
+}
+
+void CagraIndexOpt::insert_impl(size_t new_vectors,
+                                const float* insert_vectors,
+                                const uint64_t* insert_timestamps,
+                                bool sync_graph_to_host) {
     if (new_vectors == 0) return;
     auto t1 = std::chrono::high_resolution_clock::now();
     uint64_t target_ts = insert_timestamps[0];
@@ -1691,11 +1704,12 @@ void CagraIndexOpt::insert(size_t new_vectors, const float* insert_vectors, cons
     }
     // std::cout << " Done." << std::endl;
 
-    // 同步一下d_graph到h_graph_，保持一致性
-    h_graph_.resize(new_total * graph_degree_);
-    CUDA_CHECK(cudaMemcpy(h_graph_.data(), d_graph, 
-                          new_total * graph_degree_ * sizeof(uint32_t), 
-                          cudaMemcpyDeviceToHost));
+    if (sync_graph_to_host) {
+        h_graph_.resize(new_total * graph_degree_);
+        CUDA_CHECK(cudaMemcpy(h_graph_.data(), d_graph,
+                              new_total * graph_degree_ * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+    }
 
     auto t2 =  std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = t2 - t1;

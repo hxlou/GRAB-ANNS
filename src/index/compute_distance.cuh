@@ -152,7 +152,8 @@ __device__ inline void compute_distance_to_random_nodes(
     uint32_t num_seeds,             // 需要生成的随机种子数量
     uint64_t rand_xor_mask,         // 随机数掩码
     uint32_t* visited_hash,         // Hashmap
-    uint32_t hash_bitlen
+    uint32_t hash_bitlen,
+    uint32_t* visited_count = nullptr
 ) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid % 32;
@@ -195,7 +196,9 @@ __device__ inline void compute_distance_to_random_nodes(
             result_distances[i] = dist;
             
             // 别忘了加入 Hashmap，防止重复访问
-            cagra::hashmap::insert(visited_hash, hash_bitlen, node_id);
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) && visited_count != nullptr) {
+                atomicAdd(visited_count, 1u);
+            }
         }
     }
     __syncthreads();
@@ -214,7 +217,8 @@ __device__ inline void compute_distance_to_init_nodes(
     uint32_t num_provided_seeds,    // [Input] 外部提供的种子数量
     uint64_t rand_xor_mask,         // 随机掩码
     uint32_t* visited_hash,         // Hashmap
-    uint32_t hash_bitlen
+    uint32_t hash_bitlen,
+    uint32_t* visited_count = nullptr
 ) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid % 32;
@@ -262,7 +266,9 @@ __device__ inline void compute_distance_to_init_nodes(
             result_indices[i] = node_id;
             result_distances[i] = dist;
             
-            cagra::hashmap::insert(visited_hash, hash_bitlen, node_id);
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) && visited_count != nullptr) {
+                atomicAdd(visited_count, 1u);
+            }
         }
     }
     __syncthreads();
@@ -282,7 +288,8 @@ __device__ inline void compute_distance_to_child_nodes(
     uint32_t* visited_hash,         // Hashmap
     uint32_t hash_bitlen,
     const uint32_t* parent_list,    // [Input] 父节点列表
-    uint32_t search_width           // 父节点数量
+    uint32_t search_width,          // 父节点数量
+    uint32_t* visited_count = nullptr
 ) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid % 32;
@@ -329,6 +336,7 @@ __device__ inline void compute_distance_to_child_nodes(
                 int not_visited = 0;
                 if (lane_id == 0) {
                     not_visited = cagra::hashmap::insert(visited_hash, hash_bitlen, neighbor_id);
+                    if (not_visited && visited_count != nullptr) atomicAdd(visited_count, 1u);
                 }
                 // 广播查重结果
                 not_visited = __shfl_sync(0xFFFFFFFF, not_visited, 0);
@@ -397,7 +405,8 @@ __device__ inline void compute_distance_to_child_nodes_strided(
     const uint32_t* parent_list,    
     uint32_t search_width,
     uint32_t* itopk_indices = nullptr,
-    uint32_t quen_capacity = 0   
+    uint32_t quen_capacity = 0,
+    uint32_t* visited_count = nullptr
 ) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid % 32;
@@ -454,6 +463,7 @@ __device__ inline void compute_distance_to_child_nodes_strided(
                 int not_visited = 0;
                 if (lane_id == 0) {
                     not_visited = cagra::hashmap::insert(visited_hash, hash_bitlen, neighbor_id);
+                    if (not_visited && visited_count != nullptr) atomicAdd(visited_count, 1u);
                 }
                 // 广播查重结果
                 not_visited = __shfl_sync(0xFFFFFFFF, not_visited, 0);
@@ -524,7 +534,9 @@ __device__ inline void compute_distance_to_child_nodes_range(
     uint32_t search_width,
     uint64_t start_bucket,          // [start_bucket, end_bucket)
     uint64_t end_bucket,
-    uint64_t* d_ts                  // 反查表
+    uint64_t* d_ts,                 // 反查表
+    uint32_t* visited_count = nullptr,
+    unsigned long long* child_profile = nullptr
 ) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid % 32;
@@ -545,6 +557,13 @@ __device__ inline void compute_distance_to_child_nodes_range(
     // 采用更细粒度的策略：
     uint32_t graph_degree = graph_stride; // 物理宽度
     uint32_t total_tasks = search_width * graph_degree;
+    unsigned long long clk_graph = 0;
+    unsigned long long clk_hash = 0;
+    unsigned long long clk_filter = 0;
+    unsigned long long clk_dist = 0;
+    unsigned long long clk_write = 0;
+    unsigned long long cnt_in_range = 0;
+    unsigned long long cnt_dist = 0;
 
     for (uint32_t task_id = warp_id; task_id < total_tasks; task_id += num_warps) {
         
@@ -561,32 +580,47 @@ __device__ inline void compute_distance_to_child_nodes_range(
             // 3. 查图：获取邻居 ID
             // knn_graph 是 [N, degree] 的行主序
             // 邻居位置 = parent_id * degree + offset
+            unsigned long long t_child = 0;
+            if (child_profile != nullptr && lane_id == 0) t_child = clock64();
             uint32_t neighbor_id = knn_graph[(size_t)parent_id * graph_degree + neighbor_offset];
+            if (child_profile != nullptr && lane_id == 0) clk_graph += clock64() - t_child;
 
             // 4. 检查邻居是否有效 (填充值)
             if (neighbor_id != 0xFFFFFFFF) {
 
-                // 5. 查重：Hashmap
+                // 5. 先做范围过滤，再写 visited hash。
+                // Range search 下如果先插入 hash，out-of-range 邻居会快速填满小 hash 表，
+                // 让后续 atomicCAS 线性探测退化。
+                if (child_profile != nullptr && lane_id == 0) t_child = clock64();
+                uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
+                if (child_profile != nullptr && lane_id == 0) clk_filter += clock64() - t_child;
+                if (bucket_id < start_bucket || bucket_id >= end_bucket) {
+                    if (lane_id == 0) {
+                        candidate_indices[task_id] = 0xFFFFFFFF;
+                        candidate_distances[task_id] = 3.40282e38f;
+                    }
+                    continue;
+                }
+                if (child_profile != nullptr && lane_id == 0) cnt_in_range++;
+
+                // 6. 查重：Hashmap
                 // 只有 Lane 0 负责查重 (原子操作)，结果广播给全 Warp
                 // insert 返回 true 表示插入成功(未访问过)，false 表示已存在
                 int not_visited = 0;
                 if (lane_id == 0) {
+                    if (child_profile != nullptr) t_child = clock64();
                     not_visited = cagra::hashmap::insert(visited_hash, hash_bitlen, neighbor_id);
+                    if (not_visited && visited_count != nullptr) atomicAdd(visited_count, 1u);
+                    if (child_profile != nullptr) clk_hash += clock64() - t_child;
                 }
                 // 广播查重结果
                 not_visited = __shfl_sync(0xFFFFFFFF, not_visited, 0);
 
-                // 检查邻居是否在指定桶范围内 优先哈希表过滤
-                uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
-                if (bucket_id < start_bucket || bucket_id >= end_bucket) {
-                    // 不在范围内，写入无效值
-                    continue;
-                }
-
                 if (not_visited) {
-                    // 6. 没访问过 -> 计算距离
+                    // 7. 没访问过 -> 计算距离
                     const float* node_ptr = dataset_ptr + (size_t)neighbor_id * dim;
                     float dist = 3.40282e38f; // MAX_FLOAT
+                    if (child_profile != nullptr && lane_id == 0) t_child = clock64();
                     if (dim == 1024) dist = cagra::device::calc_l2_dist_1024(query_buffer, node_ptr);
                     else if (dim == 2048) dist = cagra::device::calc_l2_dist_2048(query_buffer, node_ptr);
                     else if (dim == 960) dist = cagra::device::calc_l2_dist_960(query_buffer, node_ptr);
@@ -597,16 +631,74 @@ __device__ inline void compute_distance_to_child_nodes_range(
                         // 对于非特殊维度，调用通用版本
                         printf("[ERROR] unsupported dimension %u in refine_and_sort_kernel!\n", dim);
                     }
+                    if (child_profile != nullptr && lane_id == 0) {
+                        clk_dist += clock64() - t_child;
+                        cnt_dist++;
+                    }
 
                     // 7. 写入结果
                     if (lane_id == 0) {
+                        if (child_profile != nullptr) t_child = clock64();
                         candidate_indices[task_id] = neighbor_id;
                         candidate_distances[task_id] = dist;
+                        if (child_profile != nullptr) clk_write += clock64() - t_child;
                     }
                 } else {
                     // 已访问过 -> 写入无效值
+                    if (lane_id == 0) {
+                        candidate_indices[task_id] = 0xFFFFFFFF;
+                        candidate_distances[task_id] = 3.40282e38f;
+                    }
+                }
+            } else {
+                // 无效邻居 -> 写入无效值
+                if (lane_id == 0) {
+                    candidate_indices[task_id] = 0xFFFFFFFF;
+                    candidate_distances[task_id] = 3.40282e38f;
                 }
             }
+        } else {
+            // 无效父节点 -> 写入无效值
+            if (lane_id == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+        }
+    }
+    if (child_profile != nullptr) {
+        unsigned long long graph = 0;
+        unsigned long long hash = 0;
+        unsigned long long filter = 0;
+        unsigned long long dist = 0;
+        unsigned long long write = 0;
+        unsigned long long in_range = 0;
+        unsigned long long dist_count = 0;
+        if (lane_id == 0) {
+            graph = clk_graph;
+            hash = clk_hash;
+            filter = clk_filter;
+            dist = clk_dist;
+            write = clk_write;
+            in_range = cnt_in_range;
+            dist_count = cnt_dist;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            graph += __shfl_down_sync(0xffffffff, graph, offset);
+            hash += __shfl_down_sync(0xffffffff, hash, offset);
+            filter += __shfl_down_sync(0xffffffff, filter, offset);
+            dist += __shfl_down_sync(0xffffffff, dist, offset);
+            write += __shfl_down_sync(0xffffffff, write, offset);
+            in_range += __shfl_down_sync(0xffffffff, in_range, offset);
+            dist_count += __shfl_down_sync(0xffffffff, dist_count, offset);
+        }
+        if (lane_id == 0) {
+            atomicAdd(child_profile + 0, graph);
+            atomicAdd(child_profile + 1, hash);
+            atomicAdd(child_profile + 2, filter);
+            atomicAdd(child_profile + 3, dist);
+            atomicAdd(child_profile + 4, write);
+            atomicAdd(child_profile + 5, in_range);
+            atomicAdd(child_profile + 6, dist_count);
         }
     }
     // 所有 Warp 完成计算后同步
