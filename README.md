@@ -28,9 +28,12 @@ Please make sure that your CUDA toolkit, NVIDIA driver, and FAISS version are co
 
 ## Build
 
-Clone the repository and build the project:
+Clone the repository with the pinned baseline implementations and build the
+project:
 
 ```bash
+git clone --recursive <repository-url>
+cd GRAB-ANNS
 mkdir build
 cd build
 cmake ..
@@ -39,4 +42,7 @@ make -j
 
 ## Run
 
-All examples and tests are in `./tests/` path. All tests uses data in format `xxx.fvecs`. 
+Examples and component tests are under `tests/`. Paper experiment drivers for
+GRAB-ANNS, ACORN, SeRF, HNSW-Filter, and Milvus are under [`eval/`](eval/).
+Datasets use the `fvecs` format; configure their locations with
+`eval/datasets.env.example`.

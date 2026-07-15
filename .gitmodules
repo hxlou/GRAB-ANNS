@@ -1,0 +1,6 @@
+[submodule "third_party/ACORN"]
+	path = third_party/ACORN
+	url = https://github.com/guestrin-lab/ACORN.git
+[submodule "third_party/SeRF"]
+	path = third_party/SeRF
+	url = https://github.com/dai-junjie/SeRF.git

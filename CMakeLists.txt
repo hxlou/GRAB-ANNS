@@ -143,6 +143,7 @@ add_library(light_cagra SHARED
     src/index/cagra_opt.cu
     src/index/insert.cu
     src/index/search.cu
+    src/index/search_multi_cta.cu
     
     
     src/cagraIndex.cu  # 确保你的文件是 .cu 后缀
@@ -204,8 +205,17 @@ add_cagra_test(test_cagra_opt_search_range tests/test_cagra_opt_search_range.cu)
 add_cagra_test(test_cagra_opt_insert tests/test_cagra_opt_insert.cu)
 add_cagra_test(test_cagra_opt_build_auto tests/test_cagra_opt_build_auto.cu)
 add_cagra_test(test_cagra_opt_insert_auto tests/test_cagra_opt_insert_auto.cu)
-add_cagra_test(test_cagra_opt_local tests/test_cagra_opt_local.cu)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cagra_opt_local.cu")
+    add_cagra_test(test_cagra_opt_local tests/test_cagra_opt_local.cu)
+endif()
 add_cagra_test(test_cagra_auto tests/test_cagra_auto.cu)
+
+# Paper evaluation executables. Experiment orchestration lives under eval/.
+add_cagra_test(grab_exp1_search_efficiency eval/exp1_search_efficiency/grab.cu)
+add_cagra_test(grab_exp2_ablation eval/exp2_ablation/grab.cu)
+add_cagra_test(grab_exp3_scalability eval/exp3_scalability/grab.cu)
+add_cagra_test(grab_exp4_build eval/exp4_ingestion/grab.cu)
+add_cagra_test(grab_exp4_insert eval/exp4_ingestion/grab_insert.cu)
 
 # add_cagra_test(test_faiss_cagra tests/test_faiss_cagra.cu)
 
