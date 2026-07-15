@@ -9,14 +9,14 @@
 #include <cmath>
 #include <set>
 #include <iomanip>
-#include <omp.h> // 务必开启 OpenMP: -Xcompiler -fopenmp
+#include <omp.h> // Compile with OpenMP support: -Xcompiler -fopenmp
 
 #include "cagraIndex.hpp"
 
 using namespace cagra;
 
 // ==========================================
-// 1. 配置结构体
+// 1. Configuration
 // ==========================================
 struct BuildConfig {
     size_t data_size;
@@ -107,7 +107,7 @@ void run_test(
 
     size_t num_eval = 100;
     int RECALL_K = 10;
-    int NUM_EXPERIMENTS = 5; // 执行 5 次独立实验取平均
+    int NUM_EXPERIMENTS = 5; // Average five independent runs.
 
     std::ofstream csv(csv_path, std::ios::app);
     if (csv.tellp() == 0) {
@@ -137,14 +137,14 @@ void run_test(
 
         std::vector<float> range_ratios = {0.01f, 0.1f, 0.2f, 1.0f};
 
-        // 预分配 buffer
+        // Preallocate result buffers.
         std::vector<int64_t> h_idxs(num_eval * 1024); // max itopk
         std::vector<float> h_dists(num_eval * 1024);
 
         for (const auto& s_conf : search_configs) {
             index.setQueryParams(s_conf.itopk, s_conf.width, s_conf.min_iter, s_conf.max_iter, 12);
 
-            // 确保 buffer 够大
+            // Resize buffers for the current query count.
             if (h_idxs.size() < num_eval * s_conf.itopk) {
                 h_idxs.resize(num_eval * s_conf.itopk);
                 h_dists.resize(num_eval * s_conf.itopk);
@@ -154,21 +154,21 @@ void run_test(
                 double sum_recall = 0.0;
                 double sum_latency = 0.0;
 
-                // --- 5次独立实验循环 ---
+                // Run independent trials.
                 for (int run = 0; run < NUM_EXPERIMENTS; ++run) {
-                    // 1. 重新生成随机范围
+                    // 1. Generate a range for this trial.
                     uint64_t total_range = b_conf.num_buckets;
                     uint64_t len = (uint64_t)(total_range * ratio);
                     if (len < 1) len = 1;
 
                     uint64_t start = 0;
                     if (total_range > len) {
-                        // 简单的随机生成，确保每次 run 可能不同
+                        // Use a new random start position for each trial.
                         start = std::rand() % (total_range - len);
                     }
                     uint64_t end = start + len;
 
-                    // 2. 重新计算 GT (耗时操作，OpenMP 必须开)
+                    // 2. Recompute ground truth with OpenMP.
                     std::vector<std::vector<Neighbor>> gt_vecs;
                     compute_ground_truth_range(
                         base_data, timestamps.data(), current_data_size,
@@ -176,7 +176,7 @@ void run_test(
                         start, end, gt_vecs
                     );
 
-                    // 3. 执行查询 & 计时
+                    // 3. Execute and time the queries.
                     auto t_q1 = std::chrono::high_resolution_clock::now();
                     index.query_range(
                         query_data, num_eval, RECALL_K, ratio,
@@ -187,13 +187,13 @@ void run_test(
                     double lat = std::chrono::duration<double, std::milli>(t_q2 - t_q1).count() / num_eval;
                     sum_latency += lat;
 
-                    // 4. 计算本次实验的 Recall
+                    // 4. Compute recall for this trial.
                     double current_run_recall = 0;
                     int valid = 0;
                     for(size_t i=0; i<num_eval; ++i) {
                         if (gt_vecs[i].empty()) continue;
 
-                        // 构建 Set 加速查找
+                        // Use a set for ground-truth membership checks.
                         std::set<int64_t> gt_set;
                         for (const auto& n : gt_vecs[i]) gt_set.insert(n.id);
 
@@ -207,7 +207,7 @@ void run_test(
                     sum_recall += (valid > 0) ? (current_run_recall / valid) : 1.0;
                 }
 
-                // --- 计算 5 次平均值 ---
+                // Average the independent trials.
                 double avg_recall = sum_recall / NUM_EXPERIMENTS;
                 double avg_latency = sum_latency / NUM_EXPERIMENTS;
 
@@ -236,7 +236,7 @@ int main(int argc, char** argv) {
     size_t dim, n;
     float* data = read_fvecs(argv[1], dim, n);
 
-    // 构建配置
+    // Index configurations
     std::vector<BuildConfig> b_confs = {
         {1000000, 100, 32},
         {1000000, 100, 64},
@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
         {1000000, 100, 128}
     };
 
-    // 搜索配置
+    // Search configurations
     std::vector<SearchConfig> s_confs = {
         {128, 4, 0, 32},
         {128, 4, 0, 64},

@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """
-DEEP10M Milvus 规模扩展测试脚本
+DEEP10M scalability evaluation for Milvus HNSW.
 
-索引参数组合: 多组 (M, ef_construction)
-搜索参数组合: 多组 ef (K_Search)
-测试范围: 1M 到 10M (step=1M)
-Range: 1%, 10%, 20%, 100%
-
-记录指标:
-- 构建时间 (build_time)
-- 索引大小 (size_mb) - 需要特殊处理（Milvus存储在Docker内）
-- recall
-- qps
-
-特点:
-- 增量保存结果（防止中断丢失数据）
-- 进度提示（解决"卡住"焦虑）
-- CPU affinity 绑定到 E-cores
+The evaluation sweeps the configured index and search parameters over the
+selected dataset sizes and range percentages. It records index construction
+time, estimated index size, recall, and QPS. Results are appended after each
+task, and the process uses the configured CPU affinity.
 """
 
 import time
@@ -35,7 +24,7 @@ from pymilvus import (
     utility
 )
 
-# 禁用输出缓冲
+# Flush progress output line by line.
 sys.stdout.reconfigure(line_buffering=True)
 
 # Force fork start method to avoid copying large numpy arrays per worker.
@@ -50,7 +39,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
 # CPU affinity - Pin to efficiency cores (16-31)
-# 注意：GT 生成时会解除绑定，使用所有核心
+# Ground-truth generation temporarily uses all configured CPU cores.
 E_CORES = list(range(16, 32))
 
 def set_cpu_affinity():
@@ -64,7 +53,7 @@ def set_cpu_affinity():
         print(f"[WARNING] Failed to set CPU affinity: {e}")
 
 def release_cpu_affinity():
-    """释放 CPU affinity，允许使用所有核心"""
+    """Allow the process to run on all available CPU cores."""
     try:
         all_cores = list(range(cpu_count()))
         os.sched_setaffinity(0, all_cores)
@@ -75,7 +64,7 @@ def release_cpu_affinity():
         print(f"[WARNING] Failed to release CPU affinity: {e}")
 
 def get_current_affinity():
-    """获取当前 CPU 亲和性"""
+    """Return the current CPU affinity."""
     try:
         return os.sched_getaffinity(0)
     except AttributeError:
@@ -83,7 +72,7 @@ def get_current_affinity():
     except Exception as e:
         return E_CORES
 
-# Milvus 连接
+# Milvus connection
 MILVUS_HOST = os.environ.get("MILVUS_HOST", "127.0.0.1")
 MILVUS_PORT = "19530"
 
@@ -141,19 +130,19 @@ def milvus_call(op_name, func, *args, **kwargs):
 
 set_cpu_affinity()
 
-# 输出目录
+# Output directory
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results", "exp3_scalability")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# GT 缓存目录
+# Ground-truth cache directory
 GT_CACHE_DIR = os.path.join(PROJECT_ROOT, "results", "exp3_scalability", "gt_cache")
 os.makedirs(GT_CACHE_DIR, exist_ok=True)
 
-# 数据集路径 - 使用 DEEP 附带的 query 文件
+# DEEP base and query files
 DEEP_BASE_PATH = os.environ.get("GRAB_DEEP10M_BASE", os.environ.get("GRAB_DEEP_BASE", ""))
 DEEP_QUERY_PATH = os.environ.get("GRAB_DEEP_QUERY", "")
 
-# 索引参数组合（与 deep10m_scaling 对齐）
+# Index configurations
 INDEX_CONFIGS = [
     # {"M": 8, "K": 100},
     # {"M": 8, "K": 200},
@@ -166,49 +155,48 @@ INDEX_CONFIGS = [
     # {"M": 64, "K": 400},
 ]
 
-# 搜索参数组合（与 deep10m_scaling 对齐）
-# 注意：ef 必须 >= TOP_K，所以从 16 开始（TOP_K=10）
+# Search configurations; ef must be at least TOP_K.
 K_SEARCH_VALUES = [16, 32, 64, 128, 256, 512, 1024]
 
-# 测试规模点：1M到10M，步长1M
+# Evaluated dataset sizes
 DATA_SIZES = [1000000 * i for i in range(10, 11)]
 
-# Range 百分比: 1%, 10%, 20%, 100%
+# Evaluated range percentages
 RANGE_PCTS = [10.0]
 
-# CSV 输出列顺序（与 deep10m_scaling 对齐）
+# CSV column order
 CSV_COLUMNS = [
     "method", "dataset", "M", "K", "K_Search", "range_pct",
     "recall", "qps", "comps", "build_time", "size_mb",
 ]
 
-# 查询配置
-NUM_QUERIES = 1000  # 使用 1000 个查询进行批量测试
+# Query configuration
+NUM_QUERIES = 1000  # Number of queries in the batch evaluation
 TOP_K = 10
 METRIC_TYPE = "L2"
-DIM = 96  # DEEP 数据集维度
+DIM = 96  # DEEP vector dimension
 
 # Batch insert size
 BATCH_SIZE = 1000
 
-# Batch query size - 将所有查询打包成 1批发送给 Milvus
+# Number of queries per Milvus request
 BATCH_QUERY_SIZE = 200  # 200 queries per batch
 
 # ============== GT CACHE FUNCTIONS ==============
 
-# 全局变量（用于 worker 进程共享数据）
+# Read-only arrays shared by forked workers
 _shared_vectors = None
 _shared_queries = None
 
 def get_gt_cache_path(size):
-    """获取 GT 缓存文件路径"""
+    """Return the ground-truth cache path for a dataset size."""
     size_str = f"{size//1000000}m"
     return os.path.join(GT_CACHE_DIR, f"deep_{size_str}_gt_cache.pkl")
 
 def _compute_single_query_gt(args):
-    """计算单个查询的 GT（轻量级参数版本，使用共享数据）"""
+    """Compute ground truth for one query using shared arrays."""
     query_idx, l_bound, r_bound, top_k = args
-    # 使用全局共享的 vectors 和 queries
+    # Access read-only arrays inherited by forked workers.
     range_vectors = _shared_vectors[l_bound:r_bound+1]
     query_vector = _shared_queries[query_idx:query_idx+1]
     distances = np.sum((query_vector - range_vectors) ** 2, axis=1)
@@ -222,16 +210,15 @@ def _compute_single_query_gt(args):
     return (query_idx, gt_ids)
 
 def precompute_ground_truth(size, range_pcts, num_queries=NUM_QUERIES, num_ranges_per_pct=5, verbose=True):
-    """预计算 Ground Truth 并缓存到文件（多线程版本）
+    """Precompute and cache ground truth with multiple worker processes.
 
-    GT 结构: {range_pct: [(l_bound, r_bound, [gt_ids_for_each_query])]}
-    每个 range_pct 生成 num_ranges_per_pct 个随机 range
-
-    并行策略：每个查询独立计算，充分利用所有 CPU 核心
+    The cache maps each range percentage to tuples containing the lower bound,
+    upper bound, and ground-truth IDs for every query. Each query is computed
+    independently for every generated range.
     """
     cache_path = get_gt_cache_path(size)
 
-    # 检查缓存是否存在
+    # Reuse an existing cache for this dataset size.
     if os.path.exists(cache_path):
         if verbose:
             print(f"[GT CACHE] Found existing cache: {cache_path}")
@@ -242,9 +229,8 @@ def precompute_ground_truth(size, range_pcts, num_queries=NUM_QUERIES, num_range
             print(f"[GT CACHE] Loaded {len(gt_cache)} range_pct values from cache")
         return gt_cache
 
-    # 缓存不存在，需要生成
-    # 使用多进程池 - 优化后可以安全使用 30 个 worker
-    num_workers = 30  # fork + 全局只读数组，避免每进程拷贝
+    # Generate the cache with forked workers and read-only shared arrays.
+    num_workers = 30
 
     if verbose:
         print(f"\n[GT PRECOMPUTE] Generating GT for size={size//1000000}M (Multi-threaded)")
@@ -265,19 +251,19 @@ def precompute_ground_truth(size, range_pcts, num_queries=NUM_QUERIES, num_range
             range_list = []
 
             for _ in range(num_ranges_per_pct):
-                # 生成随机 range
+                # Generate a range.
                 range_width = max(1, int(actual_size * range_pct / 100))
                 max_l_bound = actual_size - range_width
                 l_bound = np.random.randint(0, max(1, max_l_bound))
                 r_bound = l_bound + range_width - 1
 
-                # 准备所有查询的任务参数 - 1000 个任务（轻量级参数，只传索引）
+                # Pass query indices and scalar bounds to workers.
                 query_tasks = [(query_idx, l_bound, r_bound, TOP_K) for query_idx in range(num_queries)]
 
-                # 多进程并行计算 1000 个查询的 GT（共享内存 + fork 避免拷贝）
+                # Compute query ground truth in worker processes.
                 results = pool.map(_compute_single_query_gt, query_tasks)
 
-                # 按查询索引排序，确保顺序正确
+                # Restore query order after parallel processing.
                 results.sort(key=lambda x: x[0])
                 all_gt_ids = [gt_ids for _, gt_ids in results]
 
@@ -291,7 +277,7 @@ def precompute_ground_truth(size, range_pcts, num_queries=NUM_QUERIES, num_range
     _shared_vectors = None
     _shared_queries = None
 
-    # 保存到文件
+    # Persist the completed cache.
     if verbose:
         print(f"[GT CACHE] Saving to: {cache_path}")
     with open(cache_path, 'wb') as f:
@@ -316,12 +302,12 @@ def load_fvecs(path, count=None):
         return data.reshape(-1, dim)
 
 def get_collection_name(size, m, ef_con):
-    """生成 collection 名称"""
+    """Return the collection name for an index configuration."""
     size_str = f"{size//1000000}m"
     return f"deep_{size_str}_M{m}_EFCON{ef_con}"
 
 def collection_has_index(collection):
-    """检查 collection 是否有索引"""
+    """Return whether a collection has an index."""
     indexes = collection.indexes
     return len(indexes) > 0
 
@@ -329,23 +315,18 @@ def collection_has_index(collection):
 
 def estimate_index_size(size, m, ef_con):
     """
-    估算 HNSW 索引大小
+    Estimate HNSW index size from graph links, levels, vectors, and IDs.
 
-    基于 HNSW 的内存占用公式：
-    - 每个节点约: M * 2 * (4 + 4) bytes = M * 16 bytes (边)
-    - 每个节点: 4 bytes (level)
-    - 每个向量: dim * 4 bytes
-    - 每个ID: 8 bytes
-
-    参考：https://github.com/nmslib/hnswlib/blob/master/ALGO_PARAMS.md
+    The estimate uses 2M links per node, eight bytes per link, four bytes for
+    the level, DIM * 4 bytes for the vector, and eight bytes for the ID.
     """
-    # 每个节点的边数（约为 M * 2）
+    # Approximate number of links per node
     edges_per_node = m * 2
 
-    # 每条边占用的字节（neighbor_id + link_data）
+    # Bytes per link for neighbor ID and link data
     bytes_per_edge = 4 + 4
 
-    # 每个节点的字节
+    # Estimated bytes per node
     bytes_per_node = (
         edges_per_node * bytes_per_edge +  # edges
         4 +                                  # level
@@ -354,15 +335,15 @@ def estimate_index_size(size, m, ef_con):
     )
 
     total_bytes = size * bytes_per_node
-    return total_bytes / (1024 * 1024)  # 转换为 MB
+    return total_bytes / (1024 * 1024)  # Convert to MiB.
 
 # ============== BUILD FUNCTION ==============
 
 def build_collection(size, m, ef_con, verbose=True):
-    """构建 collection 和索引
+    """Create a collection, insert vectors, and construct its HNSW index.
 
-    注意：build_time 只计算 create_index() 的时间，不包括 insert 时间
-    因为在 Milvus 中，insert 只是数据写入，create_index 才是真正的索引构建
+    build_time measures create_index only; insertion time is reported
+    separately and is not included in that field.
     """
     if not ensure_milvus_connection():
         raise RuntimeError("Milvus connection unavailable during build.")
@@ -374,7 +355,7 @@ def build_collection(size, m, ef_con, verbose=True):
         print(f"{'='*80}")
         print(f"  Collection: {collection_name}")
 
-    # 强制删除现存 collection，确保每次都是全新构建（准确测量 build 时间）
+    # Drop an existing collection so each task constructs a new index.
     if utility.has_collection(collection_name):
         if verbose:
             print(f"  [CLEANUP] Dropping existing collection to ensure fresh build...")
@@ -382,7 +363,7 @@ def build_collection(size, m, ef_con, verbose=True):
         if verbose:
             print(f"  [CLEANUP] Dropped existing collection")
 
-    # 创建 collection
+    # Create the collection.
     if verbose:
         print(f"  [CREATE] Creating new collection...")
 
@@ -393,10 +374,10 @@ def build_collection(size, m, ef_con, verbose=True):
     schema = CollectionSchema(fields, description=f"DEEP-{size//1000000}M M={m} ef_con={ef_con}")
     collection = Collection(name=collection_name, schema=schema)
 
-    # 插入数据（这不是索引构建！）
+    # Insert vectors before the timed create_index call.
     if verbose:
         print(f"  [INSERT] Loading and inserting {size} vectors...")
-        print(f"    注意：insert 只是数据写入，不计入 build_time")
+        print("    Insertion time is reported separately from build_time")
 
     vectors = load_fvecs(DEEP_BASE_PATH, size)
     actual_size = vectors.shape[0]
@@ -407,7 +388,7 @@ def build_collection(size, m, ef_con, verbose=True):
         end = min(i + BATCH_SIZE, actual_size)
         milvus_call("insert", collection.insert, [ids[i:end].tolist(), vectors[i:end]])
 
-        # 显示进度
+        # Report insertion progress.
         if verbose and (i // BATCH_SIZE) % 10 == 0:
             progress = (end / actual_size) * 100
             print(f"    Insert progress: {progress:.1f}% ({end}/{actual_size})")
@@ -416,9 +397,9 @@ def build_collection(size, m, ef_con, verbose=True):
     insert_time = time.time() - insert_start
 
     if verbose:
-        print(f"  [INSERT] Inserted {actual_size} vectors in {insert_time:.2f}s (不计入 build_time)")
+        print(f"  [INSERT] Inserted {actual_size} vectors in {insert_time:.2f}s")
 
-    # 构建索引 - 这才是真正的索引构建！只计算这部分时间
+    # Time the create_index operation.
     index_params = {
         "metric_type": METRIC_TYPE,
         "index_type": "HNSW",
@@ -426,24 +407,23 @@ def build_collection(size, m, ef_con, verbose=True):
     }
 
     if verbose:
-        print(f"  [INDEX] Building HNSW index (真正的索引构建开始)...")
-        print(f"    预计需要 5-15 分钟，请耐心等待...")
-        print(f"    数据规模: {size:,} vectors")
-        print(f"    参数: M={m}, efConstruction={ef_con}")
+        print("  [INDEX] Building HNSW index")
+        print(f"    Dataset size: {size:,} vectors")
+        print(f"    Parameters: M={m}, efConstruction={ef_con}")
 
     build_start = time.time()
     milvus_call("create_index", collection.create_index, field_name="embedding", index_params=index_params)
     build_time = time.time() - build_start
 
-    # 估算索引大小
+    # Estimate index size.
     index_size_mb = estimate_index_size(size, m, ef_con)
 
     if verbose:
         print(f"  [INDEX] Index built in {build_time:.2f}s ({build_time/60:.1f} min)")
         print(f"  [SIZE]  Estimated index size: {index_size_mb:.2f} MB")
-        print(f"  [TIMING] Insert: {insert_time:.2f}s, Build: {build_time:.2f}s (只有 Build 计入 build_time)")
+        print(f"  [TIMING] Insert: {insert_time:.2f}s, build_time: {build_time:.2f}s")
 
-    # 加载到内存
+    # Load the collection for querying.
     if verbose:
         print(f"  [LOAD] Loading collection into memory...")
 
@@ -461,14 +441,14 @@ def build_collection(size, m, ef_con, verbose=True):
 # ============== QUERY FUNCTION ==============
 
 def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose=True):
-    """执行批量查询测试（使用缓存的 GT）
+    """Run batched queries using cached ground truth.
 
     Args:
-        collection_name: Milvus collection 名称
-        ef: 搜索参数 ef
-        range_pcts: 要测试的 range 百分比列表
-        gt_cache: 预计算的 ground truth 缓存
-        queries: 查询向量（已加载，避免重复加载）
+        collection_name: Milvus collection name.
+        ef: Search parameter.
+        range_pcts: Range percentages to evaluate.
+        gt_cache: Precomputed ground-truth cache.
+        queries: Loaded query vectors.
     """
     if not ensure_milvus_connection():
         raise RuntimeError("Milvus connection unavailable during query.")
@@ -476,8 +456,8 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
 
     if verbose:
         print(f"\n[QUERY] Testing ef={ef}, ranges={range_pcts}")
-        print(f"  [BATCH] 批量查询模式：{BATCH_QUERY_SIZE} 个查询/批")
-        print(f"  [GT CACHE] 使用预计算的 GT，不再重复计算")
+        print(f"  [BATCH] Queries per request: {BATCH_QUERY_SIZE}")
+        print("  [GT CACHE] Using precomputed ground truth")
 
     search_params = {"metric_type": METRIC_TYPE, "params": {"ef": ef}}
 
@@ -491,7 +471,7 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
         if verbose:
             print(f"  [{current_test}/{total_tests}] Range={range_pct}%", end=" ", flush=True)
 
-        # 从缓存获取该 range_pct 的所有 range 数据
+        # Read ranges and exact results from the cache.
         range_list = gt_cache[range_pct]
 
         total_recall = 0.0
@@ -501,7 +481,7 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
         for range_idx, (l_bound, r_bound, all_gt_ids) in enumerate(range_list):
             expr = f"id >= {l_bound} && id <= {r_bound}"
 
-            # Warm up（批量查询）
+            # Warm up the batched query path.
             if range_idx == 0:
                 try:
                     collection.search(
@@ -515,7 +495,7 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
                 except:
                     pass
 
-            # 批量查询：按 BATCH_QUERY_SIZE 分批
+            # Submit queries in batches of BATCH_QUERY_SIZE.
             num_queries = queries.shape[0]
             t_start = time.time()
             batch_recall = 0.0
@@ -545,7 +525,7 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
 
             t_end = time.time()
 
-            # 计算 QPS（该 range 的总时间）
+            # Compute QPS for this range.
             batch_qps = num_queries / (t_end - t_start) if (t_end - t_start) > 0 else 0
             total_qps += batch_qps
 
@@ -570,14 +550,14 @@ def query_collection(collection_name, ef, range_pcts, gt_cache, queries, verbose
 # ============== SINGLE TASK FUNCTION ==============
 
 def run_single_task(size, m, ef_con, ef_list, gt_cache, queries):
-    """执行单个任务：构建（如需要）+ 多组查询
+    """Construct one index and evaluate its search configurations.
 
     Args:
-        size: 数据集规模
-        m, ef_con: 索引参数
-        ef_list: 搜索参数列表
-        gt_cache: 预计算的 ground truth 缓存
-        queries: 查询向量（已加载，避免重复加载）
+        size: Dataset size.
+        m, ef_con: Index parameters.
+        ef_list: Search parameter values.
+        gt_cache: Precomputed ground-truth cache.
+        queries: Loaded query vectors.
     """
     size_str = f"{size//1000000}M"
     collection_name = get_collection_name(size, m, ef_con)
@@ -586,12 +566,12 @@ def run_single_task(size, m, ef_con, ef_list, gt_cache, queries):
     print(f"[TASK] Milvus deep_{size_str} M={m} ef_con={ef_con} ef_list={ef_list}")
     print(f"{'='*80}")
 
-    # 构建阶段
+    # Index-construction phase
     build_result = build_collection(size, m, ef_con, verbose=True)
 
     results = []
     for ef in ef_list:
-        # 查询阶段（使用缓存的 GT）
+        # Query phase using cached ground truth
         query_results = query_collection(
             collection_name=build_result["collection_name"],
             ef=ef,
@@ -601,7 +581,7 @@ def run_single_task(size, m, ef_con, ef_list, gt_cache, queries):
             verbose=True
         )
 
-        # 组装结果
+        # Assemble result rows.
         for qr in query_results:
             results.append({
                 'method': 'milvus',
@@ -617,7 +597,7 @@ def run_single_task(size, m, ef_con, ef_list, gt_cache, queries):
                 'size_mb': build_result['index_size_mb'],
             })
 
-    # 释放内存（保留索引）
+    # Release the in-memory collection while retaining the index.
     try:
         collection = Collection(build_result["collection_name"])
         collection.release()
@@ -634,40 +614,40 @@ def main():
     result_path = os.path.join(RESULTS_DIR, f"milvus_scaling_{timestamp}.csv")
 
     print("="*80)
-    print("DEEP10M Milvus 固定参数规模扩展测试")
+    print("DEEP10M Milvus Scalability Evaluation")
     print("="*80)
-    print(f"数据集: {DEEP_BASE_PATH}")
+    print(f"Dataset: {DEEP_BASE_PATH}")
     print(f"Query:  {DEEP_QUERY_PATH}")
-    print(f"规模点: {[f'{s//1000000}M' for s in DATA_SIZES]}")
-    print(f"索引参数: {INDEX_CONFIGS}")
-    print(f"搜索参数(ef): {K_SEARCH_VALUES}")
+    print(f"Dataset sizes: {[f'{s//1000000}M' for s in DATA_SIZES]}")
+    print(f"Index configurations: {INDEX_CONFIGS}")
+    print(f"Search parameters (ef): {K_SEARCH_VALUES}")
     print(f"Range: {RANGE_PCTS}%")
     print("="*80)
 
-    # 连接 Milvus
+    # Connect to Milvus.
     print("\n[CONNECT] Connecting to Milvus...")
     if not ensure_milvus_connection():
         return 1
     print(f"[CONNECT] Connected to Milvus at {MILVUS_HOST}:{MILVUS_PORT}")
 
-    # 列出已有 collections
+    # List existing collections.
     all_collections = utility.list_collections()
     print(f"\n[INFO] Existing collections: {len(all_collections)}")
     for coll in all_collections:
         if coll.startswith("deep_"):
             print(f"  - {coll}")
 
-    # 初始化 CSV（增量保存）
+    # Initialize the append-only result file.
     csv_header = ",".join(CSV_COLUMNS)
     with open(result_path, 'w') as f:
         f.write(csv_header + '\n')
 
-    # 加载查询向量（所有任务共用）
+    # Load query vectors once for all tasks.
     print("\n[QUERIES] Loading query vectors...")
     queries = load_fvecs(DEEP_QUERY_PATH, NUM_QUERIES)
     print(f"[QUERIES] Loaded {queries.shape[0]} queries")
 
-    # 执行任务（按数据集规模分组）
+    # Execute tasks grouped by dataset size.
     total_tasks = len(DATA_SIZES) * len(INDEX_CONFIGS)
     all_results = []
     first_save = False
@@ -676,25 +656,25 @@ def main():
     for size in DATA_SIZES:
         size_str = f"{size//1000000}M"
 
-        # 为当前数据集规模预计算 GT
+        # Precompute ground truth for this dataset size.
         print(f"\n\n{'='*80}")
-        print(f"[GT PRECOMPUTE] 预计算 {size_str} 的 Ground Truth")
+        print(f"[GT PRECOMPUTE] Dataset size: {size_str}")
         print(f"{'='*80}")
 
-        # 动态调整 CPU 亲和性：GT 生成时使用全部核心
+        # Temporarily use all CPU cores for ground-truth generation.
         original_affinity = get_current_affinity()
-        print(f"[CPU Affinity] 保存当前亲和性: {original_affinity}")
-        print(f"[CPU Affinity] 切换到全部核心用于 GT 生成...")
+        print(f"[CPU Affinity] Saved affinity: {original_affinity}")
+        print("[CPU Affinity] Using all cores for ground-truth generation")
         release_cpu_affinity()
 
         try:
             gt_cache = precompute_ground_truth(size, RANGE_PCTS, num_queries=NUM_QUERIES, verbose=True)
         finally:
-            # 恢复原始亲和性（E-cores）
-            print(f"[CPU Affinity] 恢复到 E-cores: {E_CORES}")
+            # Restore the configured affinity after ground-truth generation.
+            print(f"[CPU Affinity] Restoring configured CPU set: {E_CORES}")
             set_cpu_affinity()
 
-        # 当前规模的所有索引参数测试（复用同一个 GT）
+        # Reuse the ground-truth cache for all index configurations.
         for cfg in INDEX_CONFIGS:
             task_num += 1
             m = cfg["M"]
@@ -721,29 +701,29 @@ def main():
                 if results:
                     all_results.extend(results)
 
-                    # 增量保存
+                    # Append completed result rows.
                     df_new = pd.DataFrame(results, columns=CSV_COLUMNS)
                     df_new.to_csv(result_path, mode='a', header=first_save, index=False)
 
-                    print(f"\n[PROGRESS] 进度: {task_num}/{total_tasks} | 已保存: {len(all_results)} 条记录")
+                    print(f"\n[PROGRESS] {task_num}/{total_tasks} | saved rows: {len(all_results)}")
 
             except Exception as e:
                 print(f"\n[ERROR] Task failed: {e}")
                 import traceback
                 traceback.print_exc()
 
-    # 最终汇总
+    # Final summary
     if all_results:
         df = pd.DataFrame(all_results)
 
         print("\n" + "="*80)
-        print("测试完成!")
+        print("Evaluation completed")
         print("="*80)
-        print(f"结果文件: {result_path}")
-        print(f"共 {len(all_results)} 条记录")
+        print(f"Result file: {result_path}")
+        print(f"Result rows: {len(all_results)}")
 
-        # 显示汇总
-        print("\n汇总结果 (range=10%):")
+        # Display the 10% range summary.
+        print("\nSummary (range=10%):")
         print("-" * 80)
         print(f"{'Method':<10} {'Dataset':<10} {'BuildTime(s)':<12} {'Size(MB)':<12} "
               f"{'Recall':<10} {'QPS':<12}")

@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-Pareto Frontier Test Script for Milvus
+Pareto frontier evaluation for Milvus HNSW.
 
-目标：
-- 测试 Milvus HNSW 索引在多个数据集上的性能
-- 测试多个构建参数组合 (M, ef_construction)
-- 测试多个搜索参数 (ef_search)
-- 收集 QPS-Recall 数据用于绘制帕累托前沿曲线
-- 输出与 HNSW/SeRF 一致的 CSV 格式
-
-特点：
-- 复用已有 collection（避免重复构建）
-- 断点续传（检查已有结果）
-- CPU 亲和性（绑定到 E-cores）
-- 与 HNSW/SeRF 相同的 query 文件
-
-输出：
-- CSV 文件包含 method, dataset, M, K, K_Search, range_pct, recall, qps, comps, build_time, index_size_mb
-- 与 HNSW/SeRF 共享同一个 CSV 文件：results/pareto_frontier/pareto_all.csv
+The script evaluates the same datasets, query files, index parameters, search
+parameters, and output schema used by the SeRF and HNSW evaluation. Existing
+collections and result rows are reused when available. The process is pinned
+to the configured CPU set.
 """
 
 import time
@@ -38,30 +26,30 @@ from pymilvus import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
-# Milvus 连接
+# Milvus connection
 MILVUS_HOST = "127.0.0.1"
 MILVUS_PORT = "19530"
 
-# 输出目录
+# Output directory
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results", "exp1_search_efficiency")
 
-# CPU 亲和性 - 绑定到 E-cores（避免与 HNSW/SeRF 竞争）
+# CPU affinity used for this process
 E_CORES = list(range(16, 32))
 
 def set_cpu_affinity():
-    """绑定进程到 E-cores"""
+    """Pin the process to the configured CPU set."""
     try:
         os.sched_setaffinity(0, E_CORES)
-        print(f"[CPU] 绑定到 E-cores: {E_CORES}")
+        print(f"[CPU] Affinity set to: {E_CORES}")
     except AttributeError:
-        print("[WARN] os.sched_setaffinity 不可用")
+        print("[WARN] os.sched_setaffinity is unavailable")
     except Exception as e:
-        print(f"[WARN] 设置 CPU 亲和性失败: {e}")
+        print(f"[WARN] Could not set CPU affinity: {e}")
 
-# 在导入时设置 CPU 亲和性
+# Apply CPU affinity during initialization.
 set_cpu_affinity()
 
-# 数据集配置（与 HNSW/SeRF 一致）
+# Dataset configuration shared with SeRF and HNSW
 DATASETS = {
     "DEEP-96": {
         "base_path": os.environ.get("GRAB_DEEP_BASE", ""),
@@ -85,10 +73,10 @@ DATASETS = {
     },
 }
 
-# 数据规模
+# Dataset size
 DATA_SIZE = 1000000
 
-# 索引参数（与 HNSW/SeRF 一致）
+# Index parameters
 INDEX_CONFIGS = [
     {"M": 8,  "ef_con": 100},
     {"M": 8,  "ef_con": 200},
@@ -100,25 +88,25 @@ INDEX_CONFIGS = [
     # {"M": 64, "ef_con": 200},
 ]
 
-# 搜索参数（与 HNSW/SeRF 一致）
+# Search parameters
 EF_SEARCH_VALUES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-# Range 百分比
+# Evaluated range percentages
 RANGE_PCTS = [1.0, 10.0, 20.0, 100.0]
 
-# 查询配置
+# Query configuration
 NUM_QUERIES = 1000
 TOP_K = 10
 QUERY_SEED = 42
 
-# Milvus 索引配置
+# Milvus index configuration
 INDEX_TYPE = "HNSW"
 METRIC_TYPE = "L2"
 
-# ============== 工具函数 ==============
+# ============== UTILITIES ==============
 
 def load_fvecs(path, count=None):
-    """加载 fvecs 文件"""
+    """Load vectors from an fvecs file."""
     with open(path, 'rb') as f:
         dim = np.frombuffer(f.read(4), dtype=np.int32)[0]
         if count is None:
@@ -129,7 +117,7 @@ def load_fvecs(path, count=None):
         return data.reshape(-1, dim)
 
 def get_batch_size(dim):
-    """根据维度获取合适的批量大小（避免超过 gRPC 64MB 限制）"""
+    """Select an insertion batch size within the gRPC message limit."""
     if dim >= 2048:
         return 7500
     elif dim >= 960:
@@ -140,7 +128,7 @@ def get_batch_size(dim):
         return 150000
 
 def synthesize_queries(vectors, num_queries=NUM_QUERIES, seed=QUERY_SEED):
-    """生成合成查询（与 C++ 一致的方法）"""
+    """Generate synthetic queries with the same procedure as the C++ runner."""
     n, dim = vectors.shape
     queries = np.zeros((num_queries, dim), dtype=np.float32)
     rng = np.random.default_rng(seed)
@@ -153,12 +141,12 @@ def synthesize_queries(vectors, num_queries=NUM_QUERIES, seed=QUERY_SEED):
     return queries
 
 def get_collection_name(dataset_key, m, ef_con):
-    """生成 collection 名称"""
+    """Return the collection name for an index configuration."""
     dataset_short = dataset_key.split('-')[0].lower()
     return f"{dataset_short}_1m_M{m}_EFCON{ef_con}"
 
 def get_existing_results(csv_path):
-    """读取已测试的配置"""
+    """Read completed configurations from an existing result file."""
     if not os.path.exists(csv_path):
         return set()
 
@@ -170,27 +158,27 @@ def get_existing_results(csv_path):
             existing.add(key)
         return existing
     except Exception as e:
-        print(f"[WARN] 无法读取已有结果: {e}")
+        print(f"[WARN] Could not read existing results: {e}")
         return set()
 
-# ============== Milvus 操作 ==============
+# ============== MILVUS OPERATIONS ==============
 
 def create_collection_if_needed(collection_name, dim, vectors, m, ef_con):
-    """创建 collection 并插入数据（如果不存在）"""
+    """Create and populate a collection when it is not already available."""
     if utility.has_collection(collection_name):
         collection = Collection(collection_name)
         num_entities = collection.num_entities
 
         if num_entities == DATA_SIZE:
-            print(f"  [INFO] Collection 已存在: {collection_name} ({num_entities} vectors)")
+            print(f"  [INFO] Reusing collection: {collection_name} ({num_entities} vectors)")
             return collection
         else:
-            print(f"  [WARN] Collection 数据不完整: {collection_name} ({num_entities}/{DATA_SIZE})")
-            print(f"  [INFO] 删除并重建...")
+            print(f"  [WARN] Collection is incomplete: {collection_name} ({num_entities}/{DATA_SIZE})")
+            print("  [INFO] Dropping and recreating the collection")
             utility.drop_collection(collection_name)
 
-    # 创建新 collection
-    print(f"  [CREATE] 创建 collection: {collection_name}")
+    # Create a collection.
+    print(f"  [CREATE] Collection: {collection_name}")
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
         FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim)
@@ -198,37 +186,36 @@ def create_collection_if_needed(collection_name, dim, vectors, m, ef_con):
     schema = CollectionSchema(fields, description=f"M={m}, ef_con={ef_con}")
     collection = Collection(name=collection_name, schema=schema)
 
-    # 插入数据
+    # Insert vectors in dimension-dependent batches.
     actual_size = vectors.shape[0]
     ids = np.arange(actual_size)
     batch_size = get_batch_size(dim)
 
-    print(f"  [INSERT] 插入 {actual_size} 向量...")
+    print(f"  [INSERT] Vectors: {actual_size}")
     for i in range(0, actual_size, batch_size):
         end = min(i + batch_size, actual_size)
         collection.insert([ids[i:end].tolist(), vectors[i:end]])
     collection.flush()
-    print(f"  [INSERT] 完成: {actual_size} vectors")
+    print(f"  [INSERT] Completed: {actual_size} vectors")
 
     return collection
 
 def build_index_if_needed(collection, m, ef_con):
-    """构建索引（如果不存在）"""
+    """Construct the index when it is not already available."""
     indexes = collection.indexes
     if indexes:
-        print(f"  [INFO] 索引已存在")
-        # 验证索引是否就绪
+        print("  [INFO] Reusing existing index")
+        # Verify that the existing index can be loaded.
         try:
             collection.load()
             collection.release()
             return True, 0.0
         except Exception as e:
-            print(f"  [WARN] 索引未就绪: {e}")
+            print(f"  [WARN] Index is not ready: {e}")
             return False, 0.0
 
-    # 构建索引
-    print(f"  [INDEX] 构建 HNSW: M={m}, efConstruction={ef_con}")
-    print(f"  [INDEX] 预计需要 1-5 分钟...")
+    # Construct the HNSW index.
+    print(f"  [INDEX] HNSW parameters: M={m}, efConstruction={ef_con}")
 
     index_params = {
         "metric_type": METRIC_TYPE,
@@ -240,23 +227,23 @@ def build_index_if_needed(collection, m, ef_con):
     collection.create_index(field_name="embedding", index_params=index_params)
     build_time = time.time() - t0
 
-    # 验证索引
+    # Verify that the constructed index can be loaded.
     try:
         collection.load()
         collection.release()
-        print(f"  [INDEX] ✅ 构建完成: {build_time:.2f}s")
+        print(f"  [INDEX] Completed: {build_time:.2f}s")
         return True, build_time
     except Exception as e:
-        print(f"  [ERROR] 索引构建失败: {e}")
+        print(f"  [ERROR] Index construction failed: {e}")
         return False, build_time
 
 def test_range_query_batch(collection, queries, vectors, ef, range_pct):
-    """执行范围查询并计算 recall（批量处理）"""
+    """Run range-filtered queries and compute recall."""
     actual_size = vectors.shape[0]
     range_width = int(actual_size * range_pct / 100)
     range_width = max(1, range_width)
 
-    # 生成随机范围
+    # Generate query ranges.
     rng = np.random.default_rng(QUERY_SEED)
     if range_pct == 100:
         l_bounds = np.zeros(NUM_QUERIES, dtype=int)
@@ -265,13 +252,13 @@ def test_range_query_batch(collection, queries, vectors, ef, range_pct):
         max_l_bound = max(0, max_l_bound)
         l_bounds = rng.integers(0, max_l_bound + 1, size=NUM_QUERIES)
 
-    # 计算 ground truth
+    # Compute exact ground truth.
     total_recall = 0.0
     total_time = 0.0
 
     search_params = {"metric_type": METRIC_TYPE, "params": {"ef": ef}}
 
-    collection.load()  # 确保已加载
+    collection.load()  # Ensure that the collection is loaded.
 
     for query_idx in range(NUM_QUERIES):
         l_bound = int(l_bounds[query_idx])
@@ -281,7 +268,7 @@ def test_range_query_batch(collection, queries, vectors, ef, range_pct):
         range_vectors = vectors[l_bound:r_bound+1]
         query_vector = queries[query_idx:query_idx+1]
 
-        # 计算距离（内存优化）
+        # Compute distances without allocating a full difference matrix.
         vec_sq = np.einsum('ij,ij->i', range_vectors, range_vectors)
         query_sq = np.einsum('i,i', query_vector[0], query_vector[0])
         dot_prod = np.dot(range_vectors, query_vector.flatten())
@@ -294,7 +281,7 @@ def test_range_query_batch(collection, queries, vectors, ef, range_pct):
         else:
             gt_ids = set()
 
-        # Milvus 查询
+        # Run the Milvus query.
         expr = f"id >= {l_bound} && id <= {r_bound}"
 
         t0 = time.time()
@@ -308,7 +295,7 @@ def test_range_query_batch(collection, queries, vectors, ef, range_pct):
         )
         query_time = time.time() - t0
 
-        # 计算 recall
+        # Compute recall.
         result_ids = set()
         for hit in res[0]:
             if hasattr(hit, 'id'):
@@ -323,10 +310,10 @@ def test_range_query_batch(collection, queries, vectors, ef, range_pct):
 
     return avg_recall, avg_qps
 
-# ============== 主流程 ==============
+# ============== MAIN WORKFLOW ==============
 
 def run_single_task(task, csv_path, existing_results):
-    """执行单个任务"""
+    """Run one index and search configuration."""
     dataset_key = task["dataset_key"]
     dataset_info = task["dataset_info"]
     m = task["M"]
@@ -338,7 +325,7 @@ def run_single_task(task, csv_path, existing_results):
     print(f"[TASK] {dataset_key} M={m} K={ef_con}")
     print(f"{'='*80}")
 
-    # 过滤出未测试的 ef_search
+    # Select ef_search values that have not been evaluated.
     untested_ef = []
     for ef in EF_SEARCH_VALUES:
         key = ('milvus', dataset_key, m, ef_con, ef)
@@ -346,42 +333,40 @@ def run_single_task(task, csv_path, existing_results):
             untested_ef.append(ef)
 
     if not untested_ef:
-        print(f"[SKIP] 所有 ef_search 已测试")
+        print("[SKIP] All ef_search values completed")
         return []
 
-    print(f"[INFO] 待测试 ef_search: {untested_ef}")
+    print(f"[INFO] Remaining ef_search values: {untested_ef}")
 
-    # 加载数据
-    print(f"[LOAD] 加载数据: {dataset_info['base_path']}")
+    # Load base vectors.
+    print(f"[LOAD] Base vectors: {dataset_info['base_path']}")
     vectors = load_fvecs(dataset_info['base_path'], DATA_SIZE)
-    print(f"[LOAD] 数据大小: {vectors.shape}")
+    print(f"[LOAD] Vector array shape: {vectors.shape}")
 
-    # 加载或生成查询
+    # Load the query file or generate queries when no file is available.
     query_path = dataset_info['query_path']
     if query_path and os.path.exists(query_path):
         queries = load_fvecs(query_path, NUM_QUERIES)
-        print(f"[LOAD] 查询数据: {queries.shape}")
+        print(f"[LOAD] Query array shape: {queries.shape}")
     else:
-        print(f"[SYNTH] 生成合成查询: {NUM_QUERIES} 条")
+        print(f"[SYNTH] Generating {NUM_QUERIES} queries")
         queries = synthesize_queries(vectors, NUM_QUERIES)
 
-    # 创建/加载 collection
+    # Create or reuse the collection.
     collection = create_collection_if_needed(collection_name, dataset_info['dim'], vectors, m, ef_con)
 
-    # 构建索引
+    # Construct or reuse the index.
     index_ready, build_time = build_index_if_needed(collection, m, ef_con)
 
     if not index_ready:
-        print(f"[ERROR] 索引未就绪，跳过测试")
+        print("[ERROR] Index is not ready; query task skipped")
         return []
 
-    # 计算索引大小（Milvus collection 的估算大小）
-    # Milvus 的 collection 大小约等于 数据量 × 维度 × 4 bytes（float32）
-    # 加上索引结构开销（约 1.5-2 倍）
+    # Estimate collection size from float32 vectors and index overhead.
     data_size_mb = (DATA_SIZE * dataset_info['dim'] * 4) / (1024 * 1024)
-    index_size_mb = data_size_mb * 1.5  # 索引结构开销
+    index_size_mb = data_size_mb * 1.5  # Estimated index overhead
 
-    # 执行查询测试
+    # Run query configurations.
     results = []
 
     for ef in untested_ef:
@@ -406,14 +391,14 @@ def run_single_task(task, csv_path, existing_results):
                 'index_size_mb': index_size_mb,
             })
 
-    # 释放 collection
+    # Release the collection after the task.
     collection.release()
-    print(f"[INFO] Collection 已释放")
+    print("[INFO] Collection released")
 
     return results
 
 def generate_tasks():
-    """生成所有任务"""
+    """Generate all evaluation tasks."""
     tasks = []
 
     for dataset_key, dataset_info in DATASETS.items():
@@ -431,57 +416,57 @@ def generate_tasks():
     return tasks
 
 def main():
-    # 创建输出目录
+    # Create the output directory.
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # 使用统一 CSV 文件（与 HNSW/SeRF 共享）
+    # Milvus, SeRF, and HNSW write to the same result file.
     UNIFIED_CSV = os.path.join(RESULTS_DIR, "pareto_all.csv")
     CSV_PATH = UNIFIED_CSV
 
     print("="*80)
     print("Pareto Frontier Test for Milvus")
     print("="*80)
-    print(f"数据集: {list(DATASETS.keys())}")
-    print(f"数据规模: {DATA_SIZE//1000000}M")
-    print(f"索引参数: {len(INDEX_CONFIGS)} 个组合")
-    print(f"搜索参数: ef_search = {EF_SEARCH_VALUES}")
+    print(f"Datasets: {list(DATASETS.keys())}")
+    print(f"Dataset size: {DATA_SIZE//1000000}M")
+    print(f"Index configurations: {len(INDEX_CONFIGS)}")
+    print(f"Search parameters: ef_search = {EF_SEARCH_VALUES}")
     print(f"Range: {RANGE_PCTS}%")
     print("="*80)
 
-    # 连接 Milvus
-    print("\n[CONNECT] 连接 Milvus...")
+    # Connect to Milvus.
+    print("\n[CONNECT] Milvus")
     try:
         connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT, timeout=60)
-        print(f"[CONNECT] ✅ 已连接: {MILVUS_HOST}:{MILVUS_PORT}")
+        print(f"[CONNECT] Connected: {MILVUS_HOST}:{MILVUS_PORT}")
     except Exception as e:
-        print(f"[ERROR] 连接失败: {e}")
-        print(f"[HINT] 请先启动 Milvus: cd script_milvus && ./start_milvus.sh")
+        print(f"[ERROR] Connection failed: {e}")
+        print("[HINT] Start the Milvus service before running this evaluation")
         return 1
 
-    # 生成任务
+    # Generate tasks.
     tasks = generate_tasks()
-    print(f"\n共 {len(tasks)} 个任务")
+    print(f"\nTotal tasks: {len(tasks)}")
 
-    # 创建 CSV 文件（如果不存在）
+    # Create the result file if needed.
     if not os.path.exists(CSV_PATH):
         with open(CSV_PATH, 'w') as f:
             f.write("method,dataset,M,K,K_Search,range_pct,recall,qps,comps,build_time,index_size_mb\n")
-        print(f"[INFO] 创建统一 CSV 文件: {CSV_PATH}")
+        print(f"[INFO] Created result file: {CSV_PATH}")
     else:
-        print(f"[INFO] 使用已有 CSV 文件: {CSV_PATH}")
+        print(f"[INFO] Using existing result file: {CSV_PATH}")
 
-    # 读取已有结果
+    # Read completed configurations.
     existing_results = get_existing_results(CSV_PATH)
-    print(f"已测试配置: {len(existing_results)} 个")
+    print(f"Completed configurations: {len(existing_results)}")
 
-    # 顺序执行任务
+    # Execute tasks sequentially.
     completed = 0
     for task_idx, task in enumerate(tasks, 1):
-        print(f"\n[PROGRESS] 任务 {task_idx}/{len(tasks)}")
+        print(f"\n[PROGRESS] Task {task_idx}/{len(tasks)}")
 
         results = run_single_task(task, CSV_PATH, existing_results)
 
-        # 实时写入 CSV
+        # Append each completed task to the result file.
         if results:
             with open(CSV_PATH, 'a') as f:
                 for r in results:
@@ -490,9 +475,9 @@ def main():
             completed += len(results)
 
     print("\n" + "="*80)
-    print(f"测试完成！")
-    print(f"结果已保存到: {CSV_PATH}")
-    print(f"共 {completed} 条新记录")
+    print("Evaluation completed")
+    print(f"Results saved to: {CSV_PATH}")
+    print(f"New result rows: {completed}")
     print("="*80)
 
     return 0

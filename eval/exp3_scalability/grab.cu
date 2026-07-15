@@ -12,23 +12,23 @@
 #include <map>
 #include <numeric>
 
-// 系统库
+// Standard library
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
-// FAISS (CPU 版本)
+// FAISS CPU API
 #include <faiss/IndexFlat.h>
 
 #define CHECK_CUDA(call) do { cudaError_t err = call; if (err != cudaSuccess) { fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); exit(1); } } while (0)
 
 // =============================================================================
-// 1. 配置结构体
+// 1. Configuration
 // =============================================================================
 struct BuildConfig {
-    size_t total_data_size;   // 数据量
-    size_t num_buckets;       // 桶数量
-    uint32_t graph_degree;    // 图度数
+    size_t total_data_size;   // Number of vectors
+    size_t num_buckets;       // Number of buckets
+    uint32_t graph_degree;    // Graph degree
 
     std::string to_string() const {
         return "N=" + std::to_string(total_data_size) +
@@ -57,7 +57,7 @@ struct RangeStats {
 };
 
 // =============================================================================
-// 2. 预生成的任务结构体 (优化核心)
+// 2. Precomputed query task
 // =============================================================================
 const int NUM_ROUNDS = 5;
 const int QUERIES_PER_ROUND = 32;
@@ -74,7 +74,7 @@ struct BenchmarkTask {
 };
 
 // =============================================================================
-// 3. 辅助工具 & SIFT 加载器
+// 3. Utilities and fvecs loader
 // =============================================================================
 class Timer {
     std::chrono::high_resolution_clock::time_point start_;
@@ -136,7 +136,7 @@ void log_csv(const std::string& filename, const BuildConfig& b, const SearchConf
 }
 
 // =============================================================================
-// 4. 任务生成器 (预计算 GT)
+// 4. Task generation and ground-truth computation
 // =============================================================================
 std::map<double, std::vector<BenchmarkTask>> generate_tasks(
     const float* host_data,
@@ -162,7 +162,7 @@ std::map<double, std::vector<BenchmarkTask>> generate_tasks(
         for (int round = 0; round < NUM_ROUNDS; ++round) {
             BenchmarkTask task;
 
-            // A. 随机范围
+            // A. Generate a range.
             int max_start = b_conf.num_buckets - span_buckets;
             task.start_bucket = std::uniform_int_distribution<int>(0, max_start)(rng);
             task.end_bucket = task.start_bucket + span_buckets;
@@ -172,7 +172,7 @@ std::map<double, std::vector<BenchmarkTask>> generate_tasks(
             size_t range_len = task.range_global_end - task.range_global_start;
             const float* range_data_ptr = host_data + task.range_global_start * dim;
 
-            // B. 随机 Query
+            // B. Sample queries.
             task.queries.resize(QUERIES_PER_ROUND * dim);
             std::uniform_int_distribution<int> q_dist(0, range_len - 1);
             for (int i = 0; i < QUERIES_PER_ROUND; ++i) {
@@ -182,19 +182,19 @@ std::map<double, std::vector<BenchmarkTask>> generate_tasks(
                           task.queries.data() + i * dim);
             }
 
-            // C. 计算 GT (FAISS) - 只计算一次！
+            // C. Compute ground truth once with FAISS.
             task.gt_indices.resize(QUERIES_PER_ROUND * K);
             std::vector<float> gt_dists(QUERIES_PER_ROUND * K);
 
-            // 在这一小段范围内建临时的 FAISS 索引
+            // Build a temporary FAISS index over the selected range.
             faiss::IndexFlatL2 cpu_index(dim);
             cpu_index.add(range_len, range_data_ptr);
 
-            // 搜索
+            // Search the temporary index.
             std::vector<int64_t> local_indices(QUERIES_PER_ROUND * K);
             cpu_index.search(QUERIES_PER_ROUND, task.queries.data(), K, gt_dists.data(), local_indices.data());
 
-            // 将局部 ID 转换为全局 ID 并保存
+            // Convert local result IDs to global IDs.
             for(int i=0; i<QUERIES_PER_ROUND * K; ++i) {
                 task.gt_indices[i] = local_indices[i] + task.range_global_start;
             }
@@ -209,7 +209,7 @@ std::map<double, std::vector<BenchmarkTask>> generate_tasks(
 }
 
 // =============================================================================
-// 5. 核心测试逻辑 (使用预生成的任务)
+// 5. Evaluation with precomputed tasks
 // =============================================================================
 void run_range_benchmark_fast(
     cagra::CagraIndexOpt& index,
@@ -220,14 +220,14 @@ void run_range_benchmark_fast(
     const std::map<double, std::vector<BenchmarkTask>>& tasks_map,
     const std::string& csv_file
 ) {
-    // 设置 CAGRA 搜索参数 (这一步很快)
+    // Set search parameters.
     index.setQueryParams(s_conf.itopk, s_conf.width, 0, s_conf.iter, 14);
 
     // std::cout << "   [Search Config] " << s_conf.to_string() << std::endl;
 
     for (const auto& kv : tasks_map) {
         double ratio = kv.first;
-        const auto& tasks = kv.second; // 这里取到了 NUM_ROUNDS 个任务
+        const auto& tasks = kv.second; // NUM_ROUNDS tasks for this range ratio
 
         RangeStats stats = {};
         stats.ratio = ratio;
@@ -239,7 +239,7 @@ void run_range_benchmark_fast(
             // D. CAGRA Range Search
             Timer t;
 
-            // 确保 active_degree 传入 graph_degree (32)，启用 Remote Edge
+            // Use graph_degree as active_degree to include remote edges.
             if (ratio <= 0.90f) {
                 index.query_range(task.queries.data(), QUERIES_PER_ROUND, K,
                                   (uint64_t)task.start_bucket, (uint64_t)task.end_bucket,
@@ -249,8 +249,7 @@ void run_range_benchmark_fast(
             }
             double ms = t.elapsed_ms();
 
-            // E. 统计
-            // 越界检查
+            // E. Aggregate metrics and check range validity.
             for (int i = 0; i < QUERIES_PER_ROUND * K; ++i) {
                 int64_t gid = out_indices[i];
                 if (gid != -1) {
@@ -267,7 +266,7 @@ void run_range_benchmark_fast(
         stats.avg_recall /= NUM_ROUNDS;
         stats.avg_qps /= NUM_ROUNDS;
 
-        // 仅打印关键信息减少刷屏
+        // Print one summary line per configuration.
         // std::cout << "      Ratio=" << (int)(ratio*100) << "% | Recall="
         //           << std::fixed << std::setprecision(2) << stats.avg_recall << "% | QPS="
         //           << (int)stats.avg_qps << std::endl;

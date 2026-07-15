@@ -2,17 +2,13 @@
 """
 Experiment 1 (Q1) - Milvus build-time only
 
-需求（按用户说明）：
-- 仅测试构建（不做 recall/QPS）
-- 固定参数：M=32, K=400（这里 K 记作 efConstruction=400），K_Search 留空
-- 4 个数据集：DEEP-96, SIFT-128, GIST-960, WIT-2048
-- 若 collection 已存在：先 drop，再 sleep 60s
-- create_index 完成后：记录 build_time，然后 drop，再 sleep 60s
-- 输出 CSV 列：method,dataset,M,K,K_Search,range_pct,recall,qps,comps,build_time,ips
+Milvus HNSW ingestion evaluation on DEEP-96, SIFT-128, GIST-960, and
+WIT-2048. The fixed configuration is M=32 and efConstruction=400. The
+evaluation records index construction time without running recall or QPS
+measurements. Existing collections are dropped before each run.
 
-说明：
-- build_time 计时口径：create_index + wait_for_index_building_complete（把异步构建等待算进去）
-- ips 口径：DATA_SIZE / build_time（与用户提供的 SeRF/HNSW ips 计算方式一致）
+build_time includes create_index and wait_for_index_building_complete. ips is
+computed as DATA_SIZE / build_time, matching the SeRF and HNSW evaluation.
 """
 
 from __future__ import annotations
@@ -84,7 +80,7 @@ MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
 
 METHOD = "milvus"
 M = 32
-K = 400  # 写入 CSV 的 K 列；对应 Milvus HNSW efConstruction
+K = 400  # CSV K field; corresponds to Milvus HNSW efConstruction.
 EF_CONSTRUCTION = 400
 
 DEFAULT_DATA_SIZE = 1_000_000

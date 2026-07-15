@@ -12,7 +12,7 @@
 #include <map>
 #include <numeric>
 
-// 系统库
+// Standard library
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -21,14 +21,14 @@
 #define CHECK_CUDA(call) do { cudaError_t err = call; if (err != cudaSuccess) { fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); exit(1); } } while (0)
 
 // =============================================================================
-// 1. 配置结构体
+// 1. Configuration
 // =============================================================================
 
 struct BuildConfig {
-    size_t total_data_size;   // 总数据量
-    size_t num_buckets;       // 桶数量
-    uint32_t graph_degree;    // 图度数
-    float base_ratio;         // Base 数据占比 (0.0 ~ 1.0)
+    size_t total_data_size;   // Total number of vectors
+    size_t num_buckets;       // Number of buckets
+    uint32_t graph_degree;    // Graph degree
+    float base_ratio;         // Fraction assigned to the base index (0.0 to 1.0)
 
     std::string to_string() const {
         return "N=" + std::to_string(total_data_size) +
@@ -53,7 +53,7 @@ struct SearchConfig {
 struct ResultStats {
     double insert_time_ms;
     double ips;             // Insertions Per Second
-    double ratio;           // 查询范围比例
+    double ratio;           // Query range ratio
     double avg_recall;
     double avg_qps;
     long long bound_errors;
@@ -61,7 +61,7 @@ struct ResultStats {
 };
 
 // =============================================================================
-// 2. 辅助工具 & SIFT Loader
+// 2. Utilities and fvecs loader
 // =============================================================================
 class Timer {
     std::chrono::high_resolution_clock::time_point start_;
@@ -98,7 +98,7 @@ void load_fvecs(const std::string& filename, std::vector<float>& data, int& dim,
     }
 }
 
-// 召回率计算：对比 GT 集合与 Search 结果集合
+// Compute recall from ground-truth and search-result ID sets.
 double calc_recall(size_t nq, int k, const int64_t* gt, const int64_t* res) {
     size_t correct = 0;
     for (size_t i = 0; i < nq; ++i) {
@@ -123,7 +123,7 @@ void log_csv(const std::string& filename, const BuildConfig& b, const SearchConf
 }
 
 // =============================================================================
-// 3. 核心测试逻辑
+// 3. Evaluation workflow
 // =============================================================================
 void run_insert_benchmark_suite(
     const float* host_full_data,
@@ -136,19 +136,19 @@ void run_insert_benchmark_suite(
     std::cout << "\n>>> [CONFIG] " << b_conf.to_string() << std::endl;
 
     // -------------------------------------------------------------
-    // 1. 数据准备 (按 Build/Insert 切分)
+    // 1. Split vectors between base construction and insertion.
     // -------------------------------------------------------------
     size_t bucket_size = b_conf.total_data_size / b_conf.num_buckets;
     if (bucket_size == 0) bucket_size = 1;
 
-    // 原始数据的时间戳
+    // Scalar values associated with the source vectors
     std::vector<uint64_t> timestamps(b_conf.total_data_size);
 
-    // 切分容器
+    // Per-bucket base and insertion buffers
     std::vector<float> build_data;
     std::vector<uint64_t> build_ts;
 
-    // 对于insert数据，我们每个桶分开储存
+    // Store insertion vectors separately for each bucket.
     std::vector<std::vector<float>> insert_data(b_conf.num_buckets);
     std::vector<std::vector<uint64_t>> insert_ts(b_conf.num_buckets);
 
@@ -165,7 +165,7 @@ void run_insert_benchmark_suite(
         timestamps[i] = ts;
         const float* vec = host_full_data + i * dim;
 
-        // 模拟：每个桶前 Ratio% 是老数据，后 (1-Ratio)% 是新数据
+        // Assign the first base_ratio fraction of each bucket to the base index.
         if ((i % bucket_size) < split_point) {
             build_data.insert(build_data.end(), vec, vec + dim);
             build_ts.push_back(ts);
@@ -191,7 +191,7 @@ void run_insert_benchmark_suite(
     std::cout << "   [Build] Time: " << t_build << " ms" << std::endl;
 
     // Insert
-    // 使用固定的较强参数进行插入时的搜索，保证图质量
+    // Use fixed insertion-search parameters for every evaluated dataset.
     index.setQueryParams(256, 4, 0, 50, 14);
 
     Timer insert_timer;
@@ -202,7 +202,7 @@ void run_insert_benchmark_suite(
         index.insert(insert_ts[bkt].size(), insert_data[bkt].data(), insert_ts[bkt].data());
         // sleep(5);
     }
-    // 从index获取图信息，采样几个点的邻居并打印
+    // Read graph metadata from the constructed index.
     auto graph = index.get_graph();
     for (int i = 1145; i < 1000000; i+= 30000) {
         std::cout << "Node " << i << " neighbors: ";
@@ -220,14 +220,14 @@ void run_insert_benchmark_suite(
 
 
     // -------------------------------------------------------------
-    // 3. 循环测试 Search Configs & Ratios
+    // 3. Evaluate search configurations and range ratios.
     // -------------------------------------------------------------
     const int NUM_ROUNDS = 5;
     const int QUERIES_PER_ROUND = 100;
     const int K = 10;
     std::mt19937 rng(12345);
 
-    // 获取 Index 内部全量数据指针 (Source of Truth)
+    // Access the complete vector array stored by the index.
     const float* index_data_ptr = index.get_data();
 
     for (const auto& s_conf : search_configs) {
@@ -241,27 +241,26 @@ void run_insert_benchmark_suite(
             stats.ips = ips;
             stats.ratio = ratio;
 
-            // 计算跨越多少个桶
+            // Determine how many buckets are covered by the range.
             int span_buckets = (int)(b_conf.num_buckets * ratio);
             if (span_buckets < 1) span_buckets = 1;
             if (span_buckets > b_conf.num_buckets) span_buckets = b_conf.num_buckets;
 
-            // 多轮测试取平均
+            // Average metrics over multiple rounds.
             for (int round = 0; round < NUM_ROUNDS; ++round) {
-                // A. 随机生成范围 [start_bucket, end_bucket)
+                // A. Generate a range [start_bucket, end_bucket).
                 int max_start = b_conf.num_buckets - span_buckets;
                 int start_bucket = std::uniform_int_distribution<int>(0, max_start)(rng);
                 int end_bucket = start_bucket + span_buckets;
 
                 // =========================================================
-                // 【核心修正】GT 生成逻辑
-                // 1. 收集该范围内所有的 Global IDs
+                // B. Collect global IDs within the selected range.
                 // =========================================================
                 std::vector<uint32_t> range_global_ids;
                 range_global_ids.reserve(span_buckets * (b_conf.total_data_size / b_conf.num_buckets) * 1.1);
 
                 for (uint64_t ts = start_bucket; ts < end_bucket; ++ts) {
-                    // 使用 index 提供的接口获取真实的 ID 列表
+                    // Read bucket IDs through the index interface.
                     std::vector<uint32_t> bucket_ids = index.get_ids_by_timestamp(ts);
                     range_global_ids.insert(range_global_ids.end(), bucket_ids.begin(), bucket_ids.end());
                 }
@@ -269,7 +268,7 @@ void run_insert_benchmark_suite(
                 size_t range_data_size = range_global_ids.size();
                 if (range_data_size == 0) continue;
 
-                // 2. Gather 向量数据 (构建临时的连续数据集)
+                // C. Gather vectors into a contiguous temporary array.
                 std::vector<float> range_vectors(range_data_size * dim);
                 for (size_t i = 0; i < range_data_size; ++i) {
                     uint32_t gid = range_global_ids[i];
@@ -277,7 +276,7 @@ void run_insert_benchmark_suite(
                     std::copy(src, src + dim, range_vectors.data() + i * dim);
                 }
 
-                // 3. 采样 Query (从 range_vectors 中随机选)
+                // D. Sample queries from the vectors in the range.
                 std::vector<float> queries(QUERIES_PER_ROUND * dim);
                 std::uniform_int_distribution<size_t> q_dist(0, range_data_size - 1);
 
@@ -288,9 +287,8 @@ void run_insert_benchmark_suite(
                               queries.data() + i * dim);
                 }
 
-                // 4. 生成 GT (CPU FAISS)
-                // FAISS Index 建立在 range_vectors 上
-                // 返回的 id 是 range_vectors 的下标 (0 ~ range_data_size-1)
+                // E. Compute ground truth with a CPU FAISS index over range_vectors.
+                // FAISS returns offsets in [0, range_data_size).
                 std::vector<int64_t> gt_local_indices(QUERIES_PER_ROUND * K);
                 std::vector<float> gt_dists(QUERIES_PER_ROUND * K);
                 {
@@ -299,21 +297,20 @@ void run_insert_benchmark_suite(
                     cpu_index.search(QUERIES_PER_ROUND, queries.data(), K, gt_dists.data(), gt_local_indices.data());
                 }
 
-                // 5. 映射 GT: Local Index -> Global Index
-                // 真正的 GT ID = range_global_ids[faiss_return_id]
+                // F. Map local FAISS offsets to global vector IDs.
                 std::vector<int64_t> gt_global_indices(QUERIES_PER_ROUND * K);
                 for (size_t i = 0; i < gt_global_indices.size(); ++i) {
                     gt_global_indices[i] = (int64_t)range_global_ids[gt_local_indices[i]];
                 }
 
                 // =========================================================
-                // 执行 CAGRA Search
+                // G. Execute the GRAB-ANNS search.
                 // =========================================================
                 std::vector<int64_t> out_indices(QUERIES_PER_ROUND * K);
                 std::vector<float> out_dists(QUERIES_PER_ROUND * K);
 
                 Timer t;
-                // active_degree 传入 32 以启用 Remote Edge (跨桶能力)
+                // Use the configured active degree, including remote edges.
                 if (ratio < 0.02) {
                     index.query_local(queries.data(),
                                     QUERIES_PER_ROUND,
@@ -344,13 +341,12 @@ void run_insert_benchmark_suite(
 
                 double ms = t.elapsed_ms();
 
-                // E. 统计
-                // 1. Bound Check (使用 Set 加速查找)
+                // H. Aggregate metrics and validate result ranges.
                 std::unordered_set<uint32_t> valid_gids_set(range_global_ids.begin(), range_global_ids.end());
                 for (int i = 0; i < QUERIES_PER_ROUND * K; ++i) {
                     int64_t gid = out_indices[i];
                     if (gid != -1) {
-                        // 如果结果不在我们预期的 ID 列表里，就是越界
+                        // A returned ID outside valid_ids violates the range predicate.
                         if (valid_gids_set.find((uint32_t)gid) == valid_gids_set.end()) {
                             stats.local_bound_errors++;
                         }
@@ -389,19 +385,19 @@ int main(int argc, char** argv) {
     std::string csv_file =
         (argc == 3) ? argv[2] : "results/exp4_ingestion/grab_insert.csv";
 
-    // 1. 加载 SIFT 数据
+    // 1. Load the configured dataset.
     std::vector<float> host_full_data;
     int dim = 0;
     size_t file_total = 0;
     load_fvecs(sift_path, host_full_data, dim, file_total);
 
-    // 再次提醒：SIFT 是 128 维
+    // Dataset dimensionality is supplied by the selected configuration.
     if (dim != 128) {
         std::cerr << "Warning: SIFT dim is 128. Ensure config.cuh DIM is 128!" << std::endl;
     }
 
     // ==========================================================
-    // 参数配置
+    // Evaluation parameters
     // ==========================================================
 
     // A. Build Configs
@@ -439,7 +435,7 @@ int main(int argc, char** argv) {
     };
 
     // C. Range Ratios
-    std::vector<double> range_ratios = {0.01, 0.1, 0.2, 1.0}; // 0.01 近似单桶，1.0 全量
+    std::vector<double> range_ratios = {0.01, 0.1, 0.2, 1.0}; // 0.01 is approximately one bucket; 1.0 covers all buckets.
 
     std::cout << "Starting Accurate SIFT Insert+Range Benchmark..." << std::endl;
 
