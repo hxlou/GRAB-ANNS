@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <random>
 
 namespace cagra {
@@ -80,10 +81,31 @@ void CagraIndexOpt::reserveSingleCtaScratch(size_t bytes) {
 // =============================================================================
 
 void CagraIndexOpt::add(size_t num_vectors, const float* add_vectors, const uint64_t* add_timestamps) {
+    add(num_vectors, add_vectors, add_timestamps, nullptr);
+}
+
+void CagraIndexOpt::add(size_t num_vectors,
+                        const float* add_vectors,
+                        const uint64_t* add_timestamps,
+                        const uint64_t* add_scalars) {
     if (num_vectors == 0) return;
 
     size_t start_idx = h_data_.size() / dim_;
     size_t new_total = start_idx + num_vectors;
+
+    if (add_scalars != nullptr) {
+        if (h_scalar_values_.size() != start_idx) {
+            throw std::invalid_argument(
+                "Scalar values must be supplied for every vector accumulated before build");
+        }
+        h_scalar_values_.resize(new_total);
+        std::memcpy(h_scalar_values_.data() + start_idx,
+                    add_scalars,
+                    num_vectors * sizeof(uint64_t));
+    } else if (current_size_ == 0 && !h_scalar_values_.empty()) {
+        throw std::invalid_argument(
+            "Scalar values cannot be omitted after scalar-aware build data was added");
+    }
 
     // 1. 追加向量数据 (Host Vector)
     // resize 可能会触发 realloc，数据量大时耗时，建议预留 reserve
@@ -115,6 +137,104 @@ void CagraIndexOpt::add(size_t num_vectors, const float* add_vectors, const uint
                           add_timestamps, 
                           num_vectors * sizeof(uint64_t), 
                           cudaMemcpyHostToDevice));
+}
+
+void CagraIndexOpt::update_scalar_bucket_range(uint64_t scalar, uint64_t bucket) {
+    auto [it, inserted] = scalar_to_buckets_.try_emplace(
+        scalar, ScalarBucketRange{bucket, bucket});
+    if (!inserted) {
+        it->second.first_bucket = std::min(it->second.first_bucket, bucket);
+        it->second.last_bucket = std::max(it->second.last_bucket, bucket);
+    }
+}
+
+void CagraIndexOpt::build_scalar_to_bucket_map() {
+    if (h_scalar_values_.empty()) {
+        throw std::logic_error(
+            "No scalar values are available; use the scalar-aware add overload first");
+    }
+    if (h_scalar_values_.size() != h_timestamps_.size()) {
+        throw std::logic_error("Scalar values and bucket IDs have different row counts");
+    }
+
+    scalar_to_buckets_.clear();
+    for (size_t i = 0; i < h_scalar_values_.size(); ++i) {
+        update_scalar_bucket_range(h_scalar_values_[i], h_timestamps_[i]);
+    }
+
+    bool first = true;
+    uint64_t previous_last_bucket = 0;
+    for (const auto& [scalar, range] : scalar_to_buckets_) {
+        (void)scalar;
+        if (range.first_bucket > range.last_bucket) {
+            throw std::logic_error("Invalid scalar-to-bucket range");
+        }
+        if (!first && range.first_bucket < previous_last_bucket) {
+            throw std::invalid_argument(
+                "Scalar-to-bucket routing requires bucket IDs to be monotonic by scalar");
+        }
+        previous_last_bucket = range.last_bucket;
+        first = false;
+    }
+}
+
+uint64_t CagraIndexOpt::select_least_loaded_bucket(
+    uint64_t first_bucket,
+    uint64_t last_bucket,
+    const std::map<uint64_t, size_t>* pending_counts) const {
+    if (first_bucket > last_bucket) {
+        throw std::logic_error("Invalid bucket range for scalar routing");
+    }
+
+    uint64_t selected_bucket = first_bucket;
+    size_t selected_count = std::numeric_limits<size_t>::max();
+    for (uint64_t bucket = first_bucket;; ++bucket) {
+        size_t count = 0;
+        auto ids_it = ts_to_ids_.find(bucket);
+        if (ids_it != ts_to_ids_.end()) count = ids_it->second.size();
+        if (pending_counts != nullptr) {
+            auto pending_it = pending_counts->find(bucket);
+            if (pending_it != pending_counts->end()) count += pending_it->second;
+        }
+        if (count < selected_count) {
+            selected_bucket = bucket;
+            selected_count = count;
+        }
+        if (bucket == last_bucket) break;
+    }
+    return selected_bucket;
+}
+
+uint64_t CagraIndexOpt::route_scalar_to_bucket(uint64_t scalar) const {
+    return route_scalar_to_bucket_with_pending(scalar, nullptr);
+}
+
+uint64_t CagraIndexOpt::route_scalar_to_bucket_with_pending(
+    uint64_t scalar,
+    const std::map<uint64_t, size_t>* pending_counts) const {
+    if (scalar_to_buckets_.empty()) {
+        throw std::logic_error("Scalar-to-bucket map has not been built or loaded");
+    }
+
+    auto next = scalar_to_buckets_.lower_bound(scalar);
+    uint64_t first_bucket;
+    uint64_t last_bucket;
+    if (next != scalar_to_buckets_.end() && next->first == scalar) {
+        first_bucket = next->second.first_bucket;
+        last_bucket = next->second.last_bucket;
+    } else if (next == scalar_to_buckets_.begin()) {
+        first_bucket = next->second.first_bucket;
+        last_bucket = next->second.first_bucket;
+    } else if (next == scalar_to_buckets_.end()) {
+        const auto& previous = std::prev(next)->second;
+        first_bucket = previous.last_bucket;
+        last_bucket = previous.last_bucket;
+    } else {
+        const auto& previous = std::prev(next)->second;
+        first_bucket = previous.last_bucket;
+        last_bucket = next->second.first_bucket;
+    }
+    return select_least_loaded_bucket(first_bucket, last_bucket, pending_counts);
 }
 
 // =============================================================================
@@ -164,6 +284,12 @@ void CagraIndexOpt::build() {
 
     size_t num_vectors = h_data_.size() / dim_;
     current_size_ = num_vectors;
+
+    if (!h_scalar_values_.empty()) {
+        build_scalar_to_bucket_map();
+    } else {
+        scalar_to_buckets_.clear();
+    }
 
     std::cout << "[CagraIndexOpt] Building index for " << num_vectors << " vectors..." << std::endl;
 
@@ -1548,6 +1674,83 @@ void CagraIndexOpt::insert_deferred(size_t new_vectors,
     insert_impl(new_vectors, insert_vectors, insert_timestamps, false);
 }
 
+void CagraIndexOpt::insert_by_scalar(size_t new_vectors,
+                                     const float* insert_vectors,
+                                     const uint64_t* insert_scalars,
+                                     uint32_t* inserted_ids) {
+    insert_by_scalar_impl(
+        new_vectors, insert_vectors, insert_scalars, inserted_ids, true);
+}
+
+void CagraIndexOpt::insert_deferred_by_scalar(size_t new_vectors,
+                                              const float* insert_vectors,
+                                              const uint64_t* insert_scalars,
+                                              uint32_t* inserted_ids) {
+    insert_by_scalar_impl(
+        new_vectors, insert_vectors, insert_scalars, inserted_ids, false);
+}
+
+void CagraIndexOpt::insert_by_scalar_impl(size_t new_vectors,
+                                          const float* insert_vectors,
+                                          const uint64_t* insert_scalars,
+                                          uint32_t* inserted_ids,
+                                          bool sync_graph_to_host) {
+    if (new_vectors == 0) return;
+    if (insert_vectors == nullptr || insert_scalars == nullptr) {
+        throw std::invalid_argument("Scalar-aware insert received a null input pointer");
+    }
+    if (scalar_to_buckets_.empty()) {
+        throw std::logic_error(
+            "Scalar-to-bucket map has not been built or loaded before insert");
+    }
+    if (current_size_ + new_vectors > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("Scalar-aware insert exceeds the uint32 vector ID range");
+    }
+
+    std::map<uint64_t, std::vector<size_t>> input_indices_by_bucket;
+    std::map<uint64_t, size_t> pending_counts;
+    for (size_t i = 0; i < new_vectors; ++i) {
+        uint64_t bucket = route_scalar_to_bucket_with_pending(
+            insert_scalars[i], &pending_counts);
+        input_indices_by_bucket[bucket].push_back(i);
+        ++pending_counts[bucket];
+    }
+
+    const size_t first_inserted_id = current_size_;
+    size_t inserted_count = 0;
+    for (auto group_it = input_indices_by_bucket.begin();
+         group_it != input_indices_by_bucket.end();
+         ++group_it) {
+        uint64_t bucket = group_it->first;
+        const auto& input_indices = group_it->second;
+        size_t group_size = input_indices.size();
+        std::vector<float> grouped_vectors(group_size * dim_);
+        std::vector<uint64_t> grouped_buckets(group_size, bucket);
+
+        for (size_t group_index = 0; group_index < group_size; ++group_index) {
+            size_t input_index = input_indices[group_index];
+            std::memcpy(grouped_vectors.data() + group_index * dim_,
+                        insert_vectors + input_index * dim_,
+                        dim_ * sizeof(float));
+            if (inserted_ids != nullptr) {
+                inserted_ids[input_index] = static_cast<uint32_t>(
+                    first_inserted_id + inserted_count + group_index);
+            }
+        }
+
+        bool is_last_group = std::next(group_it) == input_indices_by_bucket.end();
+        insert_impl(group_size,
+                    grouped_vectors.data(),
+                    grouped_buckets.data(),
+                    sync_graph_to_host && is_last_group);
+
+        for (size_t input_index : input_indices) {
+            update_scalar_bucket_range(insert_scalars[input_index], bucket);
+        }
+        inserted_count += group_size;
+    }
+}
+
 void CagraIndexOpt::insert_impl(size_t new_vectors,
                                 const float* insert_vectors,
                                 const uint64_t* insert_timestamps,
@@ -1736,7 +1939,7 @@ void CagraIndexOpt::save(const std::string& filepath) {
     ofs.write(magic, 4);
 
     // Version (4 bytes): 版本号，用于后续格式升级
-    uint32_t version = 1;
+    uint32_t version = 2;
     ofs.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
 
     // ============================================================
@@ -1766,6 +1969,15 @@ void CagraIndexOpt::save(const std::string& filepath) {
         ofs.write(reinterpret_cast<const char*>(&ts), sizeof(uint64_t));
         ofs.write(reinterpret_cast<const char*>(&ids_size), sizeof(size_t));
         ofs.write(reinterpret_cast<const char*>(ids.data()), ids_size * sizeof(uint32_t));
+    }
+
+    // 3.3 标量路由表: scalar -> [first_bucket, last_bucket]
+    size_t scalar_map_size = scalar_to_buckets_.size();
+    ofs.write(reinterpret_cast<const char*>(&scalar_map_size), sizeof(size_t));
+    for (const auto& [scalar, range] : scalar_to_buckets_) {
+        ofs.write(reinterpret_cast<const char*>(&scalar), sizeof(uint64_t));
+        ofs.write(reinterpret_cast<const char*>(&range.first_bucket), sizeof(uint64_t));
+        ofs.write(reinterpret_cast<const char*>(&range.last_bucket), sizeof(uint64_t));
     }
 
     // ============================================================
@@ -1810,7 +2022,7 @@ void CagraIndexOpt::load(const std::string& filepath) {
 
     uint32_t version;
     ifs.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
-    if (version != 1) {
+    if (version != 1 && version != 2) {
         throw std::runtime_error("Unsupported version: " + std::to_string(version));
     }
 
@@ -1849,6 +2061,36 @@ void CagraIndexOpt::load(const std::string& filepath) {
         std::vector<uint32_t> ids(ids_size);
         ifs.read(reinterpret_cast<char*>(ids.data()), ids_size * sizeof(uint32_t));
         ts_to_ids_[ts] = std::move(ids);
+    }
+
+    scalar_to_buckets_.clear();
+    h_scalar_values_.clear();
+    if (version >= 2) {
+        size_t scalar_map_size;
+        ifs.read(reinterpret_cast<char*>(&scalar_map_size), sizeof(size_t));
+        for (size_t i = 0; i < scalar_map_size; ++i) {
+            uint64_t scalar;
+            ScalarBucketRange range;
+            ifs.read(reinterpret_cast<char*>(&scalar), sizeof(uint64_t));
+            ifs.read(reinterpret_cast<char*>(&range.first_bucket), sizeof(uint64_t));
+            ifs.read(reinterpret_cast<char*>(&range.last_bucket), sizeof(uint64_t));
+            if (range.first_bucket > range.last_bucket) {
+                throw std::runtime_error("Invalid scalar bucket range in index file");
+            }
+            scalar_to_buckets_.emplace(scalar, range);
+        }
+
+        bool first = true;
+        uint64_t previous_last_bucket = 0;
+        for (const auto& [scalar, range] : scalar_to_buckets_) {
+            (void)scalar;
+            if (!first && range.first_bucket < previous_last_bucket) {
+                throw std::runtime_error(
+                    "Non-monotonic scalar-to-bucket map in index file");
+            }
+            previous_last_bucket = range.last_bucket;
+            first = false;
+        }
     }
 
     // ============================================================

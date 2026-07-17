@@ -37,6 +37,11 @@ public:
      */
     void add(size_t num_vectors, const float* add_vectors, const uint64_t* add_timestamps);
 
+    void add(size_t num_vectors,
+             const float* add_vectors,
+             const uint64_t* add_timestamps,
+             const uint64_t* add_scalars);
+
     /**
      * @brief [Phase 2] 全量构建
      * 1. 将 Host 数据 (向量 + 时间戳) 同步到 GPU VMM。
@@ -59,6 +64,20 @@ public:
     void insert_deferred(size_t new_vectors,
                          const float* insert_vectors,
                          const uint64_t* insert_timestamps);
+
+    void insert_by_scalar(size_t new_vectors,
+                          const float* insert_vectors,
+                          const uint64_t* insert_scalars,
+                          uint32_t* inserted_ids = nullptr);
+
+    void insert_deferred_by_scalar(size_t new_vectors,
+                                   const float* insert_vectors,
+                                   const uint64_t* insert_scalars,
+                                   uint32_t* inserted_ids = nullptr);
+
+    void build_scalar_to_bucket_map();
+    uint64_t route_scalar_to_bucket(uint64_t scalar) const;
+    size_t scalar_to_bucket_map_size() const { return scalar_to_buckets_.size(); }
 
     /**
      * @brief 向量查询 (支持时间过滤 + Seed 导航)
@@ -234,6 +253,13 @@ private:
     std::vector<uint64_t> h_timestamps_;                        // host 端，快速根据 index 找到属于哪个时间戳
     std::unique_ptr<DeviceBufferVMM> d_ts_vmm_;                 // device 端使用，快速根据 index 找到属于哪个时间戳
 
+    struct ScalarBucketRange {
+        uint64_t first_bucket;
+        uint64_t last_bucket;
+    };
+    std::vector<uint64_t> h_scalar_values_;
+    std::map<uint64_t, ScalarBucketRange> scalar_to_buckets_;
+
     BuildParams build_params_;
     SearchParams search_params_;
     double remote_edge_rate_;                                   // 
@@ -246,6 +272,19 @@ private:
                      const float* insert_vectors,
                      const uint64_t* insert_timestamps,
                      bool sync_graph_to_host);
+    void insert_by_scalar_impl(size_t new_vectors,
+                               const float* insert_vectors,
+                               const uint64_t* insert_scalars,
+                               uint32_t* inserted_ids,
+                               bool sync_graph_to_host);
+    uint64_t select_least_loaded_bucket(
+        uint64_t first_bucket,
+        uint64_t last_bucket,
+        const std::map<uint64_t, size_t>* pending_counts = nullptr) const;
+    uint64_t route_scalar_to_bucket_with_pending(
+        uint64_t scalar,
+        const std::map<uint64_t, size_t>* pending_counts) const;
+    void update_scalar_bucket_range(uint64_t scalar, uint64_t bucket);
 };
 
 } // namespace cagra
