@@ -733,14 +733,26 @@ __global__ void search_kernel_range(
     uint32_t hash_reset_threshold = min(hash_size - 1,
                                         max(itopk_size + search_width * graph_stride,
                                             (hash_size * 7) / 10));
+    const uint64_t max_possible_visited = static_cast<uint64_t>(num_seeds) +
+        static_cast<uint64_t>(max_iterations) * search_width * graph_stride;
+    const uint64_t selected_count = end_bucket >= start_bucket ? end_bucket - start_bucket : 0;
+    const bool narrow_monotonic_filter = d_ts == nullptr && selected_count > 0 &&
+                                         selected_count <= num_dataset / 10;
+    if (narrow_monotonic_filter && max_possible_visited < hash_reset_threshold) {
+        // No execution can reach the reset threshold, so per-insert count
+        // atomics and the per-iteration reset check are provably unnecessary.
+        visited_count = nullptr;
+    }
 
     unsigned long long step1_cost = 0;
     unsigned long long step2_cost = 0;
     unsigned long long step3_cost = 0;
 
     for (; iter < max_iterations; ++iter) {
-        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
-                                 itopk_size, visited_count, hash_reset_threshold);
+        if (visited_count != nullptr) {
+            maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                     itopk_size, visited_count, hash_reset_threshold);
+        }
 
         // A. Sort (完全复用)
         unsigned long long t1 = 0;
