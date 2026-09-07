@@ -749,6 +749,13 @@ __global__ void search_kernel_range(
             if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
             else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
             else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+            else if (queue_capacity == 288 && tid < 32) cagra::merge::load_sort_store<9>(result_dists, result_indices, 288);
+            else if (queue_capacity == 320 && tid < 32) cagra::merge::load_sort_store<10>(result_dists, result_indices, 320);
+            else if (queue_capacity == 352 && tid < 32) cagra::merge::load_sort_store<11>(result_dists, result_indices, 352);
+            else if (queue_capacity == 384 && tid < 32) cagra::merge::load_sort_store<12>(result_dists, result_indices, 384);
+            else if (queue_capacity == 416 && tid < 32) cagra::merge::load_sort_store<13>(result_dists, result_indices, 416);
+            else if (queue_capacity == 448 && tid < 32) cagra::merge::load_sort_store<14>(result_dists, result_indices, 448);
+            else if (queue_capacity == 480 && tid < 32) cagra::merge::load_sort_store<15>(result_dists, result_indices, 480);
             else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
             else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
             // else if (queue_capacity == 32 * 64) cagra::radix::load_sort_store<64>(result_dists, result_indices, 2048);
@@ -841,6 +848,13 @@ __global__ void search_kernel_range(
     if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
     else if (queue_capacity == 128 && tid < 32) load_sort_store<4>(result_dists, result_indices, 128);
     else if (queue_capacity == 256 && tid < 32) cagra::merge::load_sort_store<8>(result_dists, result_indices, 256);
+    else if (queue_capacity == 288 && tid < 32) cagra::merge::load_sort_store<9>(result_dists, result_indices, 288);
+    else if (queue_capacity == 320 && tid < 32) cagra::merge::load_sort_store<10>(result_dists, result_indices, 320);
+    else if (queue_capacity == 352 && tid < 32) cagra::merge::load_sort_store<11>(result_dists, result_indices, 352);
+    else if (queue_capacity == 384 && tid < 32) cagra::merge::load_sort_store<12>(result_dists, result_indices, 384);
+    else if (queue_capacity == 416 && tid < 32) cagra::merge::load_sort_store<13>(result_dists, result_indices, 416);
+    else if (queue_capacity == 448 && tid < 32) cagra::merge::load_sort_store<14>(result_dists, result_indices, 448);
+    else if (queue_capacity == 480 && tid < 32) cagra::merge::load_sort_store<15>(result_dists, result_indices, 480);
     else if (queue_capacity == 512 && tid < 32) cagra::merge::load_sort_store<16>(result_dists, result_indices, 512);
     else if (queue_capacity == 32 * 32) cagra::radix::load_sort_store(result_dists, result_indices, 1024);
     else {

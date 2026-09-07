@@ -1628,6 +1628,16 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
     uint32_t raw_needed = itopk_size + params.search_width * total_degree;
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
+    const char* compact_queue_env = std::getenv("CAGRA_RANGE_COMPACT_QUEUE");
+    const uint32_t compact_capacity = std::max(
+        cagra::config::BLOCK_SIZE, ((raw_needed + 31u) / 32u) * 32u);
+    bool use_compact_queue = dim <= 128;
+    if (compact_queue_env != nullptr) {
+        use_compact_queue = std::string(compact_queue_env) != "0";
+    }
+    if (use_compact_queue && compact_capacity <= 512) {
+        queue_capacity = compact_capacity;
+    }
 
     // D. 随机种子
     std::random_device rd;
