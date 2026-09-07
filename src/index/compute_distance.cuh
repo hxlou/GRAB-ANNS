@@ -138,6 +138,80 @@ __device__ __forceinline__ float calc_l2_dist_128(const float* vec_a, const floa
     return sum_sq;
 }
 
+// Compile-time dimension/team-size variant used by the specialized range kernel.
+// A team is a power-of-two subgroup contained in one warp.
+template <uint32_t Dim, uint32_t TeamSize>
+__device__ __forceinline__ float calc_l2_dist_team(const float* vec_a, const float* vec_b) {
+    static_assert(TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
+                  "TeamSize must be 8, 16, or 32");
+    static_assert(Dim % TeamSize == 0, "Dim must be divisible by TeamSize");
+
+    constexpr uint32_t kTeamMask = TeamSize == 32 ? 0xffffffffu : ((1u << TeamSize) - 1u);
+    const uint32_t warp_lane = threadIdx.x & 31u;
+    const uint32_t team_lane = warp_lane & (TeamSize - 1u);
+    const uint32_t team_base = warp_lane & ~(TeamSize - 1u);
+    const uint32_t team_mask = kTeamMask << team_base;
+
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (uint32_t i = team_lane; i < Dim; i += TeamSize) {
+        const float diff = vec_a[i] - vec_b[i];
+        sum_sq += diff * diff;
+    }
+
+    #pragma unroll
+    for (uint32_t offset = TeamSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(team_mask, sum_sq, offset, TeamSize);
+    }
+    return sum_sq;
+}
+
+template <uint32_t Dim, uint32_t TeamSize>
+__device__ inline void compute_distance_to_init_nodes_specialized(
+    uint32_t* result_indices,
+    float* result_distances,
+    const float* query_buffer,
+    const float* dataset_ptr,
+    size_t num_dataset,
+    uint32_t result_buffer_size,
+    uint32_t target_num_seeds,
+    const uint32_t* seed_ptr,
+    uint32_t num_provided_seeds,
+    uint64_t rand_xor_mask,
+    uint32_t* visited_hash,
+    uint32_t hash_bitlen,
+    uint32_t* visited_count = nullptr)
+{
+    const uint32_t tid = threadIdx.x;
+    const uint32_t team_lane = tid & (TeamSize - 1u);
+    const uint32_t team_id = tid / TeamSize;
+    const uint32_t num_teams = blockDim.x / TeamSize;
+
+    for (uint32_t i = tid; i < result_buffer_size; i += blockDim.x) {
+        result_indices[i] = 0xFFFFFFFF;
+        result_distances[i] = 3.40282e38f;
+    }
+    __syncthreads();
+
+    for (uint32_t i = team_id; i < target_num_seeds; i += num_teams) {
+        uint32_t node_id = 0xFFFFFFFF;
+        if (seed_ptr != nullptr && i < num_provided_seeds) node_id = seed_ptr[i];
+        if (node_id >= num_dataset) node_id = (rand_xor_mask * (i + 1)) % num_dataset;
+
+        const float* node_ptr = dataset_ptr + static_cast<size_t>(node_id) * Dim;
+        const float dist = calc_l2_dist_team<Dim, TeamSize>(query_buffer, node_ptr);
+        if (team_lane == 0) {
+            result_indices[i] = node_id;
+            result_distances[i] = dist;
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) &&
+                visited_count != nullptr) {
+                atomicAdd(visited_count, 1u);
+            }
+        }
+    }
+    __syncthreads();
+}
+
 // ============================================================================
 // 阶段 1: 初始化 (随机选取节点计算距离)
 // ============================================================================
@@ -702,6 +776,159 @@ __device__ inline void compute_distance_to_child_nodes_range(
         }
     }
     // 所有 Warp 完成计算后同步
+    __syncthreads();
+}
+
+// Compile-time dimension/team-size range expansion. TeamSize=8 allows four
+// independent low-dimensional candidates to be processed by each warp.
+template <uint32_t Dim, uint32_t TeamSize>
+__device__ inline void compute_distance_to_child_nodes_range_specialized(
+    uint32_t* candidate_indices,
+    float* candidate_distances,
+    const float* query_buffer,
+    const float* dataset_ptr,
+    const uint32_t* knn_graph,
+    uint32_t graph_stride,
+    uint32_t active_degree,
+    uint32_t* visited_hash,
+    uint32_t hash_bitlen,
+    const uint32_t* parent_list,
+    uint32_t search_width,
+    uint64_t start_bucket,
+    uint64_t end_bucket,
+    uint64_t* d_ts,
+    uint32_t* visited_count = nullptr,
+    unsigned long long* child_profile = nullptr)
+{
+    static_assert(TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
+                  "TeamSize must be 8, 16, or 32");
+    (void)active_degree;
+
+    constexpr uint32_t kTeamMask = TeamSize == 32 ? 0xffffffffu : ((1u << TeamSize) - 1u);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_lane = tid & 31u;
+    const uint32_t team_lane = warp_lane & (TeamSize - 1u);
+    const uint32_t team_base = warp_lane & ~(TeamSize - 1u);
+    const uint32_t team_mask = kTeamMask << team_base;
+    const uint32_t team_id = tid / TeamSize;
+    const uint32_t num_teams = blockDim.x / TeamSize;
+
+    const uint32_t total_tasks = search_width * graph_stride;
+    unsigned long long clk_graph = 0;
+    unsigned long long clk_hash = 0;
+    unsigned long long clk_filter = 0;
+    unsigned long long clk_dist = 0;
+    unsigned long long clk_write = 0;
+    unsigned long long cnt_in_range = 0;
+    unsigned long long cnt_dist = 0;
+
+    for (uint32_t task_id = team_id; task_id < total_tasks; task_id += num_teams) {
+        const uint32_t parent_idx = task_id / graph_stride;
+        const uint32_t neighbor_offset = task_id % graph_stride;
+        const uint32_t parent_id = parent_list[parent_idx];
+
+        if (parent_id == 0xFFFFFFFF) {
+            if (team_lane == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+            continue;
+        }
+
+        unsigned long long t_child = 0;
+        if (child_profile != nullptr && team_lane == 0) t_child = clock64();
+        uint32_t neighbor_id = 0xFFFFFFFF;
+        if (team_lane == 0) {
+            neighbor_id = knn_graph[static_cast<size_t>(parent_id) * graph_stride + neighbor_offset];
+        }
+        neighbor_id = __shfl_sync(team_mask, neighbor_id, 0, TeamSize);
+        if (child_profile != nullptr && team_lane == 0) clk_graph += clock64() - t_child;
+
+        if (neighbor_id == 0xFFFFFFFF) {
+            if (team_lane == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+            continue;
+        }
+
+        if (child_profile != nullptr && team_lane == 0) t_child = clock64();
+        int in_range = 0;
+        if (team_lane == 0) {
+            const uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
+            in_range = bucket_id >= start_bucket && bucket_id < end_bucket;
+        }
+        in_range = __shfl_sync(team_mask, in_range, 0, TeamSize);
+        if (child_profile != nullptr && team_lane == 0) clk_filter += clock64() - t_child;
+        if (!in_range) {
+            if (team_lane == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+            continue;
+        }
+        if (child_profile != nullptr && team_lane == 0) cnt_in_range++;
+
+        int not_visited = 0;
+        if (team_lane == 0) {
+            if (child_profile != nullptr) t_child = clock64();
+            not_visited = cagra::hashmap::insert(visited_hash, hash_bitlen, neighbor_id);
+            if (not_visited && visited_count != nullptr) atomicAdd(visited_count, 1u);
+            if (child_profile != nullptr) clk_hash += clock64() - t_child;
+        }
+        not_visited = __shfl_sync(team_mask, not_visited, 0, TeamSize);
+
+        if (!not_visited) {
+            if (team_lane == 0) {
+                candidate_indices[task_id] = 0xFFFFFFFF;
+                candidate_distances[task_id] = 3.40282e38f;
+            }
+            continue;
+        }
+
+        if (child_profile != nullptr && team_lane == 0) t_child = clock64();
+        const float* node_ptr = dataset_ptr + static_cast<size_t>(neighbor_id) * Dim;
+        const float dist = calc_l2_dist_team<Dim, TeamSize>(query_buffer, node_ptr);
+        if (child_profile != nullptr && team_lane == 0) {
+            clk_dist += clock64() - t_child;
+            cnt_dist++;
+        }
+
+        if (team_lane == 0) {
+            if (child_profile != nullptr) t_child = clock64();
+            candidate_indices[task_id] = neighbor_id;
+            candidate_distances[task_id] = dist;
+            if (child_profile != nullptr) clk_write += clock64() - t_child;
+        }
+    }
+
+    if (child_profile != nullptr) {
+        unsigned long long graph = team_lane == 0 ? clk_graph : 0;
+        unsigned long long hash = team_lane == 0 ? clk_hash : 0;
+        unsigned long long filter = team_lane == 0 ? clk_filter : 0;
+        unsigned long long dist = team_lane == 0 ? clk_dist : 0;
+        unsigned long long write = team_lane == 0 ? clk_write : 0;
+        unsigned long long in_range = team_lane == 0 ? cnt_in_range : 0;
+        unsigned long long dist_count = team_lane == 0 ? cnt_dist : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            graph += __shfl_down_sync(0xffffffff, graph, offset);
+            hash += __shfl_down_sync(0xffffffff, hash, offset);
+            filter += __shfl_down_sync(0xffffffff, filter, offset);
+            dist += __shfl_down_sync(0xffffffff, dist, offset);
+            write += __shfl_down_sync(0xffffffff, write, offset);
+            in_range += __shfl_down_sync(0xffffffff, in_range, offset);
+            dist_count += __shfl_down_sync(0xffffffff, dist_count, offset);
+        }
+        if (warp_lane == 0) {
+            atomicAdd(child_profile + 0, graph);
+            atomicAdd(child_profile + 1, hash);
+            atomicAdd(child_profile + 2, filter);
+            atomicAdd(child_profile + 3, dist);
+            atomicAdd(child_profile + 4, write);
+            atomicAdd(child_profile + 5, in_range);
+            atomicAdd(child_profile + 6, dist_count);
+        }
+    }
     __syncthreads();
 }
 

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <fstream>
 #include <cstdlib>
+#include <type_traits>
 // FAISS 头文件
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/GpuIndexIVFPQ.h>
@@ -1647,37 +1648,78 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
         CUDA_CHECK(cudaMemsetAsync(d_stage_profile, 0, 12 * sizeof(unsigned long long), stream));
     }
 
-    cagra::device::search_kernel_range<<<grid, block, smem_size, stream>>>(
-        d_out_indices_u32,
-        d_out_dists,
-        d_queries,
-        d_dataset,
-        d_graph,
-        d_seeds,
-        d_ts,             
-        num_seeds_per_query,  
-        nullptr, 
-        
-        // Params
-        (uint32_t)num_queries,
-        num_dataset,
-        dim, 
-        total_degree,   // graph_stride (32)
-        local_degree,   // active_degree (28) -> 只搜 Local!
-        start_bucket,
-        end_bucket,
-        
-        topk,
-        itopk_size,
-        params.search_width,
-        params.max_iterations,
-        num_seeds_target,     
-        rand_xor_mask,
-        params.hash_bitlen,
-        d_pre_hashmap,
-        queue_capacity,
-        d_stage_profile
-    );
+    auto launch_range_kernel = [&](auto dim_tag, auto team_tag) {
+        constexpr uint32_t kStaticDim = decltype(dim_tag)::value;
+        constexpr uint32_t kTeamSize = decltype(team_tag)::value;
+        cagra::device::search_kernel_range<kStaticDim, kTeamSize>
+            <<<grid, block, smem_size, stream>>>(
+                d_out_indices_u32,
+                d_out_dists,
+                d_queries,
+                d_dataset,
+                d_graph,
+                d_seeds,
+                d_ts,
+                num_seeds_per_query,
+                nullptr,
+                (uint32_t)num_queries,
+                num_dataset,
+                dim,
+                total_degree,
+                local_degree,
+                start_bucket,
+                end_bucket,
+                topk,
+                itopk_size,
+                params.search_width,
+                params.max_iterations,
+                num_seeds_target,
+                rand_xor_mask,
+                params.hash_bitlen,
+                d_pre_hashmap,
+                queue_capacity,
+                d_stage_profile);
+    };
+
+    // Cached once per process so the A/B controls do not add per-query host overhead.
+    static const bool use_specialized = [] {
+        const char* value = std::getenv("CAGRA_RANGE_SPECIALIZED");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    static const bool low_dim_team32 = [] {
+        const char* value = std::getenv("CAGRA_RANGE_TEAM_SIZE");
+        return value != nullptr && std::string(value) == "32";
+    }();
+
+    if (!use_specialized) {
+        launch_range_kernel(std::integral_constant<uint32_t, 0>{},
+                            std::integral_constant<uint32_t, 32>{});
+    } else if (dim == 96) {
+        if (low_dim_team32) {
+            launch_range_kernel(std::integral_constant<uint32_t, 96>{},
+                                std::integral_constant<uint32_t, 32>{});
+        } else {
+            launch_range_kernel(std::integral_constant<uint32_t, 96>{},
+                                std::integral_constant<uint32_t, 8>{});
+        }
+    } else if (dim == 128) {
+        if (low_dim_team32) {
+            launch_range_kernel(std::integral_constant<uint32_t, 128>{},
+                                std::integral_constant<uint32_t, 32>{});
+        } else {
+            launch_range_kernel(std::integral_constant<uint32_t, 128>{},
+                                std::integral_constant<uint32_t, 8>{});
+        }
+    } else if (dim == 960) {
+        launch_range_kernel(std::integral_constant<uint32_t, 960>{},
+                            std::integral_constant<uint32_t, 32>{});
+    } else if (dim == 2048) {
+        launch_range_kernel(std::integral_constant<uint32_t, 2048>{},
+                            std::integral_constant<uint32_t, 32>{});
+    } else {
+        launch_range_kernel(std::integral_constant<uint32_t, 0>{},
+                            std::integral_constant<uint32_t, 32>{});
+    }
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaDeviceSynchronize());

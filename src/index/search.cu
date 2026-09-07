@@ -610,6 +610,7 @@ __global__ void search_kernel_bucket(
 }
 
 
+template <uint32_t StaticDim, uint32_t TeamSize>
 __global__ void search_kernel_range(
     uint32_t* result_indices_ptr,       
     float* result_distances_ptr,        
@@ -641,6 +642,9 @@ __global__ void search_kernel_range(
     uint32_t queue_capacity,
     unsigned long long* stage_profile
 ) {
+    static_assert(StaticDim == 0 || StaticDim % TeamSize == 0,
+                  "StaticDim must be zero or divisible by TeamSize");
+    const uint32_t query_dim = StaticDim == 0 ? dim : StaticDim;
     const bool profile_enabled = (stage_profile != nullptr);
     unsigned long long t_start = 0;
     if (profile_enabled) t_start = clock64();
@@ -649,7 +653,7 @@ __global__ void search_kernel_range(
     size_t offset = 0;
 
     float* query_buffer = (float*)(smem + offset);
-    offset += (dim * sizeof(float) + 15) & ~15;
+    offset += (query_dim * sizeof(float) + 15) & ~15;
 
     uint32_t* visited_hash = nullptr;
     if (hash_bitlen < 14) {
@@ -677,8 +681,8 @@ __global__ void search_kernel_range(
     if (query_id >= num_queries) return;
     const uint32_t tid = threadIdx.x;
 
-    const float* global_query = queries_ptr + (size_t)query_id * dim;
-    for (uint32_t i = tid; i < dim; i += blockDim.x) {
+    const float* global_query = queries_ptr + (size_t)query_id * query_dim;
+    for (uint32_t i = tid; i < query_dim; i += blockDim.x) {
         query_buffer[i] = global_query[i];
     }
     
@@ -702,14 +706,25 @@ __global__ void search_kernel_range(
         local_seed_ptr = seed_ptr + (size_t)query_id * num_provided_seeds;
     }
 
-    cagra::device::compute_distance_to_init_nodes(
-        result_indices, result_dists, query_buffer, dataset_ptr,
-        num_dataset, dim, queue_capacity, 
-        num_seeds,          
-        local_seed_ptr,     
-        num_provided_seeds, 
-        rand_xor_mask, visited_hash, hash_bitlen, visited_count
-    );
+    if constexpr (StaticDim == 0) {
+        cagra::device::compute_distance_to_init_nodes(
+            result_indices, result_dists, query_buffer, dataset_ptr,
+            num_dataset, query_dim, queue_capacity,
+            num_seeds,
+            local_seed_ptr,
+            num_provided_seeds,
+            rand_xor_mask, visited_hash, hash_bitlen, visited_count
+        );
+    } else {
+        cagra::device::compute_distance_to_init_nodes_specialized<StaticDim, TeamSize>(
+            result_indices, result_dists, query_buffer, dataset_ptr,
+            num_dataset, queue_capacity,
+            num_seeds,
+            local_seed_ptr,
+            num_provided_seeds,
+            rand_xor_mask, visited_hash, hash_bitlen, visited_count
+        );
+    }
     __syncthreads();
 
     // 4. 主循环
@@ -771,25 +786,46 @@ __global__ void search_kernel_range(
         // 【核心差异】使用 compute_distance_to_child_nodes_strided
         unsigned long long t5 = 0;
         if (profile_enabled) t5 = clock64();
-        cagra::device::compute_distance_to_child_nodes_range(
-            result_indices + itopk_size,
-            result_dists + itopk_size,
-            query_buffer, 
-            dataset_ptr, 
-            knn_graph, 
-            graph_stride,   // 物理宽度 32
-            graph_stride,  // 逻辑宽度 28 (Local Only)
-            dim,
-            visited_hash, 
-            hash_bitlen, 
-            parent_list, 
-            search_width,
-            start_bucket,
-            end_bucket,
-            d_ts,
-            visited_count,
-            stage_profile == nullptr ? nullptr : stage_profile + 5
-        );
+        if constexpr (StaticDim == 0) {
+            cagra::device::compute_distance_to_child_nodes_range(
+                result_indices + itopk_size,
+                result_dists + itopk_size,
+                query_buffer,
+                dataset_ptr,
+                knn_graph,
+                graph_stride,
+                graph_stride,
+                query_dim,
+                visited_hash,
+                hash_bitlen,
+                parent_list,
+                search_width,
+                start_bucket,
+                end_bucket,
+                d_ts,
+                visited_count,
+                stage_profile == nullptr ? nullptr : stage_profile + 5
+            );
+        } else {
+            cagra::device::compute_distance_to_child_nodes_range_specialized<StaticDim, TeamSize>(
+                result_indices + itopk_size,
+                result_dists + itopk_size,
+                query_buffer,
+                dataset_ptr,
+                knn_graph,
+                graph_stride,
+                graph_stride,
+                visited_hash,
+                hash_bitlen,
+                parent_list,
+                search_width,
+                start_bucket,
+                end_bucket,
+                d_ts,
+                visited_count,
+                stage_profile == nullptr ? nullptr : stage_profile + 5
+            );
+        }
         __syncthreads();
         unsigned long long t6 = 0;
         if (profile_enabled) t6 = clock64();
@@ -846,6 +882,23 @@ __global__ void search_kernel_range(
     //     printf("total function time cost: %llu\n", t_end - t_start);
     // }
 }
+
+#define CAGRA_INSTANTIATE_RANGE_KERNEL(STATIC_DIM, TEAM_SIZE)                                \
+    template __global__ void search_kernel_range<STATIC_DIM, TEAM_SIZE>(                     \
+        uint32_t*, float*, const float*, const float*, const uint32_t*, const uint32_t*,      \
+        uint64_t*, uint32_t, uint32_t*, uint32_t, size_t, uint32_t, uint32_t, uint32_t,       \
+        uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t,       \
+        uint32_t, uint32_t*, uint32_t, unsigned long long*)
+
+CAGRA_INSTANTIATE_RANGE_KERNEL(0, 32);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 32);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 8);
+CAGRA_INSTANTIATE_RANGE_KERNEL(128, 32);
+CAGRA_INSTANTIATE_RANGE_KERNEL(128, 8);
+CAGRA_INSTANTIATE_RANGE_KERNEL(960, 32);
+CAGRA_INSTANTIATE_RANGE_KERNEL(2048, 32);
+
+#undef CAGRA_INSTANTIATE_RANGE_KERNEL
 
 } // namespace device
 } // namespace cagra

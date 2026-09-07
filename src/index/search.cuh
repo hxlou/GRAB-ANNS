@@ -77,6 +77,7 @@ __global__ void search_kernel_bucket(
     unsigned long long* stage_profile = nullptr
 );
 
+template <uint32_t StaticDim, uint32_t TeamSize>
 __global__ void search_kernel_range(
     uint32_t* result_indices_ptr,       
     float* result_distances_ptr,        
