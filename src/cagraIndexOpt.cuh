@@ -252,6 +252,7 @@ private:
     std::map<uint64_t, std::vector<uint32_t>> ts_to_ids_;       // host 端使用，快速根据 ts 找到有哪些数据
     std::vector<uint64_t> h_timestamps_;                        // host 端，快速根据 index 找到属于哪个时间戳
     std::unique_ptr<DeviceBufferVMM> d_ts_vmm_;                 // device 端使用，快速根据 index 找到属于哪个时间戳
+    bool timestamps_nondecreasing_ = true;
 
     struct ScalarBucketRange {
         uint64_t first_bucket;

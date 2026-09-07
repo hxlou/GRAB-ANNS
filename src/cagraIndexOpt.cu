@@ -25,6 +25,14 @@ T* carve_device_buffer(char*& cursor, size_t count) {
     cursor += align_up_size(count * sizeof(T));
     return ptr;
 }
+
+bool use_monotonic_id_filter() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("CAGRA_RANGE_ID_FILTER");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
 } // namespace
 
 // =============================================================================
@@ -114,6 +122,16 @@ void CagraIndexOpt::add(size_t num_vectors,
 
     // 2. 追加时间戳 (Host Vector)
     // 这是正向索引: ID -> Timestamp
+    if (timestamps_nondecreasing_) {
+        if (start_idx > 0 && add_timestamps[0] < h_timestamps_.back()) {
+            timestamps_nondecreasing_ = false;
+        }
+        for (size_t i = 1; timestamps_nondecreasing_ && i < num_vectors; ++i) {
+            if (add_timestamps[i] < add_timestamps[i - 1]) {
+                timestamps_nondecreasing_ = false;
+            }
+        }
+    }
     h_timestamps_.resize(new_total);
     std::memcpy(h_timestamps_.data() + start_idx, add_timestamps, num_vectors * sizeof(uint64_t));
 
@@ -1507,6 +1525,16 @@ void CagraIndexOpt::query_range(const float* host_queries,
     float* d_dataset = (float*)d_data_vmm_->data();
     uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
     uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
+    uint64_t filter_start = start_bucket;
+    uint64_t filter_end = end_bucket;
+    if (timestamps_nondecreasing_ && use_monotonic_id_filter()) {
+        const auto first = h_timestamps_.begin();
+        filter_start = static_cast<uint64_t>(
+            std::lower_bound(first, h_timestamps_.end(), start_bucket) - first);
+        filter_end = static_cast<uint64_t>(
+            std::lower_bound(first, h_timestamps_.end(), end_bucket) - first);
+        d_timestamps = nullptr;
+    }
 
     // 调用 cagra_opt.cu 中的 search_bucket_range
     cagra::search_bucket_range_preallocated(
@@ -1520,8 +1548,8 @@ void CagraIndexOpt::query_range(const float* host_queries,
         d_queries,
         (int64_t)num_queries,
         (int64_t)k,
-        start_bucket,
-        end_bucket,
+        filter_start,
+        filter_end,
         search_params_,
         d_out_indices_u32,
         d_pre_hashmap,
@@ -1630,6 +1658,16 @@ void CagraIndexOpt::query_range_u32(const float* host_queries,
     float* d_dataset = (float*)d_data_vmm_->data();
     uint32_t* d_graph = (uint32_t*)d_graph_vmm_->data();
     uint64_t* d_timestamps = (uint64_t*)d_ts_vmm_->data();
+    uint64_t filter_start = start_bucket;
+    uint64_t filter_end = end_bucket;
+    if (timestamps_nondecreasing_ && use_monotonic_id_filter()) {
+        const auto first = h_timestamps_.begin();
+        filter_start = static_cast<uint64_t>(
+            std::lower_bound(first, h_timestamps_.end(), start_bucket) - first);
+        filter_end = static_cast<uint64_t>(
+            std::lower_bound(first, h_timestamps_.end(), end_bucket) - first);
+        d_timestamps = nullptr;
+    }
 
     cagra::search_bucket_range_preallocated_u32(
         d_dataset,
@@ -1642,8 +1680,8 @@ void CagraIndexOpt::query_range_u32(const float* host_queries,
         d_queries,
         (int64_t)num_queries,
         (int64_t)k,
-        start_bucket,
-        end_bucket,
+        filter_start,
+        filter_end,
         search_params_,
         d_indices,
         d_pre_hashmap,
@@ -2047,6 +2085,7 @@ void CagraIndexOpt::load(const std::string& filepath) {
     ifs.read(reinterpret_cast<char*>(&ts_size), sizeof(size_t));
     h_timestamps_.resize(ts_size);
     ifs.read(reinterpret_cast<char*>(h_timestamps_.data()), ts_size * sizeof(uint64_t));
+    timestamps_nondecreasing_ = std::is_sorted(h_timestamps_.begin(), h_timestamps_.end());
 
     // 3.2 倒排索引
     size_t num_buckets;

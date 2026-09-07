@@ -666,7 +666,9 @@ __device__ inline void compute_distance_to_child_nodes_range(
                 // Range search 下如果先插入 hash，out-of-range 邻居会快速填满小 hash 表，
                 // 让后续 atomicCAS 线性探测退化。
                 if (child_profile != nullptr && lane_id == 0) t_child = clock64();
-                uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
+                uint64_t bucket_id = d_ts == nullptr
+                    ? static_cast<uint64_t>(neighbor_id)
+                    : __ldg(&d_ts[neighbor_id]);
                 if (child_profile != nullptr && lane_id == 0) clk_filter += clock64() - t_child;
                 if (bucket_id < start_bucket || bucket_id >= end_bucket) {
                     if (lane_id == 0) {
@@ -855,7 +857,9 @@ __device__ inline void compute_distance_to_child_nodes_range_specialized(
         if (child_profile != nullptr && team_lane == 0) t_child = clock64();
         int in_range = 0;
         if (team_lane == 0) {
-            const uint64_t bucket_id = __ldg(&d_ts[neighbor_id]);
+            const uint64_t bucket_id = d_ts == nullptr
+                ? static_cast<uint64_t>(neighbor_id)
+                : __ldg(&d_ts[neighbor_id]);
             in_range = bucket_id >= start_bucket && bucket_id < end_bucket;
         }
         in_range = __shfl_sync(team_mask, in_range, 0, TeamSize);
