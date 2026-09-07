@@ -1674,7 +1674,32 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
 
     // E. 启动 Kernel (search_kernel_bucket)
     dim3 grid(num_queries);
-    dim3 block(cagra::config::BLOCK_SIZE);
+    static const uint32_t forced_range_block_size = [] {
+        const char* value = std::getenv("CAGRA_RANGE_BLOCK_SIZE");
+        if (value == nullptr) return 0u;
+        const uint32_t parsed = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+        return parsed == 64 || parsed == 128 || parsed == 256 || parsed == 512
+                   ? parsed
+                   : 0u;
+    }();
+    const uint64_t selected_count = end_bucket >= start_bucket ? end_bucket - start_bucket : 0;
+    // The monotonic-ID path turns the bucket bounds into exact row bounds.  On
+    // SIFT-128 with a degree-32 graph, two 128-thread CTAs can reside per SM at
+    // the current shared-memory footprint and consistently win for <=10%
+    // filters.  Broader filters and the other tuned dimensions favor 256.
+    const bool use_auto_block128 = dim == 128 && total_degree == 32 &&
+                                   d_ts == nullptr && selected_count > 0 &&
+                                   selected_count <= num_dataset / 10;
+    const uint32_t selected_range_block_size = forced_range_block_size != 0
+                                                   ? forced_range_block_size
+                                                   : (use_auto_block128 ? 128u
+                                                                        : cagra::config::BLOCK_SIZE);
+    // The current radix sorter is tuned for the historical 256-thread launch.
+    // Limit block-size experiments to the merge-sort queue path.
+    const uint32_t range_block_size = queue_capacity <= 512
+                                          ? selected_range_block_size
+                                          : cagra::config::BLOCK_SIZE;
+    dim3 block(range_block_size);
 
     unsigned long long* d_stage_profile = nullptr;
     bool range_profile = std::getenv("CAGRA_RANGE_PROFILE") != nullptr;
@@ -1795,6 +1820,7 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
                   << " range=[" << start_bucket << "," << end_bucket << ")"
                   << " degree=" << total_degree
                   << " local_degree=" << local_degree
+                  << " block_size=" << range_block_size
                   << " queue_capacity=" << queue_capacity
                   << " avg_iter=" << h_stage_profile[3] / denom
                   << " avg_cycles_sort=" << h_stage_profile[0] / denom
