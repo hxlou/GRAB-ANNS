@@ -1726,6 +1726,7 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
     static const uint32_t low_dim_team_size = [] {
         const char* value = std::getenv("CAGRA_RANGE_TEAM_SIZE");
         if (value == nullptr) return 0u;
+        if (std::string(value) == "2") return 2u;
         if (std::string(value) == "4") return 4u;
         if (std::string(value) == "8") return 8u;
         if (std::string(value) == "32") return 32u;
@@ -1736,7 +1737,16 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
         launch_range_kernel(std::integral_constant<uint32_t, 0>{},
                             std::integral_constant<uint32_t, 32>{});
     } else if (dim == 96) {
-        if (low_dim_team_size == 32) {
+        const uint32_t num_team2_tasks = params.search_width * total_degree;
+        // TeamSize=2 wins when all 128 teams get at least two evenly divided
+        // candidates; partial/short waves remain faster with TeamSize=4.
+        const bool use_auto_team2 = low_dim_team_size == 0 &&
+                                    num_team2_tasks >= 256 &&
+                                    num_team2_tasks % (cagra::config::BLOCK_SIZE / 2) == 0;
+        if (low_dim_team_size == 2 || use_auto_team2) {
+            launch_range_kernel(std::integral_constant<uint32_t, 96>{},
+                                std::integral_constant<uint32_t, 2>{});
+        } else if (low_dim_team_size == 32) {
             launch_range_kernel(std::integral_constant<uint32_t, 96>{},
                                 std::integral_constant<uint32_t, 32>{});
         } else if (low_dim_team_size == 8) {
