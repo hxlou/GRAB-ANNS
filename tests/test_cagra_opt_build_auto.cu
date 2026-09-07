@@ -50,6 +50,30 @@ struct SearchConfig {
     }
 };
 
+void load_fvecs(const std::string& filename, std::vector<float>& data, int& dim, size_t& num) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Error opening " << filename << std::endl;
+        exit(1);
+    }
+    in.read((char*)&dim, sizeof(int));
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    size_t row_size = sizeof(int) + dim * sizeof(float);
+    num = file_size / row_size;
+
+    std::cout << ">> Loading SIFT from " << filename << " (Dim=" << dim << ", N=" << num << ")..." << std::endl;
+    data.resize(num * dim);
+    in.seekg(0, std::ios::beg);
+    for (size_t i = 0; i < num; ++i) {
+        int d;
+        in.read((char*)&d, sizeof(int));
+        if (d != dim) { std::cerr << "Dim mismatch!" << std::endl; exit(1); }
+        in.read((char*)(data.data() + i * dim), dim * sizeof(float));
+    }
+}
+
+
 // =============================================================================
 // 2. 辅助工具
 // =============================================================================
@@ -246,7 +270,7 @@ int main() {
     int fd = open(bin_path.c_str(), O_RDONLY);
     size_t file_sz = (size_t)file_total * dim * sizeof(float);
     const float* host_full_data = (const float*)mmap(nullptr, file_sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    
+
     // ============================================================
     // 【参数定义区】在这里写死你需要测试的所有组合
     // ============================================================
@@ -254,37 +278,31 @@ int main() {
     // A. 构建参数列表 (外层循环)
     std::vector<BuildConfig> build_configs = {
         // {DataSize, Buckets, Degree, LocalDegree}
-        {880000, 2, 32},
-        {880000, 2, 64},
-        {880000, 2, 128},
-        {880000, 10, 32},
-        {880000, 10, 64},
-        {880000, 10, 128},
-        {880000, 50, 32},
-        {880000, 50, 64},
-        {880000, 50, 128},
-        {880000, 100, 32},
-        {880000, 100, 64},
-        {880000, 100, 128},
-        {880000, 500, 32},
-        {880000, 500, 64},
-        {880000, 500, 32}
+        {1000000, 100, 128},
     };
 
     // B. 搜索参数列表 (内层循环)
     std::vector<SearchConfig> search_configs = {
         // {Itopk, Width, Iter}
-        // {128, 4, 50}, // 极速模式
-        // {128, 6, 100}, // 平衡模式
-        // {256, 4, 100}, // 高召回模式
-        // {256, 4, 50 },
-        // {256, 6, 50 },
-        // {256, 6, 100},
-        // {512, 8, 100}  // 极限模式
+        {128, 4, 50}, // 极速模式
+        {128, 6, 100}, // 平衡模式
+        {256, 4, 100}, // 高召回模式
+        {256, 4, 50 },
+        {256, 6, 50 },
+        {256, 6, 100},
+        {512, 8, 100},  // 极限模式
         {512, 4, 100},
         {512, 4, 200},
         {512, 6, 100},
         {512, 6, 200}
+    };
+
+    // 搜索范围
+    std::vector<float> search_radio = {
+        0.01f,
+        0.1f,
+        0.2f,
+        1.0f
     };
 
     std::cout << "==========================================================" << std::endl;

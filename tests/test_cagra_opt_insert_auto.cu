@@ -111,15 +111,15 @@ double calc_recall(size_t nq, int k, const int64_t* gt, const int64_t* res) {
     return 100.0 * (double)correct / (nq * k);
 }
 
-void log_csv(const std::string& filename, const BuildConfig& b, const SearchConfig& s, const ResultStats& r) {
+void log_csv(const std::string& filename, const BuildConfig& b, const SearchConfig& s, const ResultStats& r, float build_time_s=0.0f) {
     std::ofstream file(filename, std::ios::app);
     if (file.tellp() == 0) {
-        file << "Dataset,Buckets,Degree,BaseRatio,InsertTime(ms),IPS,Itopk,Width,Iter,RangeRatio,Recall,QPS,Errors\n";
+        file << "Dataset,Buckets,Degree,BaseRatio,InsertTime(ms),IPS,Itopk,Width,Iter,RangeRatio,Recall,QPS,Errors,BuildTime(s)\n";
     }
     file << b.total_data_size << "," << b.num_buckets << "," << b.graph_degree << "," << b.base_ratio << ","
          << r.insert_time_ms << "," << r.ips << ","
          << s.itopk << "," << s.width << "," << s.iter << ","
-         << r.ratio << "," << r.avg_recall << "," << r.avg_qps << "," << r.bound_errors << "\n";
+         << r.ratio << "," << r.avg_recall << "," << r.avg_qps << "," << r.bound_errors << "," << build_time_s << "\n";
 }
 
 // =============================================================================
@@ -185,10 +185,19 @@ void run_insert_benchmark_suite(
     
     // Build
     Timer build_timer;
+    // 获取当前准备时间，并输出到终端，作为日志记录
+    printf("now start build\n");
+    auto now1 = std::chrono::system_clock::now();
+    std::time_t t1 = std::chrono::system_clock::to_time_t(now1);
+    std::cout << "now: " << std::ctime(&t1); // 带换行
     index.add(build_ts.size(), build_data.data(), build_ts.data());
     index.build();
     double t_build = build_timer.elapsed_ms();
     std::cout << "   [Build] Time: " << t_build << " ms" << std::endl;
+    printf("now end build\n");
+    auto now2 = std::chrono::system_clock::now();
+    std::time_t t2 = std::chrono::system_clock::to_time_t(now2);
+    std::cout << "now: " << std::ctime(&t2); // 带换行
 
     // Insert
     // 使用固定的较强参数进行插入时的搜索，保证图质量
@@ -198,32 +207,32 @@ void run_insert_benchmark_suite(
     // index.insert(insert_ts.size(), insert_data.data(), insert_ts.data());
     for (size_t bkt = 0; bkt < b_conf.num_buckets; ++bkt) {
         if (insert_ts[bkt].empty()) continue;
-        if (bkt % 10 == 0) printf("====================== now is in bucket %lu ======================\n", bkt);
+        // if (bkt % 10 == 0) printf("====================== now is in bucket %lu ======================\n", bkt);
         index.insert(insert_ts[bkt].size(), insert_data[bkt].data(), insert_ts[bkt].data());
         // sleep(5);
     }
     // 从index获取图信息，采样几个点的邻居并打印
-    auto graph = index.get_graph();
-    for (int i = 1145; i < 1000000; i+= 30000) {
-        std::cout << "Node " << i << " neighbors: ";
-        for (int j = 0; j < b_conf.graph_degree; ++j) {
-            std::cout << graph[i * b_conf.graph_degree + j] << " ";
-            if (j == (b_conf.graph_degree / 2 - 1)) std::cout << "  |  ";
-        }
-        std::cout << std::endl;
-    }
+    // auto graph = index.get_graph();
+    // for (int i = 1145; i < 1000000; i+= 30000) {
+    //     std::cout << "Node " << i << " neighbors: ";
+    //     for (int j = 0; j < b_conf.graph_degree; ++j) {
+    //         std::cout << graph[i * b_conf.graph_degree + j] << " ";
+    //         if (j == (b_conf.graph_degree / 2 - 1)) std::cout << "  |  ";
+    //     }
+    //     std::cout << std::endl;
+    // }
 
     double t_insert = insert_timer.elapsed_ms();
     double ips = b_conf.total_data_size * (1.0 - b_conf.base_ratio) * 1000.0 / t_insert;
     
     std::cout << "   [Insert] Time: " << t_insert << " ms, IPS: " << (int)ips << std::endl;
-
+    index.save_graph_to_bin("graph.bin");
 
     // -------------------------------------------------------------
     // 3. 循环测试 Search Configs & Ratios
     // -------------------------------------------------------------
     const int NUM_ROUNDS = 5;       
-    const int QUERIES_PER_ROUND = 100;
+    const int QUERIES_PER_ROUND = 1000;
     const int K = 10;
     std::mt19937 rng(12345);
 
@@ -315,6 +324,10 @@ void run_insert_benchmark_suite(
                 Timer t;
                 // active_degree 传入 32 以启用 Remote Edge (跨桶能力)
                 if (ratio < 0.02) {
+                    printf("Now start query\n");
+                    auto now3 = std::chrono::system_clock::now();
+                    std::time_t t3 = std::chrono::system_clock::to_time_t(now3);
+                    std::cout << "now: " << std::ctime(&t3); // 带换行
                     index.query_local(queries.data(), 
                                     QUERIES_PER_ROUND, 
                                     K, 
@@ -322,6 +335,10 @@ void run_insert_benchmark_suite(
                                     out_indices.data(), 
                                     out_dists.data(),
                                     b_conf.graph_degree);
+                    printf("Now end query\n");
+                    auto now4 = std::chrono::system_clock::now();
+                    std::time_t t4 = std::chrono::system_clock::to_time_t(now4);
+                    std::cout << "now: " << std::ctime(&t4); // 带换行
                 } else if (ratio > 0.99) {
                     index.query(queries.data(), 
                                     QUERIES_PER_ROUND, 
@@ -331,6 +348,10 @@ void run_insert_benchmark_suite(
                                     out_indices.data(), 
                                     out_dists.data());
                 } else {
+                    printf("Now start query\n");
+                    auto now3 = std::chrono::system_clock::now();
+                    std::time_t t3 = std::chrono::system_clock::to_time_t(now3);
+                    std::cout << "now: " << std::ctime(&t3); // 带换行
                     index.query_range(queries.data(), 
                                     QUERIES_PER_ROUND, 
                                     K, 
@@ -339,6 +360,10 @@ void run_insert_benchmark_suite(
                                     out_indices.data(), 
                                     out_dists.data(), 
                                     b_conf.graph_degree); 
+                    printf("Now end query\n");
+                    auto now4 = std::chrono::system_clock::now();
+                    std::time_t t4 = std::chrono::system_clock::to_time_t(now4);
+                    std::cout << "now: " << std::ctime(&t4); // 带换行
                 }
 
                 
@@ -368,7 +393,7 @@ void run_insert_benchmark_suite(
                       << std::fixed << std::setprecision(2) << stats.avg_recall << "% | QPS=" 
                       << (int)stats.avg_qps << " | IPS=" << (int)stats.ips << " | Errors=" << stats.local_bound_errors << std::endl;
             
-            log_csv(csv_file, b_conf, s_conf, stats);
+            log_csv(csv_file, b_conf, s_conf, stats, t_build / 1000.0f);
         }
     }
 }
@@ -380,8 +405,9 @@ int main() {
     printf("Using cuda device %d\n", CUDA_DEVICE_ID);
     CHECK_CUDA(cudaSetDevice(CUDA_DEVICE_ID));
 
-    std::string sift_path = "../data/sift-1m/sift/sift_base.fvecs";
-    std::string csv_file  = "benchmark_insert_range_sift.csv";
+    std::string sift_path = "/home/lhx/lightCagra/data/deep_base.fvecs";
+    // std::string sift_path = "/home/lhx/lightCagra/data/wit-image.fvecs";
+    std::string csv_file  = "deep.csv";
 
     // 1. 加载 SIFT 数据
     std::vector<float> host_full_data;
@@ -401,39 +427,18 @@ int main() {
     // A. Build Configs
     std::vector<BuildConfig> build_configs = {
         // DataSize, Buckets, Degree, BaseRatio
-        {1000000, 100, 32, 0.5f},
-        {1000000, 100, 32, 0.1f},
-        {1000000, 100, 64, 0.5f},
-        {1000000, 100, 64, 0.1f},
+        {1000000, 100, 32, 1.0f},
     };
 
     // B. Search Configs
     std::vector<SearchConfig> search_configs = {
         // Itopk, Width, Iter
-        {128, 4, 50},
-        {128, 4, 100},
-        {128, 4, 150},
-        {128, 4, 200},
-        {128, 6, 50},
-        {128, 6, 100},
-        {128, 6, 150},
-        {128, 6, 200},        
+        {128, 4, 50},      
         {256, 4, 50},
-        {256, 4, 100},
-        {256, 4, 150},
-        {256, 4, 200},
-        {256, 6, 50},
-        {256, 6, 100},
-        {256, 6, 150},
-        {256, 6, 200},
-        {512, 4, 50},
-        {512, 4, 100},
-        {512, 4, 150},
-        {512, 4, 200},
     };
 
     // C. Range Ratios
-    std::vector<double> range_ratios = {0.01, 0.1, 0.2, 1.0}; // 0.01 近似单桶，1.0 全量
+    std::vector<double> range_ratios = {0.1}; // 0.01 近似单桶，1.0 全量
 
     std::cout << "Starting Accurate SIFT Insert+Range Benchmark..." << std::endl;
 
