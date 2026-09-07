@@ -33,6 +33,37 @@ bool use_monotonic_id_filter() {
     }();
     return enabled;
 }
+
+__global__ void broadcast_query_seeds(uint32_t* seeds,
+                                      size_t num_queries,
+                                      size_t seeds_per_query) {
+    const size_t offset = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t broadcast_count = (num_queries - 1) * seeds_per_query;
+    if (offset < broadcast_count) {
+        seeds[seeds_per_query + offset] = seeds[offset % seeds_per_query];
+    }
+}
+
+void copy_and_broadcast_seeds(uint32_t* d_seeds,
+                              const std::vector<uint32_t>& sampled_seeds,
+                              size_t num_queries) {
+    if (num_queries == 0 || sampled_seeds.empty()) return;
+    const size_t seeds_per_query = sampled_seeds.size();
+    CUDA_CHECK(cudaMemcpy(d_seeds,
+                          sampled_seeds.data(),
+                          seeds_per_query * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+    if (num_queries <= 1) return;
+
+    constexpr uint32_t block_size = 256;
+    const size_t broadcast_count = (num_queries - 1) * seeds_per_query;
+    const uint32_t grid_size = static_cast<uint32_t>(
+        (broadcast_count + block_size - 1) / block_size);
+    broadcast_query_seeds<<<grid_size, block_size>>>(d_seeds,
+                                                     num_queries,
+                                                     seeds_per_query);
+    CUDA_CHECK(cudaGetLastError());
+}
 } // namespace
 
 // =============================================================================
@@ -1250,22 +1281,9 @@ void CagraIndexOpt::query_local(const float* host_queries,
                           num_queries * dim_ * sizeof(float), 
                           cudaMemcpyHostToDevice));
 
-    // 拷贝种子
-    // 策略：我们生成了一组种子，广播给所有 Query 使用
-    // 我们需要在 GPU 上展开成 [num_queries * actual_seeds_count] 的数组
-    // 或者，我们可以只传一份种子到 GPU，但在 Kernel 里所有 Query 读同一块内存？
-    // 为了适配现有的 search_bucket_opt 接口（它期望 seed_ptr 对应每个 query 有独立的偏移），
-    // 我们需要在 Host 端把种子复制 num_queries 份。
-    
-    std::vector<uint32_t> batch_seeds(num_queries * actual_seeds_count);
-    for (size_t i = 0; i < num_queries; ++i) {
-        std::memcpy(batch_seeds.data() + i * actual_seeds_count, 
-                    sampled_seeds.data(), 
-                    actual_seeds_count * sizeof(uint32_t));
-    }
-
-    size_t seeds_bytes = batch_seeds.size() * sizeof(uint32_t);
-    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(), seeds_bytes, cudaMemcpyHostToDevice));
+    // The search kernel expects one seed row per query. Transfer one row and
+    // expand it on the GPU to avoid constructing and copying a large host array.
+    copy_and_broadcast_seeds(d_seeds, sampled_seeds, num_queries);
     if (d_pre_hashmap != nullptr) {
         CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
     }
@@ -1369,15 +1387,7 @@ void CagraIndexOpt::query_local_u32(const float* host_queries,
                           query_count * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    std::vector<uint32_t> batch_seeds(seed_count);
-    for (size_t i = 0; i < num_queries; ++i) {
-        std::memcpy(batch_seeds.data() + i * actual_seeds_count,
-                    sampled_seeds.data(),
-                    actual_seeds_count * sizeof(uint32_t));
-    }
-    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(),
-                          seed_count * sizeof(uint32_t),
-                          cudaMemcpyHostToDevice));
+    copy_and_broadcast_seeds(d_seeds, sampled_seeds, num_queries);
     if (d_pre_hashmap != nullptr) {
         CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
     }
@@ -1507,14 +1517,7 @@ void CagraIndexOpt::query_range(const float* host_queries,
                           num_queries * dim_ * sizeof(float), 
                           cudaMemcpyHostToDevice));
 
-    // 广播 Seeds：所有 Query 使用同一组范围内有效的种子
-    std::vector<uint32_t> batch_seeds(num_queries * actual_seeds_count);
-    for (size_t i = 0; i < num_queries; ++i) {
-        std::memcpy(batch_seeds.data() + i * actual_seeds_count, 
-                    sampled_seeds.data(), 
-                    actual_seeds_count * sizeof(uint32_t));
-    }
-    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(), batch_seeds.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    copy_and_broadcast_seeds(d_seeds, sampled_seeds, num_queries);
     if (d_pre_hashmap != nullptr) {
         CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
     }
@@ -1642,15 +1645,7 @@ void CagraIndexOpt::query_range_u32(const float* host_queries,
                           query_count * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    std::vector<uint32_t> batch_seeds(seed_count);
-    for (size_t i = 0; i < num_queries; ++i) {
-        std::memcpy(batch_seeds.data() + i * actual_seeds_count,
-                    sampled_seeds.data(),
-                    actual_seeds_count * sizeof(uint32_t));
-    }
-    CUDA_CHECK(cudaMemcpy(d_seeds, batch_seeds.data(),
-                          seed_count * sizeof(uint32_t),
-                          cudaMemcpyHostToDevice));
+    copy_and_broadcast_seeds(d_seeds, sampled_seeds, num_queries);
     if (d_pre_hashmap != nullptr) {
         CUDA_CHECK(cudaMemset(d_pre_hashmap, 0xFF, hash_count * sizeof(uint32_t)));
     }
