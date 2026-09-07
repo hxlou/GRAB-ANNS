@@ -142,8 +142,8 @@ __device__ __forceinline__ float calc_l2_dist_128(const float* vec_a, const floa
 // A team is a power-of-two subgroup contained in one warp.
 template <uint32_t Dim, uint32_t TeamSize>
 __device__ __forceinline__ float calc_l2_dist_team(const float* vec_a, const float* vec_b) {
-    static_assert(TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
-                  "TeamSize must be 8, 16, or 32");
+    static_assert(TeamSize == 4 || TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
+                  "TeamSize must be 4, 8, 16, or 32");
     static_assert(Dim % TeamSize == 0, "Dim must be divisible by TeamSize");
 
     constexpr uint32_t kTeamMask = TeamSize == 32 ? 0xffffffffu : ((1u << TeamSize) - 1u);
@@ -802,8 +802,8 @@ __device__ inline void compute_distance_to_child_nodes_range_specialized(
     uint32_t* visited_count = nullptr,
     unsigned long long* child_profile = nullptr)
 {
-    static_assert(TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
-                  "TeamSize must be 8, 16, or 32");
+    static_assert(TeamSize == 4 || TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
+                  "TeamSize must be 4, 8, 16, or 32");
     (void)active_degree;
 
     constexpr uint32_t kTeamMask = TeamSize == 32 ? 0xffffffffu : ((1u << TeamSize) - 1u);

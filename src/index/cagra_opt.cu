@@ -1696,24 +1696,31 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
         const char* value = std::getenv("CAGRA_RANGE_SPECIALIZED");
         return value == nullptr || std::string(value) != "0";
     }();
-    static const bool low_dim_team32 = [] {
+    static const uint32_t low_dim_team_size = [] {
         const char* value = std::getenv("CAGRA_RANGE_TEAM_SIZE");
-        return value != nullptr && std::string(value) == "32";
+        if (value == nullptr) return 0u;
+        if (std::string(value) == "4") return 4u;
+        if (std::string(value) == "8") return 8u;
+        if (std::string(value) == "32") return 32u;
+        return 0u;
     }();
 
     if (!use_specialized) {
         launch_range_kernel(std::integral_constant<uint32_t, 0>{},
                             std::integral_constant<uint32_t, 32>{});
     } else if (dim == 96) {
-        if (low_dim_team32) {
+        if (low_dim_team_size == 32) {
             launch_range_kernel(std::integral_constant<uint32_t, 96>{},
                                 std::integral_constant<uint32_t, 32>{});
-        } else {
+        } else if (low_dim_team_size == 8) {
             launch_range_kernel(std::integral_constant<uint32_t, 96>{},
                                 std::integral_constant<uint32_t, 8>{});
+        } else {
+            launch_range_kernel(std::integral_constant<uint32_t, 96>{},
+                                std::integral_constant<uint32_t, 4>{});
         }
     } else if (dim == 128) {
-        if (low_dim_team32) {
+        if (low_dim_team_size == 32) {
             launch_range_kernel(std::integral_constant<uint32_t, 128>{},
                                 std::integral_constant<uint32_t, 32>{});
         } else {
