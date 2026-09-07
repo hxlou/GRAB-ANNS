@@ -1326,6 +1326,21 @@ void search_opt_preallocated_u32(const float* d_dataset,
     uint32_t queue_capacity = std::max(cagra::config::BLOCK_SIZE, 
                                        cagra::detail::next_power_of_2(raw_needed));
 
+    // The range kernel is a strict superset of global search when the accepted
+    // ID interval is [0, num_dataset). Reuse it for the tuned low-dimensional
+    // cases to get compile-time distance specialization and compact merge-sort
+    // queues without maintaining another specialized search implementation.
+    // Keep an opt-out for reproducible A/B tests and emergency rollback.
+    const char* global_range_env = std::getenv("CAGRA_GLOBAL_RANGE_KERNEL");
+    const bool global_range_enabled =
+        global_range_env == nullptr || std::string(global_range_env) != "0";
+    const bool use_global_range_kernel = global_range_enabled && (dim == 96 || dim == 128);
+    const uint32_t compact_capacity = std::max(
+        cagra::config::BLOCK_SIZE, ((raw_needed + 31u) / 32u) * 32u);
+    if (use_global_range_kernel && dim <= 128 && compact_capacity <= 512) {
+        queue_capacity = compact_capacity;
+    }
+
     // D. 随机种子
     std::random_device rd;
     uint64_t rand_xor_mask = rd(); 
@@ -1339,32 +1354,103 @@ void search_opt_preallocated_u32(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
-    opt_in_large_dynamic_smem(cagra::device::search_kernel, smem_size);
-    cagra::device::search_kernel<<<grid, block, smem_size, stream>>>(
-        d_out_indices_u32,
-        d_out_dists,
-        d_queries,
-        d_dataset,
-        d_graph,
-        d_seeds,              // 传入外部 seeds
-        num_seeds_per_query,  // 外部 seeds 数量
-        nullptr, 
-        
-        // Params
-        (uint32_t)num_queries,
-        num_dataset,
-        dim, 
-        graph_degree,
-        topk,
-        itopk_size,
-        params.search_width,
-        params.max_iterations,
-        num_seeds_target,     // 目标总种子数
-        rand_xor_mask,
-        params.hash_bitlen,
-        d_pre_hashmap,
-        queue_capacity
-    );
+    if (use_global_range_kernel) {
+        auto launch_global_range = [&](auto dim_tag, auto team_tag) {
+            constexpr uint32_t kStaticDim = decltype(dim_tag)::value;
+            constexpr uint32_t kTeamSize = decltype(team_tag)::value;
+            opt_in_large_dynamic_smem(
+                cagra::device::search_kernel_range<kStaticDim, kTeamSize>, smem_size);
+            cagra::device::search_kernel_range<kStaticDim, kTeamSize>
+                <<<grid, block, smem_size, stream>>>(
+                    d_out_indices_u32,
+                    d_out_dists,
+                    d_queries,
+                    d_dataset,
+                    d_graph,
+                    d_seeds,
+                    nullptr,
+                    num_seeds_per_query,
+                    nullptr,
+                    static_cast<uint32_t>(num_queries),
+                    num_dataset,
+                    dim,
+                    graph_degree,
+                    graph_degree,
+                    0,
+                    static_cast<uint64_t>(num_dataset),
+                    topk,
+                    itopk_size,
+                    params.search_width,
+                    params.max_iterations,
+                    num_seeds_target,
+                    rand_xor_mask,
+                    params.hash_bitlen,
+                    d_pre_hashmap,
+                    queue_capacity,
+                    nullptr);
+        };
+
+        static const uint32_t forced_global_team_size = [] {
+            const char* value = std::getenv("CAGRA_GLOBAL_TEAM_SIZE");
+            if (value == nullptr) return 0u;
+            const uint32_t parsed = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+            return parsed == 2 || parsed == 4 || parsed == 8 || parsed == 32 ? parsed : 0u;
+        }();
+
+        if (dim == 96) {
+            // Unlike selective range search, global search computes every
+            // accepted distance. TeamSize=4 is consistently faster than the
+            // TeamSize=2 range heuristic across both degree-32 and degree-64.
+            if (forced_global_team_size == 2) {
+                launch_global_range(std::integral_constant<uint32_t, 96>{},
+                                    std::integral_constant<uint32_t, 2>{});
+            } else if (forced_global_team_size == 8) {
+                launch_global_range(std::integral_constant<uint32_t, 96>{},
+                                    std::integral_constant<uint32_t, 8>{});
+            } else if (forced_global_team_size == 32) {
+                launch_global_range(std::integral_constant<uint32_t, 96>{},
+                                    std::integral_constant<uint32_t, 32>{});
+            } else {
+                launch_global_range(std::integral_constant<uint32_t, 96>{},
+                                    std::integral_constant<uint32_t, 4>{});
+            }
+        } else {
+            if (forced_global_team_size == 32) {
+                launch_global_range(std::integral_constant<uint32_t, 128>{},
+                                    std::integral_constant<uint32_t, 32>{});
+            } else {
+                launch_global_range(std::integral_constant<uint32_t, 128>{},
+                                    std::integral_constant<uint32_t, 8>{});
+            }
+        }
+    } else {
+        opt_in_large_dynamic_smem(cagra::device::search_kernel, smem_size);
+        cagra::device::search_kernel<<<grid, block, smem_size, stream>>>(
+            d_out_indices_u32,
+            d_out_dists,
+            d_queries,
+            d_dataset,
+            d_graph,
+            d_seeds,              // 传入外部 seeds
+            num_seeds_per_query,  // 外部 seeds 数量
+            nullptr,
+
+            // Params
+            (uint32_t)num_queries,
+            num_dataset,
+            dim,
+            graph_degree,
+            topk,
+            itopk_size,
+            params.search_width,
+            params.max_iterations,
+            num_seeds_target,     // 目标总种子数
+            rand_xor_mask,
+            params.hash_bitlen,
+            d_pre_hashmap,
+            queue_capacity
+        );
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
