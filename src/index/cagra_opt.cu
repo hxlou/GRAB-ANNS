@@ -29,6 +29,29 @@
 #include "raft_help.cuh"
 namespace cagra {
 
+namespace {
+
+template <typename Kernel>
+void opt_in_large_dynamic_smem(Kernel kernel, size_t dynamic_bytes) {
+    // Current search kernels use about 9 KiB of static shared memory.  Keep the
+    // common <=36 KiB dynamic-memory path free of CUDA runtime queries.
+    constexpr size_t kStaticSmemFastPathHeadroom = 12 * 1024;
+    if (dynamic_bytes <= config::MAX_SHARED_MEMORY - kStaticSmemFastPathHeadroom) {
+        return;
+    }
+    cudaFuncAttributes attributes{};
+    CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+    if (dynamic_bytes + attributes.sharedSizeBytes <= config::MAX_SHARED_MEMORY) {
+        return;
+    }
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(dynamic_bytes)));
+}
+
+} // namespace
+
 // ===============================
 // build
 // ===============================
@@ -1316,6 +1339,7 @@ void search_opt_preallocated_u32(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
+    opt_in_large_dynamic_smem(cagra::device::search_kernel, smem_size);
     cagra::device::search_kernel<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
@@ -1477,6 +1501,7 @@ void search_bucket_opt_preallocated_u32(const float* d_dataset,
     dim3 grid(num_queries);
     dim3 block(cagra::config::BLOCK_SIZE);
 
+    opt_in_large_dynamic_smem(cagra::device::search_kernel_bucket, smem_size);
     cagra::device::search_kernel_bucket<<<grid, block, smem_size, stream>>>(
         d_out_indices_u32,
         d_out_dists,
@@ -1661,6 +1686,8 @@ void search_bucket_range_preallocated_u32(const float* d_dataset,
     auto launch_range_kernel = [&](auto dim_tag, auto team_tag) {
         constexpr uint32_t kStaticDim = decltype(dim_tag)::value;
         constexpr uint32_t kTeamSize = decltype(team_tag)::value;
+        opt_in_large_dynamic_smem(
+            cagra::device::search_kernel_range<kStaticDim, kTeamSize>, smem_size);
         cagra::device::search_kernel_range<kStaticDim, kTeamSize>
             <<<grid, block, smem_size, stream>>>(
                 d_out_indices_u32,
