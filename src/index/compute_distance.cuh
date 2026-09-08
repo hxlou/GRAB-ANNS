@@ -201,11 +201,11 @@ __device__ inline void compute_distance_to_init_nodes_specialized(
         const float* node_ptr = dataset_ptr + static_cast<size_t>(node_id) * Dim;
         const float dist = calc_l2_dist_team<Dim, TeamSize>(query_buffer, node_ptr);
         if (team_lane == 0) {
-            result_indices[i] = node_id;
-            result_distances[i] = dist;
-            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) &&
-                visited_count != nullptr) {
-                atomicAdd(visited_count, 1u);
+            // A duplicate seed must remain INVALID in the result queue too.
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id)) {
+                result_indices[i] = node_id;
+                result_distances[i] = dist;
+                if (visited_count != nullptr) atomicAdd(visited_count, 1u);
             }
         }
     }
@@ -266,12 +266,11 @@ __device__ inline void compute_distance_to_random_nodes(
 
         // 写入结果队列的前 num_seeds 个位置
         if (lane_id == 0) {
-            result_indices[i] = node_id;
-            result_distances[i] = dist;
-            
-            // 别忘了加入 Hashmap，防止重复访问
-            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) && visited_count != nullptr) {
-                atomicAdd(visited_count, 1u);
+            // Random sampling can repeat an ID; accept only the first insert.
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id)) {
+                result_indices[i] = node_id;
+                result_distances[i] = dist;
+                if (visited_count != nullptr) atomicAdd(visited_count, 1u);
             }
         }
     }
@@ -336,12 +335,11 @@ __device__ inline void compute_distance_to_init_nodes(
 
         // 4. 写入队列 & 哈希表 (仅 Lane 0 执行)
         if (lane_id == 0) {
-            // 写入结果队列
-            result_indices[i] = node_id;
-            result_distances[i] = dist;
-            
-            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id) && visited_count != nullptr) {
-                atomicAdd(visited_count, 1u);
+            // Apply the same uniqueness rule to provided and fallback seeds.
+            if (cagra::hashmap::insert(visited_hash, hash_bitlen, node_id)) {
+                result_indices[i] = node_id;
+                result_distances[i] = dist;
+                if (visited_count != nullptr) atomicAdd(visited_count, 1u);
             }
         }
     }

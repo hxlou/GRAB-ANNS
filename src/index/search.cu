@@ -297,9 +297,6 @@ __global__ void search_kernel(
     uint64_t step3 = 0;
 
     for (; iter < max_iterations; ++iter) {
-        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
-                                 itopk_size, visited_count, hash_reset_threshold);
-
         // --- Step A: 排序 (仅 Warp 0 工作) ---  
         auto t1 = clock64();      
         if (queue_capacity == 64 && tid < 32)       load_sort_store<2>(result_dists, result_indices, 64);
@@ -315,6 +312,12 @@ __global__ void search_kernel(
         }
         __syncthreads();
         auto t2 = clock64();
+
+        // Restore the retained top-k only after merging the previous expansion.
+        // Restoring before sorting misses candidates promoted into the top-k,
+        // allowing a later expansion to insert a second copy of those IDs.
+        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                 itopk_size, visited_count, hash_reset_threshold);
 
         // --- Step B: 选父节点 ---
         auto t3 = clock64();
@@ -366,7 +369,9 @@ __global__ void search_kernel(
     uint32_t output_offset = query_id * topk;
     
     for (uint32_t i = tid; i < topk; i += blockDim.x) {
-        uint32_t idx = result_indices[i] & 0x7FFFFFFF;
+        const uint32_t raw_idx = result_indices[i];
+        uint32_t idx = raw_idx == cagra::hashmap::INVALID_KEY
+                           ? raw_idx : (raw_idx & 0x7FFFFFFF);
         float dist = result_dists[i];
         if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
@@ -499,9 +504,6 @@ __global__ void search_kernel_bucket(
 
 
     for (; iter < max_iterations; ++iter) {
-        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
-                                 itopk_size, visited_count, hash_reset_threshold);
-
         // auto t1 = clock64();
         // A. Sort (完全复用)
         // if (tid < 32) {
@@ -521,6 +523,10 @@ __global__ void search_kernel_bucket(
             }
         // }
         __syncthreads();
+
+        // Include newly promoted candidates when rebuilding the visited set.
+        maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                 itopk_size, visited_count, hash_reset_threshold);
 
         // // 输出itopk中的内容，调试用
         // if (tid == 0 && query_id == 0) {
@@ -596,7 +602,9 @@ __global__ void search_kernel_bucket(
 
     uint32_t output_offset = query_id * topk;
     for (uint32_t i = tid; i < topk; i += blockDim.x) {
-        uint32_t idx = result_indices[i] & 0x7FFFFFFF;
+        const uint32_t raw_idx = result_indices[i];
+        uint32_t idx = raw_idx == cagra::hashmap::INVALID_KEY
+                           ? raw_idx : (raw_idx & 0x7FFFFFFF);
         float dist = result_dists[i];
         if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
@@ -730,11 +738,17 @@ __global__ void search_kernel_range(
     // 4. 主循环
     uint32_t iter = 0;
     uint32_t hash_size = 1u << hash_bitlen;
-    uint32_t hash_reset_threshold = min(hash_size - 1,
-                                        max(itopk_size + search_width * graph_stride,
-                                            (hash_size * 7) / 10));
     const uint64_t max_possible_visited = static_cast<uint64_t>(num_seeds) +
         static_cast<uint64_t>(max_iterations) * search_width * graph_stride;
+    const uint32_t default_reset_load = (hash_size * 7) / 10;
+    const bool use_early_global_reset = !ApplyRangeFilter && StaticDim == 96 &&
+                                        max_possible_visited >= default_reset_load;
+    const uint32_t reset_load = use_early_global_reset
+                                    ? (hash_size * 5) / 10
+                                    : default_reset_load;
+    uint32_t hash_reset_threshold = min(hash_size - 1,
+                                        max(itopk_size + search_width * graph_stride,
+                                            reset_load));
     const uint64_t selected_count = end_bucket >= start_bucket ? end_bucket - start_bucket : 0;
     const bool narrow_monotonic_filter = d_ts == nullptr && selected_count > 0 &&
                                          selected_count <= num_dataset / 10;
@@ -749,11 +763,6 @@ __global__ void search_kernel_range(
     unsigned long long step3_cost = 0;
 
     for (; iter < max_iterations; ++iter) {
-        if (visited_count != nullptr) {
-            maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
-                                     itopk_size, visited_count, hash_reset_threshold);
-        }
-
         // A. Sort (完全复用)
         unsigned long long t1 = 0;
         if (profile_enabled) t1 = clock64();
@@ -784,6 +793,12 @@ __global__ void search_kernel_range(
         __syncthreads();
         unsigned long long t2 = 0;
         if (profile_enabled) t2 = clock64();
+
+        // The retained queue and visited set must describe the same top-k.
+        if (visited_count != nullptr) {
+            maybe_reset_visited_hash(visited_hash, hash_bitlen, result_indices,
+                                     itopk_size, visited_count, hash_reset_threshold);
+        }
 
         // B. Pickup Parents (完全复用)
         unsigned long long t3 = 0;
@@ -880,7 +895,9 @@ __global__ void search_kernel_range(
 
     uint32_t output_offset = query_id * topk;
     for (uint32_t i = tid; i < topk; i += blockDim.x) {
-        uint32_t idx = result_indices[i] & 0x7FFFFFFF;
+        const uint32_t raw_idx = result_indices[i];
+        uint32_t idx = raw_idx == cagra::hashmap::INVALID_KEY
+                           ? raw_idx : (raw_idx & 0x7FFFFFFF);
         float dist = result_dists[i];
         if (result_indices_ptr) result_indices_ptr[output_offset + i] = idx;
         if (result_distances_ptr) result_distances_ptr[output_offset + i] = dist;
