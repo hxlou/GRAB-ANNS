@@ -783,7 +783,7 @@ __device__ inline void compute_distance_to_child_nodes_range(
 
 // Compile-time dimension/team-size range expansion. TeamSize=8 allows four
 // independent low-dimensional candidates to be processed by each warp.
-template <uint32_t Dim, uint32_t TeamSize>
+template <uint32_t Dim, uint32_t TeamSize, bool ApplyRangeFilter = true>
 __device__ inline void compute_distance_to_child_nodes_range_specialized(
     uint32_t* candidate_indices,
     float* candidate_distances,
@@ -854,16 +854,18 @@ __device__ inline void compute_distance_to_child_nodes_range_specialized(
             continue;
         }
 
-        if (child_profile != nullptr && team_lane == 0) t_child = clock64();
-        int in_range = 0;
-        if (team_lane == 0) {
-            const uint64_t bucket_id = d_ts == nullptr
-                ? static_cast<uint64_t>(neighbor_id)
-                : __ldg(&d_ts[neighbor_id]);
-            in_range = bucket_id >= start_bucket && bucket_id < end_bucket;
+        int in_range = 1;
+        if constexpr (ApplyRangeFilter) {
+            if (child_profile != nullptr && team_lane == 0) t_child = clock64();
+            if (team_lane == 0) {
+                const uint64_t bucket_id = d_ts == nullptr
+                    ? static_cast<uint64_t>(neighbor_id)
+                    : __ldg(&d_ts[neighbor_id]);
+                in_range = bucket_id >= start_bucket && bucket_id < end_bucket;
+            }
+            in_range = __shfl_sync(team_mask, in_range, 0, TeamSize);
+            if (child_profile != nullptr && team_lane == 0) clk_filter += clock64() - t_child;
         }
-        in_range = __shfl_sync(team_mask, in_range, 0, TeamSize);
-        if (child_profile != nullptr && team_lane == 0) clk_filter += clock64() - t_child;
         if (!in_range) {
             if (team_lane == 0) {
                 candidate_indices[task_id] = 0xFFFFFFFF;

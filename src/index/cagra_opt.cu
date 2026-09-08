@@ -1335,6 +1335,9 @@ void search_opt_preallocated_u32(const float* d_dataset,
     const bool global_range_enabled =
         global_range_env == nullptr || std::string(global_range_env) != "0";
     const bool use_global_range_kernel = global_range_enabled && (dim == 96 || dim == 128);
+    const char* filter_elision_env = std::getenv("CAGRA_GLOBAL_FILTER_ELISION");
+    const bool use_global_filter_elision =
+        filter_elision_env == nullptr || std::string(filter_elision_env) != "0";
     const uint32_t compact_capacity = std::max(
         cagra::config::BLOCK_SIZE, ((raw_needed + 31u) / 32u) * 32u);
     if (use_global_range_kernel && dim <= 128 && compact_capacity <= 512) {
@@ -1355,12 +1358,14 @@ void search_opt_preallocated_u32(const float* d_dataset,
     dim3 block(cagra::config::BLOCK_SIZE);
 
     if (use_global_range_kernel) {
-        auto launch_global_range = [&](auto dim_tag, auto team_tag) {
+        auto launch_global_range = [&](auto dim_tag, auto team_tag, auto filter_tag) {
             constexpr uint32_t kStaticDim = decltype(dim_tag)::value;
             constexpr uint32_t kTeamSize = decltype(team_tag)::value;
+            constexpr bool kApplyRangeFilter = decltype(filter_tag)::value;
             opt_in_large_dynamic_smem(
-                cagra::device::search_kernel_range<kStaticDim, kTeamSize>, smem_size);
-            cagra::device::search_kernel_range<kStaticDim, kTeamSize>
+                cagra::device::search_kernel_range<kStaticDim, kTeamSize, kApplyRangeFilter>,
+                smem_size);
+            cagra::device::search_kernel_range<kStaticDim, kTeamSize, kApplyRangeFilter>
                 <<<grid, block, smem_size, stream>>>(
                     d_out_indices_u32,
                     d_out_dists,
@@ -1390,6 +1395,14 @@ void search_opt_preallocated_u32(const float* d_dataset,
                     nullptr);
         };
 
+        auto launch_tuned_global_range = [&](auto dim_tag, auto team_tag) {
+            if (use_global_filter_elision) {
+                launch_global_range(dim_tag, team_tag, std::false_type{});
+            } else {
+                launch_global_range(dim_tag, team_tag, std::true_type{});
+            }
+        };
+
         static const uint32_t forced_global_team_size = [] {
             const char* value = std::getenv("CAGRA_GLOBAL_TEAM_SIZE");
             if (value == nullptr) return 0u;
@@ -1403,24 +1416,28 @@ void search_opt_preallocated_u32(const float* d_dataset,
             // TeamSize=2 range heuristic across both degree-32 and degree-64.
             if (forced_global_team_size == 2) {
                 launch_global_range(std::integral_constant<uint32_t, 96>{},
-                                    std::integral_constant<uint32_t, 2>{});
+                                    std::integral_constant<uint32_t, 2>{},
+                                    std::true_type{});
             } else if (forced_global_team_size == 8) {
                 launch_global_range(std::integral_constant<uint32_t, 96>{},
-                                    std::integral_constant<uint32_t, 8>{});
+                                    std::integral_constant<uint32_t, 8>{},
+                                    std::true_type{});
             } else if (forced_global_team_size == 32) {
                 launch_global_range(std::integral_constant<uint32_t, 96>{},
-                                    std::integral_constant<uint32_t, 32>{});
+                                    std::integral_constant<uint32_t, 32>{},
+                                    std::true_type{});
             } else {
-                launch_global_range(std::integral_constant<uint32_t, 96>{},
-                                    std::integral_constant<uint32_t, 4>{});
+                launch_tuned_global_range(std::integral_constant<uint32_t, 96>{},
+                                          std::integral_constant<uint32_t, 4>{});
             }
         } else {
             if (forced_global_team_size == 32) {
                 launch_global_range(std::integral_constant<uint32_t, 128>{},
-                                    std::integral_constant<uint32_t, 32>{});
+                                    std::integral_constant<uint32_t, 32>{},
+                                    std::true_type{});
             } else {
-                launch_global_range(std::integral_constant<uint32_t, 128>{},
-                                    std::integral_constant<uint32_t, 8>{});
+                launch_tuned_global_range(std::integral_constant<uint32_t, 128>{},
+                                          std::integral_constant<uint32_t, 8>{});
             }
         }
     } else {

@@ -610,7 +610,7 @@ __global__ void search_kernel_bucket(
 }
 
 
-template <uint32_t StaticDim, uint32_t TeamSize>
+template <uint32_t StaticDim, uint32_t TeamSize, bool ApplyRangeFilter>
 __global__ void search_kernel_range(
     uint32_t* result_indices_ptr,       
     float* result_distances_ptr,        
@@ -826,7 +826,8 @@ __global__ void search_kernel_range(
                 stage_profile == nullptr ? nullptr : stage_profile + 5
             );
         } else {
-            cagra::device::compute_distance_to_child_nodes_range_specialized<StaticDim, TeamSize>(
+            cagra::device::compute_distance_to_child_nodes_range_specialized<
+                StaticDim, TeamSize, ApplyRangeFilter>(
                 result_indices + itopk_size,
                 result_dists + itopk_size,
                 query_buffer,
@@ -909,22 +910,24 @@ __global__ void search_kernel_range(
     // }
 }
 
-#define CAGRA_INSTANTIATE_RANGE_KERNEL(STATIC_DIM, TEAM_SIZE)                                \
-    template __global__ void search_kernel_range<STATIC_DIM, TEAM_SIZE>(                     \
+#define CAGRA_INSTANTIATE_RANGE_KERNEL(STATIC_DIM, TEAM_SIZE, APPLY_RANGE_FILTER)             \
+    template __global__ void search_kernel_range<STATIC_DIM, TEAM_SIZE, APPLY_RANGE_FILTER>( \
         uint32_t*, float*, const float*, const float*, const uint32_t*, const uint32_t*,      \
         uint64_t*, uint32_t, uint32_t*, uint32_t, size_t, uint32_t, uint32_t, uint32_t,       \
         uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t,       \
         uint32_t, uint32_t*, uint32_t, unsigned long long*)
 
-CAGRA_INSTANTIATE_RANGE_KERNEL(0, 32);
-CAGRA_INSTANTIATE_RANGE_KERNEL(96, 32);
-CAGRA_INSTANTIATE_RANGE_KERNEL(96, 2);
-CAGRA_INSTANTIATE_RANGE_KERNEL(96, 4);
-CAGRA_INSTANTIATE_RANGE_KERNEL(96, 8);
-CAGRA_INSTANTIATE_RANGE_KERNEL(128, 32);
-CAGRA_INSTANTIATE_RANGE_KERNEL(128, 8);
-CAGRA_INSTANTIATE_RANGE_KERNEL(960, 32);
-CAGRA_INSTANTIATE_RANGE_KERNEL(2048, 32);
+CAGRA_INSTANTIATE_RANGE_KERNEL(0, 32, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 32, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 2, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 4, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 8, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(128, 32, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(128, 8, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(960, 32, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(2048, 32, true);
+CAGRA_INSTANTIATE_RANGE_KERNEL(96, 4, false);
+CAGRA_INSTANTIATE_RANGE_KERNEL(128, 8, false);
 
 #undef CAGRA_INSTANTIATE_RANGE_KERNEL
 
