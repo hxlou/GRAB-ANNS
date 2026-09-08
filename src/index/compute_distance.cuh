@@ -779,6 +779,90 @@ __device__ inline void compute_distance_to_child_nodes_range(
     __syncthreads();
 }
 
+#if defined(CAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE) && CAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE
+// Opt-in research path, disabled by default: current DEEP A/B tests do not show
+// a reliable speedup. Compile with -DCAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE=1 to
+// evaluate it; filtered search and the default global implementation are kept.
+// Assign global graph/hash work to individual threads before assigning accepted
+// candidates to distance teams. Candidate slots and visited semantics stay fixed.
+template <uint32_t Dim, uint32_t TeamSize>
+__device__ inline void compute_distance_to_child_nodes_global_two_phase(
+    uint32_t* candidate_indices, float* candidate_distances,
+    const float* query_buffer, const float* dataset_ptr,
+    const uint32_t* knn_graph, uint32_t graph_stride,
+    uint32_t* visited_hash, uint32_t hash_bitlen,
+    const uint32_t* parent_list, uint32_t search_width,
+    uint32_t* visited_count, unsigned long long* child_profile)
+{
+    const uint32_t tid = threadIdx.x;
+    const uint32_t total_tasks = search_width * graph_stride;
+    unsigned long long clk_graph = 0, clk_hash = 0, clk_dist = 0, clk_write = 0;
+    unsigned long long cnt_in_range = 0, cnt_dist = 0;
+    for (uint32_t task = tid; task < total_tasks; task += blockDim.x) {
+        unsigned long long tick = 0;
+        if (child_profile != nullptr) tick = clock64();
+        const uint32_t parent = parent_list[task / graph_stride];
+        uint32_t node = parent == 0xffffffffu ? 0xffffffffu
+            : knn_graph[static_cast<size_t>(parent) * graph_stride + task % graph_stride];
+        if (child_profile != nullptr) clk_graph += clock64() - tick;
+        if (node != 0xffffffffu) {
+            if (child_profile != nullptr) { ++cnt_in_range; tick = clock64(); }
+            const bool inserted = cagra::hashmap::insert(visited_hash, hash_bitlen, node);
+            if (inserted && visited_count != nullptr) atomicAdd(visited_count, 1u);
+            if (!inserted) node = 0xffffffffu;
+            if (child_profile != nullptr) clk_hash += clock64() - tick;
+        }
+        candidate_indices[task] = node;
+    }
+    // All distance teams must see the completed ID/visited phase, including
+    // threads whose parent was invalid or whose candidate was already visited.
+    __syncthreads();
+    const uint32_t team_lane = tid & (TeamSize - 1u);
+    const uint32_t team_id = tid / TeamSize;
+    const uint32_t num_teams = blockDim.x / TeamSize;
+    for (uint32_t task = team_id; task < total_tasks; task += num_teams) {
+        const uint32_t node = candidate_indices[task];
+        float distance = 3.40282e38f;
+        unsigned long long tick = 0;
+        if (node != 0xffffffffu) {
+            if (child_profile != nullptr && team_lane == 0) tick = clock64();
+            distance = calc_l2_dist_team<Dim, TeamSize>(
+                query_buffer, dataset_ptr + static_cast<size_t>(node) * Dim);
+            if (child_profile != nullptr && team_lane == 0) {
+                clk_dist += clock64() - tick;
+                ++cnt_dist;
+            }
+        }
+        if (team_lane == 0) {
+            if (child_profile != nullptr) tick = clock64();
+            candidate_distances[task] = distance;
+            if (child_profile != nullptr) clk_write += clock64() - tick;
+        }
+    }
+    // Sums over participating threads, not CTA elapsed times.
+    if (child_profile != nullptr) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            clk_graph += __shfl_down_sync(0xffffffff, clk_graph, offset);
+            clk_hash += __shfl_down_sync(0xffffffff, clk_hash, offset);
+            clk_dist += __shfl_down_sync(0xffffffff, clk_dist, offset);
+            clk_write += __shfl_down_sync(0xffffffff, clk_write, offset);
+            cnt_in_range += __shfl_down_sync(0xffffffff, cnt_in_range, offset);
+            cnt_dist += __shfl_down_sync(0xffffffff, cnt_dist, offset);
+        }
+        if ((tid & 31u) == 0) {
+            atomicAdd(child_profile + 0, clk_graph);
+            atomicAdd(child_profile + 1, clk_hash);
+            atomicAdd(child_profile + 3, clk_dist);
+            atomicAdd(child_profile + 4, clk_write);
+            atomicAdd(child_profile + 5, cnt_in_range);
+            atomicAdd(child_profile + 6, cnt_dist);
+        }
+    }
+    __syncthreads();
+}
+
+#endif  // CAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE
+
 // Compile-time dimension/team-size range expansion. TeamSize=8 allows four
 // independent low-dimensional candidates to be processed by each warp.
 template <uint32_t Dim, uint32_t TeamSize, bool ApplyRangeFilter = true>
@@ -803,6 +887,16 @@ __device__ inline void compute_distance_to_child_nodes_range_specialized(
     static_assert(TeamSize == 2 || TeamSize == 4 || TeamSize == 8 || TeamSize == 16 || TeamSize == 32,
                   "TeamSize must be 2, 4, 8, 16, or 32");
     (void)active_degree;
+
+#if defined(CAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE) && CAGRA_EXPERIMENTAL_GLOBAL_TWO_PHASE
+    if constexpr (!ApplyRangeFilter) {
+        compute_distance_to_child_nodes_global_two_phase<Dim, TeamSize>(
+            candidate_indices, candidate_distances, query_buffer, dataset_ptr,
+            knn_graph, graph_stride, visited_hash, hash_bitlen, parent_list,
+            search_width, visited_count, child_profile);
+        return;
+    }
+#endif
 
     constexpr uint32_t kTeamMask = TeamSize == 32 ? 0xffffffffu : ((1u << TeamSize) - 1u);
     const uint32_t tid = threadIdx.x;
